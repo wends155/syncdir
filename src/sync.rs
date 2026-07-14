@@ -216,21 +216,17 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let rel_path = PathBuf::from(path);
         let dest_path = self.config.dest_dir.join(&rel_path);
 
-        if dest_path.exists() {
-            if self.config.propagate_deletions {
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| SyncError::Config(e.to_string()))?
-                    .as_secs()
-                    .to_string();
-                let archive_path = self.get_archive_path(&rel_path, &timestamp);
-                if let Some(parent) = archive_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(&dest_path, &archive_path)?;
-            } else {
-                fs::remove_file(&dest_path)?;
+        if dest_path.exists() && self.config.propagate_deletions {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| SyncError::Config(e.to_string()))?
+                .as_secs()
+                .to_string();
+            let archive_path = self.get_archive_path(&rel_path, &timestamp);
+            if let Some(parent) = archive_path.parent() {
+                fs::create_dir_all(parent)?;
             }
+            fs::rename(&dest_path, &archive_path)?;
         }
         self.db.delete_file(path)?;
         Ok(())

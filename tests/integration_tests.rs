@@ -107,3 +107,43 @@ fn test_tray_module_compiles() {
         std::sync::mpsc::Sender<syncdir::sync::SyncCommand>,
     ) -> Result<(), syncdir::error::SyncError> = syncdir::tray::run_tray;
 }
+
+#[test]
+fn test_propagate_deletions_false() {
+    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+    let db_path = dir.path().join("sigcache.db");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+
+    let config = Config {
+        source_dir: source.clone(),
+        dest_dir: dest.clone(),
+        debounce_seconds: 1,
+        propagate_deletions: false,
+        block_sync_threshold_bytes: 10,
+        block_size_bytes: 4,
+        verify_writes: true,
+    };
+
+    let store = SqliteHashStore::new(&db_path, &config).unwrap();
+    let engine = LocalSyncEngine::new(store, config);
+
+    let file_path = source.join("test.txt");
+    std::fs::write(&file_path, b"hello").unwrap();
+    engine.sync_file("test.txt").unwrap();
+
+    // Verify file exists on destination
+    let dest_path = dest.join("test.txt");
+    assert!(dest_path.exists());
+
+    // Call delete_file
+    engine.delete_file("test.txt").unwrap();
+
+    // Since propagate_deletions = false, the destination file MUST remain
+    assert!(dest_path.exists(), "Destination file must not be deleted when propagate_deletions is false");
+}
+
