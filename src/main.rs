@@ -31,7 +31,7 @@ source_dir = "C:\\path\\to\\source"
 dest_dir = "C:\\path\\to\\destination"
 
 # Debounce delay in seconds before performing a sync.
-debounce_seconds = 2
+debounce_seconds = 3
 
 # Whether to propagate file and directory deletions.
 propagate_deletions = true
@@ -40,8 +40,8 @@ propagate_deletions = true
 # Smaller files are copied whole. (e.g. 10485760 = 10MB)
 block_sync_threshold_bytes = 10485760
 
-# The block size in bytes used for calculating delta signatures. (e.g. 65536 = 64KB)
-block_size_bytes = 65536
+# The block size in bytes used for calculating delta signatures. (e.g. 1048576 = 1MB)
+block_size_bytes = 1048576
 
 # Verify file integrity after writes using rolling/blake3 checksums.
 verify_writes = true
