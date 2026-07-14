@@ -16,7 +16,7 @@ To build `syncdir` from source, ensure you have Rust installed (v1.93.1+ or stab
 
 ```powershell
 # Clone the repository
-git clone https://github.com/user/syncdir.git
+git clone https://github.com/wends155/syncdir.git
 cd syncdir
 
 # Build the release binary
