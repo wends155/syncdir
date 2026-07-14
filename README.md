@@ -40,6 +40,9 @@ dest_dir = "Z:/dest_folder"
 # Real-time change notification debounce duration in seconds
 debounce_seconds = 3
 
+# Directory presence check retry/polling interval in seconds (default: 10)
+retry_interval_seconds = 10
+ 
 # Whether to propagate file deletions from source to destination
 propagate_deletions = true
 
