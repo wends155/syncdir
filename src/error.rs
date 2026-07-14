@@ -24,4 +24,8 @@ pub enum SyncError {
     /// File watcher failure.
     #[error("Watcher error: {0}")]
     Watcher(#[from] notify::Error),
+
+    /// System tray creation or event loop failure.
+    #[error("Tray error: {0}")]
+    Tray(String),
 }

@@ -55,6 +55,24 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Return the default application data directory: `%APPDATA%\syncdir\`.
+    ///
+    /// # Errors
+    /// Returns `SyncError::Config` if the `APPDATA` environment variable is not set.
+    pub fn default_app_dir() -> Result<PathBuf, SyncError> {
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| SyncError::Config("APPDATA environment variable not set".into()))?;
+        Ok(PathBuf::from(appdata).join("syncdir"))
+    }
+
+    /// Return the default configuration file path: `%APPDATA%\syncdir\config.toml`.
+    ///
+    /// # Errors
+    /// Returns `SyncError::Config` if the `APPDATA` environment variable is not set.
+    pub fn default_config_path() -> Result<PathBuf, SyncError> {
+        Ok(Self::default_app_dir()?.join("config.toml"))
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +135,33 @@ mod tests {
             verify_writes: true,
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_default_app_dir_returns_appdata_path() {
+        let dir = Config::default_app_dir().unwrap();
+        let dir_str = dir.to_string_lossy().to_lowercase();
+        assert!(
+            dir_str.contains("appdata"),
+            "Expected AppData in path, got: {dir_str}"
+        );
+        assert!(
+            dir_str.ends_with("syncdir"),
+            "Expected path to end with 'syncdir', got: {dir_str}"
+        );
+    }
+
+    #[test]
+    fn test_default_config_path() {
+        let path = Config::default_config_path().unwrap();
+        let path_str = path.to_string_lossy().to_lowercase();
+        assert!(
+            path_str.contains("appdata"),
+            "Expected AppData in path, got: {path_str}"
+        );
+        assert!(
+            path_str.ends_with("syncdir\\config.toml") || path_str.ends_with("syncdir/config.toml"),
+            "Expected path to end with 'syncdir/config.toml', got: {path_str}"
+        );
     }
 }

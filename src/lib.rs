@@ -7,3 +7,4 @@ pub mod db;
 pub mod error;
 pub mod monitor;
 pub mod sync;
+pub mod tray;

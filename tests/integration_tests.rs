@@ -96,3 +96,14 @@ fn test_watcher_and_sync_engine_flow() {
     let content = std::fs::read_to_string(&dest_file_path).unwrap();
     assert_eq!(content, "hello world");
 }
+
+#[test]
+fn test_tray_module_compiles() {
+    // Since run_tray blocks the thread, we only smoke-test compiling it and verifying exports.
+    // This is a static analysis verification.
+    let _func: fn(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::sync::mpsc::Sender<syncdir::sync::SyncCommand>,
+    ) -> Result<(), syncdir::error::SyncError> = syncdir::tray::run_tray;
+}
