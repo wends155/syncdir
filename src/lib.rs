@@ -6,5 +6,6 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod monitor;
+pub mod startup;
 pub mod sync;
 pub mod tray;
