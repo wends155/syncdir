@@ -4,6 +4,7 @@
 //! delta synchronization over the local network.
 
 use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use syncdir::config::Config;
 use syncdir::db::SqliteHashStore;
@@ -11,34 +12,11 @@ use syncdir::error::SyncError;
 use syncdir::monitor::DirectoryWatcher;
 use syncdir::sync::{start_sync_worker, SyncCommand};
 use syncdir::tray::run_tray;
+use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-fn try_main() -> Result<(), SyncError> {
-    // 1. Ensure application directory exists
-    let app_dir = Config::default_app_dir()?;
-    if !app_dir.exists() {
-        fs::create_dir_all(&app_dir).map_err(SyncError::Io)?;
-    }
-
-    // 2. Initialize tracing to stdout and a daily rolling log file
+fn try_main(app_dir: PathBuf) -> Result<(), SyncError> {
     let log_dir = app_dir.join("logs");
-    if !log_dir.exists() {
-        fs::create_dir_all(&log_dir).map_err(SyncError::Io)?;
-    }
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "syncdir.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-    // Combine stdout and rolling file writers
-    let dual_writer = std::io::stdout.and(non_blocking);
-
-    tracing_subscriber::fmt()
-        .with_writer(dual_writer)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     tracing::info!("Initializing syncdir daemon...");
 
     // 3. Load or create configuration
@@ -117,8 +95,130 @@ verify_writes = true
 }
 
 fn main() {
-    if let Err(e) = try_main() {
-        eprintln!("Fatal error: {e}");
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "syncdir v{} — Windows background folder synchronization daemon",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!();
+        println!("USAGE:");
+        println!("    syncdir [OPTIONS]");
+        println!();
+        println!("OPTIONS:");
+        println!("    --help, -h               Print this help message and exit");
+        println!("    --version, -v            Print version and exit");
+        println!(
+            "    --register-startup       Register syncdir to start on Windows login and exit"
+        );
+        println!("    --unregister-startup     Remove syncdir from Windows startup and exit");
+        println!();
+        println!("When run without options, syncdir starts the background sync daemon.");
+        std::process::exit(0);
+    }
+
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("syncdir {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
+    if args.iter().any(|a| a == "--register-startup") {
+        match syncdir::config::StartupRegistry::register() {
+            Ok(()) => println!("Successfully registered syncdir for Windows startup."),
+            Err(e) => {
+                eprintln!("Failed to register startup: {e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+
+    if args.iter().any(|a| a == "--unregister-startup") {
+        match syncdir::config::StartupRegistry::unregister() {
+            Ok(()) => println!("Successfully removed syncdir from Windows startup."),
+            Err(e) => {
+                eprintln!("Failed to unregister startup: {e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+
+    // Computes default app dir and sets up logging
+    let app_dir = match Config::default_app_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("Fatal error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if !app_dir.exists() {
+        if let Err(e) = fs::create_dir_all(&app_dir) {
+            eprintln!("Fatal error: Failed to create app directory: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    let log_dir = app_dir.join("logs");
+    if !log_dir.exists() {
+        if let Err(e) = fs::create_dir_all(&log_dir) {
+            eprintln!("Fatal error: Failed to create log directory: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    let file_appender = match Builder::new()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("syncdir.log")
+        .max_log_files(7)
+        .build(&log_dir)
+    {
+        Ok(appender) => appender,
+        Err(e) => {
+            eprintln!("Fatal error: Failed to initialize log file writer: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let dual_writer = std::io::stdout.and(non_blocking);
+
+    tracing_subscriber::fmt()
+        .with_writer(dual_writer)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    if args.iter().any(|a| a == "--autostart") {
+        tracing::info!("syncdir initialized (Trigger: Windows Auto-Start)");
+    } else {
+        tracing::info!("syncdir initialized (Trigger: Manual Launch)");
+    }
+
+    // Register panic hook to capture crash/panics
+    std::panic::set_hook(Box::new(|panic_info| {
+        let payload = panic_info.payload();
+        let message = if let Some(s) = payload.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "unknown panic payload"
+        };
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        tracing::error!("Daemon panic at {location}: {message}");
+    }));
+
+    if let Err(e) = try_main(app_dir) {
+        tracing::error!("Fatal error: {e}");
         std::process::exit(1);
     }
 }
