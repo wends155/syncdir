@@ -59,3 +59,12 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-14**: Builder successfully executed an S-Tier plan to update and correct outdated details in `architecture.md`. Rewrote Overview, Key Features, Module Boundaries, Diagrams, Known Constraints, and Environment Configuration sections to accurately reflect the multi-destination coordinator-broadcaster engine, namespaced SQLite cache databases, and tray status UI details. Checked with 27 passing tests.
 * **2026-07-15**: Builder successfully configured `ast-grep` (`sg`) with project-specific static analysis rules for Rust code safety, SQL injection prevention, path traversal auditing, and scattered environment variable centralization. Verified rule functionality and verified zero-exit on linter, formatter, and test suites.
 
+## 3. Context Compression
+* **Feature:** Configure `ast-grep` (`sg`) custom security rules
+* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`.
+* **New Constraints:** 
+  - Raw `.unwrap()` / `panic!()` / `todo!()` are banned in production code (triggers `unwrap-in-production`).
+  - Dynamic string formatting inside database executions is banned (triggers `sql-injection`).
+  - Raw filesystem functions must be wrapped, config-driven, or validated (triggers `path-traversal-leak` hint).
+  - Environment variables must be central in `src/config.rs` (triggers `scattered-env-var`).
+* **Pruned:** Manual checks for unwraps and env variables are now automated.
