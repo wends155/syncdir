@@ -3,7 +3,7 @@
 This document outlines the architecture, design patterns, and contracts for the Windows user-session background sync utility `syncdir`.
 
 ## 1. Project Overview
-`syncdir` is a lightweight, low-footprint Windows background utility that mirrors a source folder to a destination folder (which can be a local network-mapped share) using block-level delta synchronization. It is written in Rust, runs completely in user-space, and manages its interface via a Windows system tray icon.
+`syncdir` is a lightweight, low-footprint Windows background utility that mirrors a local source folder to one or more destination directories (local folders or mapped network shares) in real-time. It is written in Rust, runs completely in user-space, and manages its user interface and health status indicators via a Windows system tray icon.
 
 ## 2. Project Objectives & Key Features
 
@@ -11,14 +11,14 @@ This document outlines the architecture, design patterns, and contracts for the 
 * **Bandwidth Optimization**: Minimize network traffic by only writing modified blocks of large files over the local network (SMB).
 * **Zero Admin Requirements**: Run completely within the standard user's Windows login session without needing administrator privileges.
 * **Instant & Reliable Sync**: Provide real-time sync for active folders while fallback scans guarantee eventually consistent file states.
-* **Sleek UX**: Run silently in the background with a clean Windows system tray interface.
+* **Sleek UX**: Run silently in the background with a clean Windows system tray interface and dynamic status reporting.
 
 ### Key Features
-* **In-Place Block-Level Delta Sync**: Divide files >10MB into 1MB chunks and calculate cryptographic hashes (Blake3). Rewrite only modified blocks directly in the destination file using random-access writes.
-* **Local Signature Cache**: Maintain a local SQLite database of block hashes for source files. This prevents downloading/reading destination files over the network CIFS/SMB share to verify differences.
-* **Real-time File Watching**: Use Windows file change notifications via `ReadDirectoryChangesW` (debounced by 3 seconds) to capture changes immediately.
-* **Archive on Deletion**: Move deleted or overwritten destination files to a `.syncdir_archive/` subfolder with a timestamp prefix to enable easy manual restore.
-* **System Tray Menu**: Right-click menu containing "Open Config", "View Logs", "Sync Now", and "Exit".
+* **In-Place Block-Level Delta Sync**: Divide files >10MB into 1MB chunks and calculate cryptographic hashes (Blake3). Rewrite only modified blocks directly in the target destination files using random-access writes.
+* **Local Signature Caches**: Maintain isolated local SQLite databases of block hashes for each destination. This prevents downloading or reading destination files over network CIFS/SMB shares to verify differences.
+* **Real-time File Watching**: Use a central Windows directory notification hook via `ReadDirectoryChangesW` (debounced by 3 seconds) that broadcasts events to independent destination workers.
+* **Archive on Deletion**: Move deleted or overwritten destination files to a `.syncdir_archive/` subfolder on the target share with a timestamp prefix to enable easy manual restore.
+* **System Tray Menu**: Right-click menu displaying status details for each configured destination, with options to "Open Config", "View Logs", "Sync Now", and "Exit".
 
 ### Non-Goals
 * Two-way directory synchronization (strictly one-way source -> destination).
@@ -63,22 +63,22 @@ syncdir/
 * **Trait Interfaces**: None.
 
 ### `db`
-* **Owns**: Connection management to local SQLite database, SQL schemas, recording and retrieving file metadata and block signatures.
+* **Owns**: Connection management to isolated local SQLite databases, SQL schemas, recording and retrieving file metadata and block signatures. Generates separate cache database files (`sigcache_<hash>.db`) named using the Blake3 hash of the target path to prevent collisions.
 * **Does NOT own**: Calculating block hashes or filesystem read/writes.
 * **Trait Interfaces**:
   * `HashStore`: Interface for persisting and querying file block signatures.
 * **Mock Availability**: `MockHashStore` will be implemented for sync engine testing.
 
 ### `sync`
-* **Owns**: Scanning directory trees, comparing source/destination state, hashing files in 1MB blocks via Blake3, performing in-place block updates, and handling deletions (moving to archive).
+* **Owns**: Scanning directory trees, comparing source/destination state, hashing files in 1MB blocks via Blake3, performing in-place block updates, handling deletions (moving to archive), and running concurrent background worker loops (`start_sync_worker`) spawned per target destination folder.
 * **Does NOT own**: Watching directories, UI interactions.
 * **Trait Interfaces**:
   * `SyncEngine`: Core sync execution controller.
 * **Mock Availability**: `MockSyncEngine` for UI/tray triggers.
 
 ### `monitor`
-* **Owns**: Starting and running the directory monitoring thread (`ReadDirectoryChangesW`), grouping/debouncing file events.
-* **Does NOT own**: Sync execution (delegates to `SyncEngine`).
+* **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`), debouncing file events, and broadcasting `SyncCommand` events to multiple destination sync workers via crossbeam/std mpsc channels.
+* **Does NOT own**: Sync execution (delegates to `SyncEngine` worker threads).
 
 ### `tray`
 * **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications.
@@ -138,13 +138,13 @@ syncdir/
 ### Module Interaction Graph
 ```mermaid
 graph TD
-    Tray[tray] -->|Triggers Sync| Sync[sync]
+    Tray[tray] -->|Triggers/Monitors Sync| Sync[sync/workers]
     Tray -->|Reads config| Config[config]
-    Monitor[monitor] -->|Triggers debounced sync| Sync
+    Monitor[monitor/watcher] -->|Broadcasts SyncCommand| Sync
     Monitor -->|Reads paths| Config
     Sync -->|Loads signatures| Db[db]
     Sync -->|Reads paths| Config
-    Db -->|Reads DB path| Config
+    Db -->|Generates DB path from target hash| Config
     Sync -->|Logs errors| Error[error]
     Db -->|Converts errors| Error
     Config -->|Converts errors| Error
@@ -154,29 +154,31 @@ graph TD
 ```mermaid
 sequenceDiagram
     participant OS as Windows OS (notify)
-    participant Mon as Monitor Thread
-    participant SE as Sync Engine
-    participant DB as SQLite (db)
-    participant FS as Destination Folder
+    participant Mon as DirectoryWatcher Thread
+    participant Workers as Sync Worker Threads (per dest)
+    participant DB as SQLite Cache (per dest)
+    participant FS as Destination Folders
     
     OS->>Mon: File modified event
     Note over Mon: Debounce 3s
-    Mon->>SE: trigger_sync(file_path)
-    SE->>DB: get_file_signatures(relative_path)
-    DB-->>SE: Block hash signature array
-    Note over SE: Hash file in 1MB blocks (Blake3)
-    Note over SE: Calculate delta block differences
-    SE->>FS: Open target file (read-write)
-    loop for each changed block
-        SE->>FS: Seek to offset & overwrite block bytes
+    Mon->>Workers: Broadcast SyncCommand::Sync(path)
+    loop for each Sync Worker Thread
+        Workers->>DB: get_file_signatures(relative_path)
+        DB-->>Workers: Block hash signature array
+        Note over Workers: Hash file in 1MB blocks (Blake3)
+        Note over Workers: Calculate delta block differences
+        Workers->>FS: Open target file (read-write)
+        loop for each changed block
+            Workers->>FS: Seek to offset & overwrite block bytes
+        end
+        Workers->>FS: Update Last-Modified metadata
+        Workers->>DB: update_file_signatures(relative_path, new_hashes)
     end
-    SE->>FS: Update Last-Modified metadata
-    SE->>DB: update_file_signatures(relative_path, new_hashes)
 ```
 
 ## 14. Known Constraints & Technical Debt
-* **Network Latency**: If the network connection to the destination mapped share drops, `syncdir` will record the failure, skip sync for the file, and attempt to sync during the next periodic scan or when the share becomes reachable.
-* **Local DB Location**: Stored in `%APPDATA%\syncdir\sigcache.db`. If deleted, it will rebuild automatically during the next full scan by hashing the source directory.
+* **Network Latency**: If the network connection to a destination mapped share drops, `syncdir` will record the failure for that specific target worker, skip sync for the file, and attempt to sync during the next periodic scan or when the share becomes reachable.
+* **Local DB Location**: Stored in `%APPDATA%\syncdir\sigcache_<hash>.db` (where `<hash>` is the Blake3 hash of the destination directory path). If deleted, it will rebuild automatically during the next full scan by hashing the source directory.
 
 ## 15. Data Model
 
@@ -221,8 +223,18 @@ No external APIs or environment variables are required. Configuration is loaded 
 
 ```toml
 source_dir = "C:/Users/username/Documents"
-dest_dir = "Z:/Backup"
+
+# Multiple destinations:
+dest_dirs = [
+    "Z:/Backup",
+    "Y:/SecondaryBackup"
+]
+
+# Single destination fallback (backward-compatible):
+# dest_dir = "Z:/Backup"
+
 debounce_seconds = 3
+retry_interval_seconds = 10
 propagate_deletions = true
 block_sync_threshold_bytes = 10485760 # 10MB
 block_size_bytes = 1048576 # 1MB
