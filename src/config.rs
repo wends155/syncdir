@@ -33,8 +33,9 @@ impl Config {
     /// `SyncError::Config` if the TOML content is malformed.
     pub fn load(path: &Path) -> Result<Self, SyncError> {
         let content = std::fs::read_to_string(path)?;
+        let processed = preprocess_config_toml(&content);
         let config: Config =
-            toml::from_str(&content).map_err(|e| SyncError::Config(e.to_string()))?;
+            toml::from_str(&processed).map_err(|e| SyncError::Config(e.to_string()))?;
         Ok(config)
     }
 
@@ -83,6 +84,49 @@ impl Config {
     pub fn default_config_path() -> Result<PathBuf, SyncError> {
         Ok(Self::default_app_dir()?.join("config.toml"))
     }
+}
+
+fn preprocess_config_toml(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if (trimmed.starts_with("source_dir") || trimmed.starts_with("dest_dir"))
+            && trimmed.contains('=')
+        {
+            let first_quote = line.find('"');
+            let last_quote = line.rfind('"');
+            if let Some((first, last)) = first_quote.zip(last_quote).filter(|&(f, l)| f < l) {
+                let prefix = &line[..=first];
+                let suffix = &line[last..];
+                let path_part = &line[first + 1..last];
+
+                let mut processed_path = String::with_capacity(path_part.len() * 2);
+                let mut chars = path_part.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if chars.peek() == Some(&'\\') {
+                            processed_path.push('\\');
+                            processed_path.push('\\');
+                            chars.next();
+                        } else {
+                            processed_path.push('\\');
+                            processed_path.push('\\');
+                        }
+                    } else {
+                        processed_path.push(c);
+                    }
+                }
+                result.push_str(prefix);
+                result.push_str(&processed_path);
+                result.push_str(suffix);
+                result.push('\n');
+                continue;
+            }
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
 }
 
 #[cfg(test)]
@@ -183,6 +227,26 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.retry_interval_seconds, 10);
+    }
+
+    #[test]
+    fn test_config_parsing_unescaped_backslashes() {
+        let toml_str = r#"
+            source_dir = "Y:\Mill Processing\COMMON\MAINTENANCE"
+            dest_dir = "Z:\Backup\Folder"
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 1024
+            block_size_bytes = 512
+            verify_writes = true
+        "#;
+        let processed = preprocess_config_toml(toml_str);
+        let config: Config = toml::from_str(&processed).unwrap();
+        assert_eq!(
+            config.source_dir.to_string_lossy(),
+            r#"Y:\Mill Processing\COMMON\MAINTENANCE"#
+        );
+        assert_eq!(config.dest_dir.to_string_lossy(), r#"Z:\Backup\Folder"#);
     }
 
     #[test]
