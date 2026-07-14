@@ -3,6 +3,7 @@ name = "syncdir"
 version = "0.1.0"
 edition = "2024"
 description = "A lightweight Windows user-session background sync utility with block-level delta synchronization."
+license = "MIT"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
