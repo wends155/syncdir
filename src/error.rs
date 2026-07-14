@@ -20,4 +20,8 @@ pub enum SyncError {
     /// Runtime validation failure (e.g. missing directories).
     #[error("Validation error: {0}")]
     Validation(String),
+
+    /// File watcher failure.
+    #[error("Watcher error: {0}")]
+    Watcher(#[from] notify::Error),
 }

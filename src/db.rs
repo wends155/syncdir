@@ -24,6 +24,7 @@ pub trait HashStore {
     fn save_file(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError>;
     fn get_block_hashes(&self, file_id: i64) -> Result<Vec<Vec<u8>>, SyncError>;
     fn delete_file(&self, path: &str) -> Result<(), SyncError>;
+    fn list_files(&self) -> Result<Vec<String>, SyncError>;
 }
 
 /// SQLite implementation of `HashStore`.
@@ -190,6 +191,18 @@ impl HashStore for SqliteHashStore {
         )?;
         Ok(())
     }
+
+    fn list_files(&self) -> Result<Vec<String>, SyncError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT relative_path FROM file_metadata ORDER BY relative_path ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut paths = Vec::new();
+        while let Some(row) = rows.next()? {
+            paths.push(row.get(0)?);
+        }
+        Ok(paths)
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +322,39 @@ mod tests {
             let store = SqliteHashStore::new(temp.path(), &config_b).unwrap();
             assert!(store.get_file("test.bin").unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn test_list_files() {
+        let temp = NamedTempFile::new().unwrap();
+        let config = dummy_config(1024);
+        let store = SqliteHashStore::new(temp.path(), &config).unwrap();
+
+        // Empty database
+        assert!(store.list_files().unwrap().is_empty());
+
+        // Insert two files
+        let r1 = FileRecord {
+            id: None,
+            relative_path: "b_second.txt".to_string(),
+            file_size: 100,
+            last_modified: 1000,
+        };
+        let r2 = FileRecord {
+            id: None,
+            relative_path: "a_first.txt".to_string(),
+            file_size: 200,
+            last_modified: 2000,
+        };
+        store.save_file(&r1, &[vec![1; 32]]).unwrap();
+        store.save_file(&r2, &[vec![2; 32]]).unwrap();
+
+        let files = store.list_files().unwrap();
+        assert_eq!(files, vec!["a_first.txt", "b_second.txt"]);
+
+        // After delete, removed file is gone
+        store.delete_file("a_first.txt").unwrap();
+        let files = store.list_files().unwrap();
+        assert_eq!(files, vec!["b_second.txt"]);
     }
 }
