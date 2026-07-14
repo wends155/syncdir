@@ -149,3 +149,58 @@ fn test_propagate_deletions_false() {
         "Destination file must not be deleted when propagate_deletions is false"
     );
 }
+
+#[test]
+fn test_watcher_rename_event() {
+    use std::sync::mpsc::channel;
+    use syncdir::monitor::DirectoryWatcher;
+    use syncdir::sync::SyncCommand;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+
+    let config = Config {
+        source_dir: source.clone(),
+        dest_dir: dest.clone(),
+        debounce_seconds: 1,
+        propagate_deletions: true,
+        block_sync_threshold_bytes: 10,
+        block_size_bytes: 4,
+        verify_writes: true,
+    };
+
+    let (tx, rx) = channel();
+    let _watcher = DirectoryWatcher::start(&config, tx).unwrap();
+
+    let old_file = source.join("old.txt");
+    std::fs::write(&old_file, b"test").unwrap();
+
+    // Wait for creation event to clear
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    while rx.try_recv().is_ok() {}
+
+    let new_file = source.join("new.txt");
+    std::fs::rename(&old_file, &new_file).unwrap();
+
+    // Wait for rename events
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let mut received = Vec::new();
+    while let Ok(cmd) = rx.try_recv() {
+        received.push(cmd);
+    }
+
+    assert!(
+        received.contains(&SyncCommand::FileDeleted(PathBuf::from("old.txt"))),
+        "Should receive deletion command for renamed-from file, got: {:?}",
+        received
+    );
+    assert!(
+        received.contains(&SyncCommand::FileModified(PathBuf::from("new.txt"))),
+        "Should receive modification command for renamed-to file, got: {:?}",
+        received
+    );
+}

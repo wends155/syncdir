@@ -27,22 +27,87 @@ impl DirectoryWatcher {
 
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
-                Ok(event) => {
-                    for path in event.paths {
-                        if let Ok(rel_path) = path.strip_prefix(&source) {
-                            let rel = rel_path.to_path_buf();
-                            match event.kind {
-                                EventKind::Create(_) | EventKind::Modify(_) => {
-                                    let _ = tx.send(SyncCommand::FileModified(rel));
-                                }
-                                EventKind::Remove(_) => {
-                                    let _ = tx.send(SyncCommand::FileDeleted(rel));
-                                }
-                                _ => {}
+                Ok(event) => match event.kind {
+                    EventKind::Create(_)
+                    | EventKind::Modify(notify::event::ModifyKind::Data(_))
+                    | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+                    | EventKind::Modify(notify::event::ModifyKind::Any) => {
+                        for path in event.paths {
+                            if let Ok(rel_path) = path.strip_prefix(&source) {
+                                let _ = tx.send(SyncCommand::FileModified(rel_path.to_path_buf()));
                             }
                         }
                     }
-                }
+                    EventKind::Remove(_) => {
+                        for path in event.paths {
+                            if let Ok(rel_path) = path.strip_prefix(&source) {
+                                let _ = tx.send(SyncCommand::FileDeleted(rel_path.to_path_buf()));
+                            }
+                        }
+                    }
+                    EventKind::Modify(notify::event::ModifyKind::Name(rename_mode)) => {
+                        match rename_mode {
+                            notify::event::RenameMode::Both => {
+                                if event.paths.len() == 2 {
+                                    if let Ok(from_rel) = event.paths[0].strip_prefix(&source) {
+                                        let _ = tx
+                                            .send(SyncCommand::FileDeleted(from_rel.to_path_buf()));
+                                    }
+                                    if let Ok(to_rel) = event.paths[1].strip_prefix(&source) {
+                                        let _ = tx
+                                            .send(SyncCommand::FileModified(to_rel.to_path_buf()));
+                                    }
+                                } else {
+                                    for path in event.paths {
+                                        if let Ok(rel_path) = path.strip_prefix(&source) {
+                                            let _ = tx.send(SyncCommand::FileModified(
+                                                rel_path.to_path_buf(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            notify::event::RenameMode::From => {
+                                for path in event.paths {
+                                    if let Ok(rel_path) = path.strip_prefix(&source) {
+                                        let _ = tx
+                                            .send(SyncCommand::FileDeleted(rel_path.to_path_buf()));
+                                    }
+                                }
+                            }
+                            notify::event::RenameMode::To => {
+                                for path in event.paths {
+                                    if let Ok(rel_path) = path.strip_prefix(&source) {
+                                        let _ = tx.send(SyncCommand::FileModified(
+                                            rel_path.to_path_buf(),
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
+                                if event.paths.len() == 2 {
+                                    if let Ok(from_rel) = event.paths[0].strip_prefix(&source) {
+                                        let _ = tx
+                                            .send(SyncCommand::FileDeleted(from_rel.to_path_buf()));
+                                    }
+                                    if let Ok(to_rel) = event.paths[1].strip_prefix(&source) {
+                                        let _ = tx
+                                            .send(SyncCommand::FileModified(to_rel.to_path_buf()));
+                                    }
+                                } else {
+                                    for path in event.paths {
+                                        if let Ok(rel_path) = path.strip_prefix(&source) {
+                                            let _ = tx.send(SyncCommand::FileModified(
+                                                rel_path.to_path_buf(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 Err(e) => {
                     tracing::error!(error = %e, "Watcher error");
                 }
