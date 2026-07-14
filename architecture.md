@@ -34,19 +34,25 @@ This document outlines the architecture, design patterns, and contracts for the 
 ```
 syncdir/
 ├── Cargo.toml            # Project dependencies and workspace config
-├── GEMINI.md             # Operational rules and workflows
+├── Cargo.lock            # Cargo lockfile
+├── LICENSE               # Project MIT license
+├── README.md             # Project README documentation
 ├── architecture.md       # Technical design (this file)
 ├── spec.md               # Behavioral specifications
 ├── context.md            # Decisions and history
 ├── .agents/              # TARS rules, workflows, and scripts
+├── tests/
+│   └── integration_tests.rs # Integration testing suite
 └── src/
-    ├── main.rs           # Entry point and initialization
-    ├── config.rs         # Configuration parsing and validation
-    ├── db.rs             # SQLite local database management
-    ├── sync.rs           # Delta sync engine and chunking logic
-    ├── monitor.rs        # ReadDirectoryChangesW thread
-    ├── tray.rs           # System tray icon event loop
-    └── error.rs          # Project-wide error definitions
+    ├── lib.rs            # Crate library root and module declarations
+    ├── main.rs           # Daemon entry point and runner orchestration
+    ├── config.rs         # Configuration parsing and TOML path validation
+    ├── db.rs             # SQLite local database cache layer
+    ├── error.rs          # Project-wide error definitions
+    ├── monitor.rs        # ReadDirectoryChangesW event monitor
+    ├── startup.rs        # Platform-specific registry auto-start hook
+    ├── sync.rs           # Block delta sync engine and background worker
+    └── tray.rs           # System tray icon event loop and menus
 ```
 
 ## 5. Module Boundaries
@@ -113,7 +119,7 @@ syncdir/
 
 ## 10. Testing Strategy
 * **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs`, `src/db.rs`, and `src/sync.rs`.
-* **Integration Tests**: `tests/sync_integration.rs` simulating standard files, deletions, and directory updates using `tempfile`.
+* **Integration Tests**: `tests/integration_tests.rs` simulating standard files, deletions, and directory updates using `tempfile`.
 
 ## 11. Documentation Conventions
 * Every public struct, trait, and function must be documented using standard triple-slash `///` comments.
