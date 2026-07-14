@@ -28,7 +28,6 @@ pub enum EngineStatus {
 #[derive(Debug, Clone)]
 pub struct TargetStatusUpdate {
     pub target_index: usize,
-    pub source_online: bool,
     pub dest_online: bool,
 }
 
@@ -42,6 +41,11 @@ pub enum UserEvent {
     Menu(MenuEvent),
     /// A directory status change signal sent by the sync worker thread.
     StatusUpdate(TargetStatusUpdate),
+    /// Watcher status update sent by the coordinator thread.
+    WatcherStatus {
+        source_online: bool,
+        watcher_active: bool,
+    },
 }
 
 /// Generate a status-specific 32×32 RGBA tray icon.
@@ -186,8 +190,9 @@ pub fn run_tray(
 
     let num_targets = dests.len();
     let mut source_online = false;
+    let mut watcher_active = false;
     let mut dest_online = vec![false; num_targets];
-    let _ = source_online;
+    let mut needs_repaint = false;
 
     event_loop
         .run(move |event, elwt| {
@@ -232,7 +237,6 @@ pub fn run_tray(
                 }
                 #[allow(unused_assignments)]
                 Event::UserEvent(UserEvent::StatusUpdate(update)) => {
-                    source_online = update.source_online;
                     if update.target_index < num_targets {
                         dest_online[update.target_index] = update.dest_online;
                         let d_path = &dests[update.target_index];
@@ -248,44 +252,62 @@ pub fn run_tray(
                             d_path.display(),
                             status_str
                         ));
+                        needs_repaint = true;
                     }
-
-                    let all_dest_online = dest_online.iter().all(|&online| online);
-                    let any_dest_online = dest_online.iter().any(|&online| online);
-
-                    let status = if !source_online {
-                        if !any_dest_online {
-                            EngineStatus::BothOffline
-                        } else {
-                            EngineStatus::SourceOffline
-                        }
-                    } else {
-                        if all_dest_online {
-                            EngineStatus::Healthy
-                        } else {
-                            EngineStatus::DestinationOffline
-                        }
-                    };
-
-                    let online_count = dest_online.iter().filter(|&&online| online).count();
-                    let new_tooltip = format!(
-                        "syncdir — Src: {} | Dests: {}/{} Online",
-                        if source_online { "Online" } else { "Offline" },
-                        online_count,
-                        num_targets
-                    );
-
-                    let _ = tray_icon.set_tooltip(Some(&new_tooltip));
-                    if let Ok(new_icon) = generate_status_icon(status) {
-                        let _ = tray_icon.set_icon(Some(new_icon));
-                    }
-                    tracing::info!(
-                        status = ?status,
-                        online_count = online_count,
-                        "Tray status updated"
-                    );
+                }
+                #[allow(unused_assignments)]
+                Event::UserEvent(UserEvent::WatcherStatus {
+                    source_online: so,
+                    watcher_active: wa,
+                }) => {
+                    source_online = so;
+                    watcher_active = wa;
+                    needs_repaint = true;
                 }
                 _ => {}
+            }
+
+            if needs_repaint {
+                needs_repaint = false;
+                let all_dest_online = dest_online.iter().all(|&online| online);
+                let any_dest_online = dest_online.iter().any(|&online| online);
+
+                let status = if !source_online || !watcher_active {
+                    if !any_dest_online {
+                        EngineStatus::BothOffline
+                    } else {
+                        EngineStatus::SourceOffline
+                    }
+                } else {
+                    if all_dest_online {
+                        EngineStatus::Healthy
+                    } else {
+                        EngineStatus::DestinationOffline
+                    }
+                };
+
+                let online_count = dest_online.iter().filter(|&&online| online).count();
+                let src_status_str = if !source_online {
+                    "Offline"
+                } else if !watcher_active {
+                    "Degraded"
+                } else {
+                    "Online"
+                };
+                let new_tooltip = format!(
+                    "syncdir — Src: {} | Dests: {}/{} Online",
+                    src_status_str, online_count, num_targets
+                );
+
+                let _ = tray_icon.set_tooltip(Some(&new_tooltip));
+                if let Ok(new_icon) = generate_status_icon(status) {
+                    let _ = tray_icon.set_icon(Some(new_icon));
+                }
+                tracing::info!(
+                    status = ?status,
+                    online_count = online_count,
+                    "Tray status updated"
+                );
             }
         })
         .map_err(|e| SyncError::Tray(format!("Event loop error: {e}")))?;

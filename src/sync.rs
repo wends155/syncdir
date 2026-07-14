@@ -332,19 +332,19 @@ fn is_safe_relative_path(path: &Path) -> bool {
     true
 }
 
-/// Spawn a background sync worker that processes `SyncCommand`s with debouncing.
+/// Spawns a background synchronization worker thread.
 ///
-/// The worker drains the channel, accumulates pending syncs/deletes with a
-/// deadline based on `config.debounce_seconds`, and executes them once the
-/// deadline expires.
+/// The worker listens for filesystem events (file changes/deletions) on its channel
+/// and triggers block-level sync operations to its specific destination directory.
 ///
 /// # Arguments
 ///
-/// * `config` - Runtime configuration containing directories and intervals.
+/// * `target_index` - The unique index of the destination target.
+/// * `config` - Synchronization daemon configuration copy.
 /// * `db` - Persistent SQLite signature store.
-/// * `rx` - Receiver channel for file system events.
-/// * `tx` - Sender channel cloned and passed to new directory watchers.
-/// * `event_proxy` - Winit user event proxy for status signaling back to the tray.
+/// * `rx` - Channel receiver for processing `SyncCommand`s.
+/// * `event_proxy` - Winit proxy to signal directory status updates to the system tray.
+/// * `source_online_atomic` - Shared thread-safe flag indicating source presence.
 ///
 /// # Returns
 ///
@@ -355,6 +355,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
     db: S,
     rx: std::sync::mpsc::Receiver<SyncCommand>,
     event_proxy: Option<winit::event_loop::EventLoopProxy<crate::tray::UserEvent>>,
+    source_online_atomic: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let engine = LocalSyncEngine::new(db, config.clone());
@@ -363,7 +364,6 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
 
         let mut source_online = false;
         let mut dest_online = false;
-        let mut last_sent_source_online = None;
         let mut last_sent_dest_online = None;
 
         let mut last_status_check = Instant::now()
@@ -381,23 +381,19 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 last_status_check = now;
 
                 let current_source_online =
-                    config.source_dir.exists() && config.source_dir.is_dir();
+                    source_online_atomic.load(std::sync::atomic::Ordering::Relaxed);
                 let current_dest_online = config.dest_dir.exists() && config.dest_dir.is_dir();
 
                 source_online = current_source_online;
                 dest_online = current_dest_online;
 
-                if last_sent_source_online != Some(current_source_online)
-                    || last_sent_dest_online != Some(current_dest_online)
-                {
-                    last_sent_source_online = Some(current_source_online);
+                if last_sent_dest_online != Some(current_dest_online) {
                     last_sent_dest_online = Some(current_dest_online);
 
                     if let Some(ref proxy) = event_proxy {
                         let _ = proxy.send_event(crate::tray::UserEvent::StatusUpdate(
                             crate::tray::TargetStatusUpdate {
                                 target_index,
-                                source_online,
                                 dest_online,
                             },
                         ));

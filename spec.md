@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 09bf1e0
+> Last verified against: c8fba7d
  
 | Field | Value |
 |-------|-------|
@@ -89,7 +89,7 @@ THEN the metadata record and all associated block hashes are deleted (cascaded) 
 | `sync_file` | `(&self, relative_path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db` |
 | `delete_file` | `(&self, relative_path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
 | `run_full_scan` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db` |
-| `start_sync_worker` | `(config: Config, db: S, rx: Receiver<SyncCommand>, tx: Sender<SyncCommand>, event_proxy: Option<EventLoopProxy<UserEvent>>) -> JoinHandle<()>` | `JoinHandle<()>` | — |
+| `start_sync_worker` | `(target_index: usize, config: Config, db: S, rx: Receiver<SyncCommand>, event_proxy: Option<EventLoopProxy<UserEvent>>, source_online: std::sync::Arc<std::sync::atomic::AtomicBool>) -> JoinHandle<()>` | `JoinHandle<()>` | — |
  
 #### Behavioral Scenarios
  
@@ -275,10 +275,16 @@ Represents the online/offline presence state of sync directories.
 - `DestinationOffline` (destination directory offline)
 - `BothOffline` (both directories offline)
 
+### TargetStatusUpdate
+Per-target status report sent from worker threads.
+- `target_index`: usize
+- `dest_online`: bool
+
 ### UserEvent
 Custom events processed by the winit main thread UI event loop.
 - `Menu(MenuEvent)`
-- `Status(EngineStatus)`
+- `StatusUpdate(TargetStatusUpdate)`
+- `WatcherStatus { source_online: bool, watcher_active: bool }`
  
 ### SyncCommand
 Commands passed to the worker channel.

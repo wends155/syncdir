@@ -82,7 +82,8 @@ fn test_watcher_and_sync_engine_flow() {
 
     // Start watcher & sync worker BEFORE writing the file
     let _watcher = DirectoryWatcher::start(&config, tx.clone()).unwrap();
-    let _worker_handle = start_sync_worker(0, config.clone(), store, rx, None);
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let _worker_handle = start_sync_worker(0, config.clone(), store, rx, None, source_online);
 
     // Write a file in source — watcher should pick it up
     let file_path = source.join("notes.txt");

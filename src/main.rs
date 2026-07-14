@@ -83,6 +83,7 @@ retry_interval_seconds = 10
 
     let dests = config.resolved_dest_dirs();
     let mut worker_txs = Vec::new();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // 4. Initialize target databases and workers
     for (idx, dest) in dests.iter().enumerate() {
@@ -110,8 +111,14 @@ retry_interval_seconds = 10
             "Starting sync worker thread for target: {}...",
             dest.display()
         );
-        let _worker_handle =
-            start_sync_worker(idx, target_config, store, w_rx, Some(event_proxy.clone()));
+        let _worker_handle = start_sync_worker(
+            idx,
+            target_config,
+            store,
+            w_rx,
+            Some(event_proxy.clone()),
+            source_online.clone(),
+        );
     }
 
     // 5. Central coordination channels and threads
@@ -120,6 +127,8 @@ retry_interval_seconds = 10
     // Spawn central watcher coordinator thread
     let watcher_config = config.clone();
     let watcher_tx = tx.clone();
+    let watcher_source_online = source_online.clone();
+    let watcher_event_proxy = event_proxy.clone();
     std::thread::spawn(move || {
         let mut watcher: Option<syncdir::monitor::DirectoryWatcher> = None;
         let source_dir = watcher_config.source_dir.clone();
@@ -128,14 +137,19 @@ retry_interval_seconds = 10
             .checked_sub(retry_interval)
             .unwrap_or_else(std::time::Instant::now);
 
+        let mut last_sent_online = None;
+        let mut last_sent_active = None;
+
         loop {
             let now = std::time::Instant::now();
 
             if now.duration_since(last_status_check) >= retry_interval {
                 last_status_check = now;
-                let source_online = source_dir.exists() && source_dir.is_dir();
+                let is_online = source_dir.exists() && source_dir.is_dir();
+                watcher_source_online.store(is_online, std::sync::atomic::Ordering::Relaxed);
 
-                if source_online {
+                let mut watcher_active = false;
+                if is_online {
                     if watcher.is_none() {
                         tracing::info!("Source directory online. Starting directory watcher...");
                         match syncdir::monitor::DirectoryWatcher::start(
@@ -144,11 +158,15 @@ retry_interval_seconds = 10
                         ) {
                             Ok(w) => {
                                 watcher = Some(w);
+                                watcher_active = true;
                             }
                             Err(e) => {
                                 tracing::error!("Failed to start directory watcher: {e}");
+                                watcher_active = false;
                             }
                         }
+                    } else {
+                        watcher_active = true;
                     }
                 } else {
                     if watcher.is_some() {
@@ -158,6 +176,16 @@ retry_interval_seconds = 10
                         watcher = None;
                     }
                 }
+
+                if last_sent_online != Some(is_online) || last_sent_active != Some(watcher_active) {
+                    last_sent_online = Some(is_online);
+                    last_sent_active = Some(watcher_active);
+                    let _ =
+                        watcher_event_proxy.send_event(syncdir::tray::UserEvent::WatcherStatus {
+                            source_online: is_online,
+                            watcher_active,
+                        });
+                }
             }
 
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -166,12 +194,16 @@ retry_interval_seconds = 10
 
     // Spawn central broadcaster thread
     let broadcaster_rx = rx;
-    let worker_senders = worker_txs;
+    let mut worker_senders = worker_txs;
     std::thread::spawn(move || {
         while let Ok(cmd) = broadcaster_rx.recv() {
-            for worker_tx in &worker_senders {
-                let _ = worker_tx.send(cmd.clone());
-            }
+            worker_senders.retain(|worker_tx| match worker_tx.send(cmd.clone()) {
+                Ok(()) => true,
+                Err(_) => {
+                    tracing::warn!("Sync worker channel disconnected. Removing sender.");
+                    false
+                }
+            });
         }
     });
 
