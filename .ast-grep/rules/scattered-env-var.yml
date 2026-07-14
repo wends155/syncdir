@@ -1,0 +1,10 @@
+id: scattered-env-var
+message: "Raw std::env::var call outside of config module. Centralize all environment variable access in `src/config.rs`."
+note: "See coding-standard.md §4.10: MUST use centralized config struct instead of scattered std::env::var calls."
+severity: warning
+language: rust
+rule:
+  pattern: std::env::var($$$ARGS)
+ignores:
+  - "src/config.rs"
+  - "tests/**"

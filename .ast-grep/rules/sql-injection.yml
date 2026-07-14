@@ -1,0 +1,15 @@
+id: sql-injection
+message: "SQL Injection risk: dynamic string formatting passed to a database execution method. Use parameterized queries instead."
+note: "If you need dynamic table/column names, use a validated allowlist — never interpolate user input into SQL strings."
+severity: error
+language: rust
+rule:
+  any:
+    - pattern: $CONN.execute(format!($$$ARGS), $$$PARAMS)
+    - pattern: $CONN.prepare(format!($$$ARGS))
+    - pattern: $CONN.execute_batch(format!($$$ARGS))
+    - pattern: $CONN.execute(concat!($$$ARGS), $$$PARAMS)
+    - pattern: $CONN.prepare(concat!($$$ARGS))
+    - pattern: $CONN.execute_batch(concat!($$$ARGS))
+ignores:
+  - "tests/**"

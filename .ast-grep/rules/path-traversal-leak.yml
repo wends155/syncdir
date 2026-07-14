@@ -1,0 +1,20 @@
+id: path-traversal-leak
+message: "Filesystem operation detected. Ensure paths are validated (e.g. `is_safe_relative_path`) or constructed from trusted config values before use."
+note: "This is an audit hint, not necessarily a bug. Paths derived from Config.source_dir / Config.dest_dir are trusted. Flag raw user/external input only."
+severity: hint
+language: rust
+rule:
+  any:
+    - pattern: File::open($PATH)
+    - pattern: $X.open($PATH)
+    - pattern: std::fs::read_to_string($PATH)
+    - pattern: fs::read_to_string($PATH)
+    - pattern: fs::copy($$$ARGS)
+    - pattern: fs::write($$$ARGS)
+    - pattern: fs::rename($$$ARGS)
+    - pattern: fs::read($$$ARGS)
+ignores:
+  - "tests/**"
+  - "src/config.rs"
+  - "src/db.rs"
+  - "src/main.rs"

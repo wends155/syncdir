@@ -1,0 +1,12 @@
+id: unwrap-in-production
+message: "Avoid unwrap(), panic!(), or todo!() in production code. Use `?`, `map_err`, or `unwrap_or_default()` instead."
+note: "ast-grep ignores only applies to file paths; inline #[cfg(test)] modules in src/ files may trigger this warning — those are acceptable."
+severity: warning
+language: rust
+rule:
+  any:
+    - pattern: $X.unwrap()
+    - pattern: panic!($$$ARGS)
+    - pattern: todo!($$$ARGS)
+ignores:
+  - "tests/**"
