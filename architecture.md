@@ -26,7 +26,7 @@ This document outlines the architecture, design patterns, and contracts for the 
 * Complex Graphical Restore Interface (restore is handled manually via standard file explorer).
 
 ## 3. Language & Runtime
-* **Language**: Rust (Edition 2021)
+* **Language**: Rust (Edition 2024)
 * **Runtime**: Windows 10 and above (User login session)
 * **Toolchain**: `stable-x86_64-pc-windows-msvc` (MSVC Linker)
 
