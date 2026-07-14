@@ -4,7 +4,7 @@
 
 ## Overview
 
-`syncdir` is a lightweight, low-footprint Windows background utility that mirrors a local source folder to a destination folder (such as a local path or mapped network share) in real-time. It operates within the user login session to inherit appropriate permissions for accessing network drives.
+`syncdir` is a lightweight, low-footprint Windows background utility that mirrors a local source folder to one or more target destination directories (such as local folders or mapped network shares) in real-time. It operates within the user login session to inherit appropriate permissions for accessing network drives.
 
 To minimize network bandwidth and disk IO, `syncdir` uses a signature-based block-level delta synchronization mechanism:
 - Files smaller than 10MB are fully overwritten on change.
@@ -33,9 +33,17 @@ When started with no arguments, the `syncdir` daemon automatically loads or crea
 
 `config.toml` structure and defaults:
 ```toml
-# Source and destination directories to sync
+# Source directory to sync
 source_dir = "C:/Users/WSALIGAN/source_folder"
+
+# Primary destination directory
 dest_dir = "Z:/dest_folder"
+
+# Optional additional destination directories for multiple targets
+# dest_dirs = [
+#     "Y:/backup_folder_1",
+#     "X:/backup_folder_2"
+# ]
 
 # Real-time change notification debounce duration in seconds
 debounce_seconds = 3
@@ -67,6 +75,7 @@ verify_writes = true
 
 ## Features / Feature Flags
 
+- **Multiple Destinations**: Broadcasts filesystem change events from a single source folder to multiple independent target directories, running concurrent isolated sync processes.
 - **Block-level Delta Synchronization**: Only transfers modified 1MB blocks of files $\ge$ 10MB.
 - **Write Verification**: Reads back and hashes blocks immediately after writing to guarantee block integrity.
 - **Timestamp Alignment**: Automatically syncs destination file timestamps to match the source file, allowing fast-path comparison.

@@ -1,6 +1,6 @@
-//! syncdir — Windows background folder synchronization daemon.
+//! syncdir — A lightweight Windows user-session background sync utility with block-level delta synchronization.
 //!
-//! Mirrors a source folder to a destination folder using block-level
+//! Mirrors a source folder to one or more destination folders using block-level
 //! delta synchronization over the local network.
 
 use std::fs;
