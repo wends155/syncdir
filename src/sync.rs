@@ -350,10 +350,10 @@ fn is_safe_relative_path(path: &Path) -> bool {
 ///
 /// Returns the join handle for the spawned background worker thread.
 pub fn start_sync_worker<S: HashStore + Send + 'static>(
+    target_index: usize,
     config: Config,
     db: S,
     rx: std::sync::mpsc::Receiver<SyncCommand>,
-    tx: std::sync::mpsc::Sender<SyncCommand>,
     event_proxy: Option<winit::event_loop::EventLoopProxy<crate::tray::UserEvent>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -361,12 +361,11 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
         let mut pending_syncs: HashMap<PathBuf, Instant> = HashMap::new();
         let mut pending_deletes: HashMap<PathBuf, Instant> = HashMap::new();
 
-        let mut watcher: Option<crate::monitor::DirectoryWatcher> = None;
-        let mut current_status: Option<crate::tray::EngineStatus> = None;
         let mut source_online = false;
         let mut dest_online = false;
-        // Use checked_sub to avoid panic if Instant::now() is within
-        // retry_interval_seconds of the monotonic clock epoch (near boot).
+        let mut last_sent_source_online = None;
+        let mut last_sent_dest_online = None;
+
         let mut last_status_check = Instant::now()
             .checked_sub(std::time::Duration::from_secs(
                 config.retry_interval_seconds,
@@ -381,42 +380,27 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
             {
                 last_status_check = now;
 
-                source_online = config.source_dir.exists() && config.source_dir.is_dir();
-                dest_online = config.dest_dir.exists() && config.dest_dir.is_dir();
+                let current_source_online =
+                    config.source_dir.exists() && config.source_dir.is_dir();
+                let current_dest_online = config.dest_dir.exists() && config.dest_dir.is_dir();
 
-                let new_status = match (source_online, dest_online) {
-                    (true, true) => crate::tray::EngineStatus::Healthy,
-                    (false, true) => crate::tray::EngineStatus::SourceOffline,
-                    (true, false) => crate::tray::EngineStatus::DestinationOffline,
-                    (false, false) => crate::tray::EngineStatus::BothOffline,
-                };
+                source_online = current_source_online;
+                dest_online = current_dest_online;
 
-                // Manage watcher lifecycle dynamically
-                if source_online {
-                    if watcher.is_none() {
-                        tracing::info!("Source directory online. Starting directory watcher...");
-                        match crate::monitor::DirectoryWatcher::start(&config, tx.clone()) {
-                            Ok(w) => {
-                                watcher = Some(w);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to start directory watcher: {e}");
-                            }
-                        }
-                    }
-                } else {
-                    if watcher.is_some() {
-                        tracing::warn!(
-                            "Source directory went offline. Dropping directory watcher."
-                        );
-                        watcher = None;
-                    }
-                }
+                if last_sent_source_online != Some(current_source_online)
+                    || last_sent_dest_online != Some(current_dest_online)
+                {
+                    last_sent_source_online = Some(current_source_online);
+                    last_sent_dest_online = Some(current_dest_online);
 
-                if Some(new_status) != current_status {
-                    current_status = Some(new_status);
                     if let Some(ref proxy) = event_proxy {
-                        let _ = proxy.send_event(crate::tray::UserEvent::Status(new_status));
+                        let _ = proxy.send_event(crate::tray::UserEvent::StatusUpdate(
+                            crate::tray::TargetStatusUpdate {
+                                target_index,
+                                source_online,
+                                dest_online,
+                            },
+                        ));
                     }
                 }
             }

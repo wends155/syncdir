@@ -26,8 +26,14 @@ fn try_main(app_dir: PathBuf) -> Result<(), SyncError> {
 # The directory to monitor for changes.
 source_dir = "C:\\path\\to\\source"
 
-# The destination directory to synchronize changes to.
+# The primary destination directory to synchronize changes to.
 dest_dir = "C:\\path\\to\\destination"
+
+# Optional additional destination directories to synchronize changes to.
+# dest_dirs = [
+#     "D:\\backup\\destination1",
+#     "E:\\backup\\destination2"
+# ]
 
 # Debounce delay in seconds before performing a sync.
 debounce_seconds = 3
@@ -75,24 +81,106 @@ retry_interval_seconds = 10
             .map_err(|e| SyncError::Tray(format!("Failed to create event loop: {e}")))?;
     let event_proxy = event_loop.create_proxy();
 
-    // 4. Initialize Database
-    let db_path = app_dir.join("sigcache.db");
-    tracing::info!("Opening signature cache database at: {}", db_path.display());
-    let store = SqliteHashStore::new(&db_path, &config)?;
+    let dests = config.resolved_dest_dirs();
+    let mut worker_txs = Vec::new();
 
-    // 5. Wire channel and worker
+    // 4. Initialize target databases and workers
+    for (idx, dest) in dests.iter().enumerate() {
+        let mut target_config = config.clone();
+        target_config.dest_dir = dest.clone();
+
+        // Calculate isolated SQLite database filename using Blake3 hash of the target path
+        let dest_str = dest.to_string_lossy();
+        let hash = blake3::hash(dest_str.as_bytes());
+        let db_filename = format!("sigcache_{}.db", hash.to_hex());
+        let db_path = app_dir.join(db_filename);
+
+        tracing::info!(
+            "Opening signature cache database for target {} at: {}",
+            dest.display(),
+            db_path.display()
+        );
+        let store = SqliteHashStore::new(&db_path, &target_config)?;
+
+        // Wire per-worker channel
+        let (w_tx, w_rx) = channel();
+        worker_txs.push(w_tx);
+
+        tracing::info!(
+            "Starting sync worker thread for target: {}...",
+            dest.display()
+        );
+        let _worker_handle =
+            start_sync_worker(idx, target_config, store, w_rx, Some(event_proxy.clone()));
+    }
+
+    // 5. Central coordination channels and threads
     let (tx, rx) = channel();
 
-    tracing::info!("Starting sync worker thread...");
-    let _worker_handle =
-        start_sync_worker(config.clone(), store, rx, tx.clone(), Some(event_proxy));
+    // Spawn central watcher coordinator thread
+    let watcher_config = config.clone();
+    let watcher_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut watcher: Option<syncdir::monitor::DirectoryWatcher> = None;
+        let source_dir = watcher_config.source_dir.clone();
+        let retry_interval = std::time::Duration::from_secs(watcher_config.retry_interval_seconds);
+        let mut last_status_check = std::time::Instant::now()
+            .checked_sub(retry_interval)
+            .unwrap_or_else(std::time::Instant::now);
+
+        loop {
+            let now = std::time::Instant::now();
+
+            if now.duration_since(last_status_check) >= retry_interval {
+                last_status_check = now;
+                let source_online = source_dir.exists() && source_dir.is_dir();
+
+                if source_online {
+                    if watcher.is_none() {
+                        tracing::info!("Source directory online. Starting directory watcher...");
+                        match syncdir::monitor::DirectoryWatcher::start(
+                            &watcher_config,
+                            watcher_tx.clone(),
+                        ) {
+                            Ok(w) => {
+                                watcher = Some(w);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to start directory watcher: {e}");
+                            }
+                        }
+                    }
+                } else {
+                    if watcher.is_some() {
+                        tracing::warn!(
+                            "Source directory went offline. Dropping directory watcher."
+                        );
+                        watcher = None;
+                    }
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+
+    // Spawn central broadcaster thread
+    let broadcaster_rx = rx;
+    let worker_senders = worker_txs;
+    std::thread::spawn(move || {
+        while let Ok(cmd) = broadcaster_rx.recv() {
+            for worker_tx in &worker_senders {
+                let _ = worker_tx.send(cmd.clone());
+            }
+        }
+    });
 
     // Trigger initial sync scan
     let _ = tx.send(SyncCommand::TriggerFullScan);
 
     // 6. Run tray UI (blocks the main thread)
     tracing::info!("Starting system tray UI loop.");
-    run_tray(event_loop, config_path, log_dir, tx)?;
+    run_tray(event_loop, config_path, log_dir, tx, dests)?;
 
     tracing::info!("syncdir daemon shut down cleanly.");
     Ok(())

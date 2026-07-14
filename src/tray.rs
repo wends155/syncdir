@@ -3,7 +3,7 @@ use crate::startup::StartupRegistry;
 use crate::sync::SyncCommand;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use winit::event::Event;
 use winit::event_loop::ControlFlow;
@@ -24,6 +24,14 @@ pub enum EngineStatus {
     BothOffline,
 }
 
+/// Per-target status report sent from worker threads to the tray event loop.
+#[derive(Debug, Clone)]
+pub struct TargetStatusUpdate {
+    pub target_index: usize,
+    pub source_online: bool,
+    pub dest_online: bool,
+}
+
 /// Custom winit user event to wake up the loop on tray interactions and status updates.
 ///
 /// This enum allows background worker threads and OS menu clicks to safely signal
@@ -33,7 +41,7 @@ pub enum UserEvent {
     /// A menu item click event forwarded from the tray menu callback.
     Menu(MenuEvent),
     /// A directory status change signal sent by the sync worker thread.
-    Status(EngineStatus),
+    StatusUpdate(TargetStatusUpdate),
 }
 
 /// Generate a status-specific 32×32 RGBA tray icon.
@@ -106,11 +114,13 @@ fn open_path(path: &std::path::Path) -> Result<(), SyncError> {
 /// # Errors
 ///
 /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
+#[allow(unused_assignments)]
 pub fn run_tray(
     event_loop: winit::event_loop::EventLoop<UserEvent>,
     config_path: PathBuf,
     log_dir: PathBuf,
     tx: Sender<SyncCommand>,
+    dests: Vec<PathBuf>,
 ) -> Result<(), SyncError> {
     let open_config = MenuItem::new("Open Config", true, None);
     let view_logs = MenuItem::new("View Logs", true, None);
@@ -130,6 +140,26 @@ pub fn run_tray(
     menu.append(&sync_now)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
     menu.append(&startup_toggle)
+        .map_err(|e| SyncError::Tray(e.to_string()))?;
+
+    // Add per-destination items
+    let mut dest_menu_items = Vec::new();
+    if !dests.is_empty() {
+        let separator = PredefinedMenuItem::separator();
+        menu.append(&separator)
+            .map_err(|e| SyncError::Tray(e.to_string()))?;
+
+        for d in &dests {
+            let label = format!("○ {} (Offline)", d.display());
+            let item = MenuItem::new(&label, false, None); // Read-only / disabled
+            menu.append(&item)
+                .map_err(|e| SyncError::Tray(e.to_string()))?;
+            dest_menu_items.push(item);
+        }
+    }
+
+    let separator_exit = PredefinedMenuItem::separator();
+    menu.append(&separator_exit)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
     menu.append(&exit)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
@@ -153,6 +183,11 @@ pub fn run_tray(
     let sync_now_id = sync_now.id().clone();
     let startup_toggle_id = startup_toggle.id().clone();
     let exit_id = exit.id().clone();
+
+    let num_targets = dests.len();
+    let mut source_online = false;
+    let mut dest_online = vec![false; num_targets];
+    let _ = source_online;
 
     event_loop
         .run(move |event, elwt| {
@@ -195,20 +230,60 @@ pub fn run_tray(
                         }
                     }
                 }
-                Event::UserEvent(UserEvent::Status(status)) => {
-                    let new_tooltip = match status {
-                        EngineStatus::Healthy => "syncdir — Folder Sync (Healthy)",
-                        EngineStatus::SourceOffline => "syncdir — Warning: Source Offline",
-                        EngineStatus::DestinationOffline => {
-                            "syncdir — Warning: Destination Offline"
+                #[allow(unused_assignments)]
+                Event::UserEvent(UserEvent::StatusUpdate(update)) => {
+                    source_online = update.source_online;
+                    if update.target_index < num_targets {
+                        dest_online[update.target_index] = update.dest_online;
+                        let d_path = &dests[update.target_index];
+                        let status_str = if update.dest_online {
+                            "Online"
+                        } else {
+                            "Offline"
+                        };
+                        let indicator = if update.dest_online { "●" } else { "○" };
+                        dest_menu_items[update.target_index].set_text(format!(
+                            "{} {} ({})",
+                            indicator,
+                            d_path.display(),
+                            status_str
+                        ));
+                    }
+
+                    let all_dest_online = dest_online.iter().all(|&online| online);
+                    let any_dest_online = dest_online.iter().any(|&online| online);
+
+                    let status = if !source_online {
+                        if !any_dest_online {
+                            EngineStatus::BothOffline
+                        } else {
+                            EngineStatus::SourceOffline
                         }
-                        EngineStatus::BothOffline => "syncdir — Error: Both Folders Offline",
+                    } else {
+                        if all_dest_online {
+                            EngineStatus::Healthy
+                        } else {
+                            EngineStatus::DestinationOffline
+                        }
                     };
-                    let _ = tray_icon.set_tooltip(Some(new_tooltip));
+
+                    let online_count = dest_online.iter().filter(|&&online| online).count();
+                    let new_tooltip = format!(
+                        "syncdir — Src: {} | Dests: {}/{} Online",
+                        if source_online { "Online" } else { "Offline" },
+                        online_count,
+                        num_targets
+                    );
+
+                    let _ = tray_icon.set_tooltip(Some(&new_tooltip));
                     if let Ok(new_icon) = generate_status_icon(status) {
                         let _ = tray_icon.set_icon(Some(new_icon));
                     }
-                    tracing::info!(status = ?status, "Tray status updated");
+                    tracing::info!(
+                        status = ?status,
+                        online_count = online_count,
+                        "Tray status updated"
+                    );
                 }
                 _ => {}
             }

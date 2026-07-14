@@ -110,9 +110,9 @@ fn preprocess_config_toml(content: &str) -> String {
         let trimmed = line.trim();
         let is_config_line = (trimmed.starts_with("source_dir") || trimmed.starts_with("dest_dir"))
             && trimmed.contains('=');
-        
+
         let starts_dest_dirs = trimmed.starts_with("dest_dirs") && trimmed.contains('=');
-        
+
         if starts_dest_dirs {
             // Check if array is multi-line (has opening bracket but no closing bracket on this line)
             if trimmed.contains('[') && !trimmed.contains(']') {
