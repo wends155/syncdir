@@ -1,13 +1,9 @@
-//! System tray notification area UI for syncdir.
-//!
-//! Creates a windowless background application with a tray icon and
-//! right-click context menu for controlling the sync daemon.
-
+use crate::config::StartupRegistry;
 use crate::error::SyncError;
 use crate::sync::SyncCommand;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use winit::event::Event;
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
@@ -72,6 +68,11 @@ pub fn run_tray(
     let open_config = MenuItem::new("Open Config", true, None);
     let view_logs = MenuItem::new("View Logs", true, None);
     let sync_now = MenuItem::new("Sync Now", true, None);
+
+    let initially_checked = StartupRegistry::is_registered().unwrap_or(false);
+    let startup_toggle =
+        CheckMenuItem::new("Start on System Startup", true, initially_checked, None);
+
     let exit = MenuItem::new("Exit", true, None);
 
     let menu = Menu::new();
@@ -80,6 +81,8 @@ pub fn run_tray(
     menu.append(&view_logs)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
     menu.append(&sync_now)
+        .map_err(|e| SyncError::Tray(e.to_string()))?;
+    menu.append(&startup_toggle)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
     menu.append(&exit)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
@@ -101,6 +104,7 @@ pub fn run_tray(
     let open_config_id = open_config.id().clone();
     let view_logs_id = view_logs.id().clone();
     let sync_now_id = sync_now.id().clone();
+    let startup_toggle_id = startup_toggle.id().clone();
     let exit_id = exit.id().clone();
 
     event_loop
@@ -118,6 +122,29 @@ pub fn run_tray(
                     let _ = open_path(&config_path);
                 } else if menu_event.id == view_logs_id {
                     let _ = open_path(&log_dir);
+                } else if menu_event.id == startup_toggle_id {
+                    let is_checked = startup_toggle.is_checked();
+                    if is_checked {
+                        match StartupRegistry::register() {
+                            Ok(()) => {
+                                tracing::info!("Startup auto-run registered via tray menu");
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to register startup from tray: {e}");
+                                startup_toggle.set_checked(false);
+                            }
+                        }
+                    } else {
+                        match StartupRegistry::unregister() {
+                            Ok(()) => {
+                                tracing::info!("Startup auto-run unregistered via tray menu");
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to unregister startup from tray: {e}");
+                                startup_toggle.set_checked(true);
+                            }
+                        }
+                    }
                 }
             }
         })

@@ -22,6 +22,9 @@
 |----------|-----------|---------|--------|
 | `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
 | `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (Missing paths, zero debounce) |
+| `StartupRegistry::is_registered` | `() -> Result<bool, SyncError>` | `bool` | `SyncError::Io` |
+| `StartupRegistry::register` | `() -> Result<(), SyncError>` | `()` | `SyncError::Config` (registry write failure) |
+| `StartupRegistry::unregister` | `() -> Result<(), SyncError>` | `()` | — |
 
 #### Behavioral Scenarios
 
@@ -180,11 +183,20 @@ stateDiagram-v2
 
 ## Command/CLI Contracts
 
-The daemon runs in the background. It is invoked with the configuration path:
+The daemon runs in the background. It is invoked with options:
 ```sh
-syncdir --config <path-to-config.toml>
+syncdir [OPTIONS]
 ```
-If no config file is specified, it defaults to looking for `config.toml` in the current working directory.
+
+| Option | Description | Action | Exit Code |
+|--------|-------------|--------|-----------|
+| `--help`, `-h` | Prints help and usage details | Prints to stdout | `0` |
+| `--version`, `-v` | Prints current package version | Prints to stdout | `0` |
+| `--register-startup` | Registers the daemon in Windows startup registry | Writes HKCU run key (with `--autostart` suffix) | `0` (success), `1` (registry error) |
+| `--unregister-startup` | Unregisters the daemon from Windows startup registry | Deletes HKCU run key | `0` (success), `1` (registry error) |
+| `--autostart` | Windows Auto-Start trigger | Starts background sync daemon | — |
+
+If no options are specified, the daemon starts the background sync. It defaults to looking for `%APPDATA%\syncdir\config.toml` (loading configuration and initializing DB / tray loop).
 
 ---
 
