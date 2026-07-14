@@ -3,15 +3,15 @@
 //! Defines the message types that the monitor and tray threads
 //! send to the sync worker, and the trait contract for the sync engine.
 
-use std::path::PathBuf;
+use crate::config::Config;
+use crate::db::{FileRecord, HashStore};
+use crate::error::SyncError;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use crate::config::Config;
-use crate::db::{HashStore, FileRecord};
-use crate::error::SyncError;
 
 /// Commands sent from the file watcher or tray UI to the sync worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +51,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let mut file = File::open(file_path)?;
         let metadata = file.metadata()?;
         let file_size = metadata.len() as i64;
-        let last_modified = metadata.modified()?
+        let last_modified = metadata
+            .modified()?
             .duration_since(UNIX_EPOCH)
             .map_err(|e| SyncError::Config(e.to_string()))?
             .as_secs() as i64;
@@ -62,7 +63,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         loop {
             let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 { break; }
+            if bytes_read == 0 {
+                break;
+            }
             let hash = blake3::hash(&buffer[..bytes_read]);
             hashes.push(hash.as_bytes().to_vec());
         }
@@ -80,7 +83,10 @@ impl<S: HashStore> LocalSyncEngine<S> {
             for rest in components {
                 archive_rel.push(rest);
             }
-            self.config.dest_dir.join(".syncdir_archive").join(archive_rel)
+            self.config
+                .dest_dir
+                .join(".syncdir_archive")
+                .join(archive_rel)
         } else {
             self.config.dest_dir.join(".syncdir_archive")
         }
@@ -95,7 +101,8 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         if !src_path.exists() {
             return Err(SyncError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound, "Source file not found",
+                std::io::ErrorKind::NotFound,
+                "Source file not found",
             )));
         }
 
@@ -105,7 +112,8 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         if dest_path.exists() {
             let dest_meta = fs::metadata(&dest_path)?;
             let dest_size = dest_meta.len() as i64;
-            let dest_mod = dest_meta.modified()?
+            let dest_mod = dest_meta
+                .modified()?
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| SyncError::Config(e.to_string()))?
                 .as_secs() as i64;
@@ -130,11 +138,9 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
             // Windows requires write access for set_times
             let dest_file = OpenOptions::new().write(true).open(&dest_path)?;
-            dest_file.set_times(
-                fs::FileTimes::new().set_modified(
-                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(src_mod as u64)
-                )
-            )?;
+            dest_file.set_times(fs::FileTimes::new().set_modified(
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(src_mod as u64),
+            ))?;
 
             let record = FileRecord {
                 id: None,
@@ -151,7 +157,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             fs::create_dir_all(parent)?;
         }
         let mut dest_file = OpenOptions::new()
-            .read(true).write(true).create(true)
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
             .open(&dest_path)?;
 
         let file_record = self.db.get_file(path)?;
@@ -180,7 +189,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                         let verify_hash = blake3::hash(&verify_buf);
                         if verify_hash.as_bytes() != hash.as_slice() {
                             return Err(SyncError::Validation(
-                                "Write verification failed".to_string()
+                                "Write verification failed".to_string(),
                             ));
                         }
                     }
@@ -190,11 +199,9 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         // Truncate if file shrank
         dest_file.set_len(src_size as u64)?;
-        dest_file.set_times(
-            fs::FileTimes::new().set_modified(
-                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(src_mod as u64)
-            )
-        )?;
+        dest_file.set_times(fs::FileTimes::new().set_modified(
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(src_mod as u64),
+        ))?;
 
         let record = FileRecord {
             id: file_record.and_then(|r| r.id),
@@ -240,7 +247,9 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let mut source_files = HashSet::new();
 
         fn scan_dir(
-            dir: &Path, source_root: &Path, files: &mut HashSet<String>,
+            dir: &Path,
+            source_root: &Path,
+            files: &mut HashSet<String>,
         ) -> Result<(), std::io::Error> {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
@@ -256,7 +265,11 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             Ok(())
         }
 
-        scan_dir(&self.config.source_dir, &self.config.source_dir, &mut source_files)?;
+        scan_dir(
+            &self.config.source_dir,
+            &self.config.source_dir,
+            &mut source_files,
+        )?;
 
         // Sync all source files
         for rel_path in &source_files {
@@ -275,6 +288,73 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         Ok(())
     }
+}
+
+/// Spawn a background sync worker that processes `SyncCommand`s with debouncing.
+///
+/// The worker drains the channel, accumulates pending syncs/deletes with a
+/// deadline based on `config.debounce_seconds`, and executes them once the
+/// deadline expires. Returns the thread join handle.
+pub fn start_sync_worker<S: HashStore + Send + 'static>(
+    config: Config,
+    db: S,
+    rx: std::sync::mpsc::Receiver<SyncCommand>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let engine = LocalSyncEngine::new(db, config.clone());
+        let mut pending_syncs: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut pending_deletes: HashMap<PathBuf, Instant> = HashMap::new();
+
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(SyncCommand::FileModified(path)) => {
+                    let deadline =
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
+                    pending_syncs.insert(path.clone(), deadline);
+                    pending_deletes.remove(&path);
+                }
+                Ok(SyncCommand::FileDeleted(path)) => {
+                    let deadline =
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
+                    pending_deletes.insert(path.clone(), deadline);
+                    pending_syncs.remove(&path);
+                }
+                Ok(SyncCommand::TriggerFullScan) => {
+                    if let Err(e) = engine.run_full_scan() {
+                        tracing::error!(error = %e, "Full scan failed");
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            let now = Instant::now();
+
+            let ready_syncs: Vec<_> = pending_syncs
+                .iter()
+                .filter(|(_, deadline)| now >= **deadline)
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in ready_syncs {
+                pending_syncs.remove(&path);
+                if let Err(e) = engine.sync_file(&path.to_string_lossy()) {
+                    tracing::warn!(path = %path.display(), error = %e, "Sync failed");
+                }
+            }
+
+            let ready_deletes: Vec<_> = pending_deletes
+                .iter()
+                .filter(|(_, deadline)| now >= **deadline)
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in ready_deletes {
+                pending_deletes.remove(&path);
+                if let Err(e) = engine.delete_file(&path.to_string_lossy()) {
+                    tracing::warn!(path = %path.display(), error = %e, "Delete failed");
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -344,7 +424,11 @@ mod tests {
         fs::write(&big_bin_path, b"AAAAZZZZCCCC").unwrap();
         // Advance modified time to avoid fast-path matching in the same second
         let f = OpenOptions::new().write(true).open(&big_bin_path).unwrap();
-        f.set_times(fs::FileTimes::new().set_modified(SystemTime::now() + std::time::Duration::from_secs(5))).unwrap();
+        f.set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
 
         engine.sync_file("big.bin").unwrap();
 
@@ -384,7 +468,8 @@ mod tests {
         // Should be in .syncdir_archive
         let archive = dest.join(".syncdir_archive");
         assert!(archive.exists());
-        let entries: Vec<_> = fs::read_dir(&archive).unwrap()
+        let entries: Vec<_> = fs::read_dir(&archive)
+            .unwrap()
             .filter_map(|e| e.ok())
             .collect();
         assert_eq!(entries.len(), 1);

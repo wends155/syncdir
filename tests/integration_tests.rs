@@ -48,3 +48,51 @@ fn test_integration_config_db_sync_commands() {
     let fetched_hashes = store.get_block_hashes(fetched.id.unwrap()).unwrap();
     assert_eq!(fetched_hashes.len(), 4);
 }
+
+#[test]
+fn test_watcher_and_sync_engine_flow() {
+    use std::sync::mpsc::channel;
+    use syncdir::monitor::DirectoryWatcher;
+    use syncdir::sync::start_sync_worker;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+    let db_path = dir.path().join("sigcache.db");
+
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+
+    let config = Config {
+        source_dir: source.clone(),
+        dest_dir: dest.clone(),
+        debounce_seconds: 1,
+        propagate_deletions: true,
+        block_sync_threshold_bytes: 10,
+        block_size_bytes: 4,
+        verify_writes: true,
+    };
+
+    let store = SqliteHashStore::new(&db_path, &config).unwrap();
+    let (tx, rx) = channel();
+
+    // Start watcher & sync worker BEFORE writing the file
+    let _watcher = DirectoryWatcher::start(&config, tx).unwrap();
+    let _worker_handle = start_sync_worker(config.clone(), store, rx);
+
+    // Write a file in source — watcher should pick it up
+    let file_path = source.join("notes.txt");
+    std::fs::write(&file_path, b"hello world").unwrap();
+
+    // Wait for debounce (1s) + processing margin
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Verify dest file contains synchronized content
+    let dest_file_path = dest.join("notes.txt");
+    assert!(
+        dest_file_path.exists(),
+        "Destination file should exist after sync"
+    );
+    let content = std::fs::read_to_string(&dest_file_path).unwrap();
+    assert_eq!(content, "hello world");
+}

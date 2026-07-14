@@ -5,5 +5,5 @@
 pub mod config;
 pub mod db;
 pub mod error;
-pub mod sync;
 pub mod monitor;
+pub mod sync;

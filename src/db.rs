@@ -193,9 +193,9 @@ impl HashStore for SqliteHashStore {
     }
 
     fn list_files(&self) -> Result<Vec<String>, SyncError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT relative_path FROM file_metadata ORDER BY relative_path ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT relative_path FROM file_metadata ORDER BY relative_path ASC")?;
         let mut rows = stmt.query([])?;
         let mut paths = Vec::new();
         while let Some(row) = rows.next()? {
