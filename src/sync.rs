@@ -54,8 +54,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let last_modified = metadata
             .modified()?
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| SyncError::Config(e.to_string()))?
-            .as_secs() as i64;
+            .map_err(|e| SyncError::Validation(e.to_string()))?
+            .as_millis() as i64;
 
         let block_size = self.config.block_size_bytes as usize;
         let mut buffer = vec![0; block_size];
@@ -96,6 +96,12 @@ impl<S: HashStore> LocalSyncEngine<S> {
 impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     fn sync_file(&self, path: &str) -> Result<(), SyncError> {
         let rel_path = PathBuf::from(path);
+        if !is_safe_relative_path(&rel_path) {
+            return Err(SyncError::Validation(format!(
+                "Unsafe path traversal detected: {}",
+                path
+            )));
+        }
         let src_path = self.config.source_dir.join(&rel_path);
         let dest_path = self.config.dest_dir.join(&rel_path);
 
@@ -115,8 +121,8 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             let dest_mod = dest_meta
                 .modified()?
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| SyncError::Config(e.to_string()))?
-                .as_secs() as i64;
+                .map_err(|e| SyncError::Validation(e.to_string()))?
+                .as_millis() as i64;
 
             if let Some(record) = self.db.get_file(path)?
                 && record.file_size == src_size
@@ -138,7 +144,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             // Windows requires write access for set_times
             let dest_file = OpenOptions::new().write(true).open(&dest_path)?;
             dest_file.set_times(fs::FileTimes::new().set_modified(
-                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(src_mod as u64),
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(src_mod as u64),
             ))?;
 
             let record = FileRecord {
@@ -164,7 +170,12 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         let file_record = self.db.get_file(path)?;
         let old_hashes = match &file_record {
-            Some(rec) => self.db.get_block_hashes(rec.id.unwrap_or(0))?,
+            Some(rec) => {
+                let id = rec.id.ok_or_else(|| {
+                    SyncError::Validation("Corrupted file record: missing ID".to_string())
+                })?;
+                self.db.get_block_hashes(id)?
+            }
             None => Vec::new(),
         };
 
@@ -199,7 +210,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         // Truncate if file shrank
         dest_file.set_len(src_size as u64)?;
         dest_file.set_times(fs::FileTimes::new().set_modified(
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(src_mod as u64),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(src_mod as u64),
         ))?;
 
         let record = FileRecord {
@@ -214,12 +225,18 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
     fn delete_file(&self, path: &str) -> Result<(), SyncError> {
         let rel_path = PathBuf::from(path);
+        if !is_safe_relative_path(&rel_path) {
+            return Err(SyncError::Validation(format!(
+                "Unsafe path traversal detected: {}",
+                path
+            )));
+        }
         let dest_path = self.config.dest_dir.join(&rel_path);
 
         if dest_path.exists() && self.config.propagate_deletions {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| SyncError::Config(e.to_string()))?
+                .map_err(|e| SyncError::Validation(e.to_string()))?
                 .as_secs()
                 .to_string();
             let archive_path = self.get_archive_path(&rel_path, &timestamp);
@@ -283,6 +300,21 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         Ok(())
     }
+}
+
+fn is_safe_relative_path(path: &Path) -> bool {
+    if !path.is_relative() {
+        return false;
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => return false,
+            std::path::Component::RootDir => return false,
+            std::path::Component::Prefix(_) => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Spawn a background sync worker that processes `SyncCommand`s with debouncing.
