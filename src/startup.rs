@@ -6,9 +6,9 @@
 use crate::error::SyncError;
 
 #[cfg(windows)]
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
-#[cfg(windows)]
 use winreg::RegKey;
+#[cfg(windows)]
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 /// Manages the Windows Startup Run registry key for syncdir.
 pub struct StartupRegistry;

@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::error::SyncError;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 
 /// Metadata record for a tracked file.

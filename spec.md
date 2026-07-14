@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
 
-> Last verified against: 9d2fdb6
+> Last verified against: a8302db
 
 | Field | Value |
 |-------|-------|
@@ -22,9 +22,6 @@
 |----------|-----------|---------|--------|
 | `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
 | `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (Missing paths, zero debounce) |
-| `StartupRegistry::is_registered` | `() -> Result<bool, SyncError>` | `bool` | `SyncError::Io` |
-| `StartupRegistry::register` | `() -> Result<(), SyncError>` | `()` | `SyncError::Config` (registry write failure) |
-| `StartupRegistry::unregister` | `() -> Result<(), SyncError>` | `()` | — |
 
 #### Behavioral Scenarios
 
@@ -127,6 +124,32 @@ WHEN `sync_file` is called
 THEN a full copy of the file is created at the destination
 AND the destination file's last-modified timestamp is set to match the source file's
 AND the local database signatures are regenerated and saved
+
+### 4. Startup Module
+
+> Manages Windows startup registry integration.
+
+#### Public API
+
+| Function | Signature | Returns | Errors |
+|----------|-----------|---------|--------|
+| `StartupRegistry::is_registered` | `() -> Result<bool, SyncError>` | `bool` | `SyncError::Io` (failed to get current exe path) |
+| `StartupRegistry::register` | `() -> Result<(), SyncError>` | `()` | `SyncError::Config` (registry write failure) |
+| `StartupRegistry::unregister` | `() -> Result<(), SyncError>` | `()` | — |
+
+#### Behavioral Scenarios
+
+[HAPPY] Register application for startup on Windows
+GIVEN the application is not registered in startup registry
+WHEN `register` is called on Windows
+THEN a registry value named "syncdir" is created under HKCU `Software\Microsoft\Windows\CurrentVersion\Run` containing the current executable path with the `--autostart` suffix
+AND `is_registered` subsequently returns `true`
+
+[HAPPY] Unregister application from startup on Windows
+GIVEN the application is registered in startup registry
+WHEN `unregister` is called on Windows
+THEN the registry value named "syncdir" is deleted
+AND `is_registered` subsequently returns `false`
 
 ---
 

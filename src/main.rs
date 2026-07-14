@@ -10,7 +10,7 @@ use syncdir::config::Config;
 use syncdir::db::SqliteHashStore;
 use syncdir::error::SyncError;
 use syncdir::monitor::DirectoryWatcher;
-use syncdir::sync::{start_sync_worker, SyncCommand};
+use syncdir::sync::{SyncCommand, start_sync_worker};
 use syncdir::tray::run_tray;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -154,19 +154,19 @@ fn main() {
         }
     };
 
-    if !app_dir.exists() {
-        if let Err(e) = fs::create_dir_all(&app_dir) {
-            eprintln!("Fatal error: Failed to create app directory: {e}");
-            std::process::exit(1);
-        }
+    if !app_dir.exists()
+        && let Err(e) = fs::create_dir_all(&app_dir)
+    {
+        eprintln!("Fatal error: Failed to create app directory: {e}");
+        std::process::exit(1);
     }
 
     let log_dir = app_dir.join("logs");
-    if !log_dir.exists() {
-        if let Err(e) = fs::create_dir_all(&log_dir) {
-            eprintln!("Fatal error: Failed to create log directory: {e}");
-            std::process::exit(1);
-        }
+    if !log_dir.exists()
+        && let Err(e) = fs::create_dir_all(&log_dir)
+    {
+        eprintln!("Fatal error: Failed to create log directory: {e}");
+        std::process::exit(1);
     }
 
     let file_appender = match Builder::new()

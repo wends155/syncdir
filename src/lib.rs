@@ -1,4 +1,4 @@
-//! syncdir library — configuration, database, sync commands, and error types.
+//! A lightweight Windows user-session background sync utility with block-level delta synchronization.
 //!
 //! This crate exposes the core modules used by the syncdir binary.
 

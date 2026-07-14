@@ -118,14 +118,13 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 .map_err(|e| SyncError::Config(e.to_string()))?
                 .as_secs() as i64;
 
-            if let Some(record) = self.db.get_file(path)? {
-                if record.file_size == src_size
-                    && record.last_modified == src_mod
-                    && dest_size == src_size
-                    && dest_mod == src_mod
-                {
-                    return Ok(());
-                }
+            if let Some(record) = self.db.get_file(path)?
+                && record.file_size == src_size
+                && record.last_modified == src_mod
+                && dest_size == src_size
+                && dest_mod == src_mod
+            {
+                return Ok(());
             }
         }
 
@@ -256,10 +255,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 let path = entry.path();
                 if path.is_dir() {
                     scan_dir(&path, source_root, files)?;
-                } else if path.is_file() {
-                    if let Ok(rel) = path.strip_prefix(source_root) {
-                        files.insert(rel.to_string_lossy().to_string());
-                    }
+                } else if path.is_file()
+                    && let Ok(rel) = path.strip_prefix(source_root)
+                {
+                    files.insert(rel.to_string_lossy().to_string());
                 }
             }
             Ok(())

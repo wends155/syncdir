@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use syncdir::config::Config;
 use syncdir::db::{FileRecord, HashStore, SqliteHashStore};
 use syncdir::sync::SyncCommand;
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::{NamedTempFile, tempdir};
 
 #[test]
 fn test_integration_config_db_sync_commands() {
