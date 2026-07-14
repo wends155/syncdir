@@ -506,6 +506,7 @@ mod tests {
             block_size_bytes: 4,
             verify_writes: true,
             retry_interval_seconds: 10,
+            dest_dirs: None,
         }
     }
 

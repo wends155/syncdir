@@ -23,6 +23,7 @@ fn test_integration_config_db_sync_commands() {
         block_size_bytes: 1024,
         verify_writes: true,
         retry_interval_seconds: 10,
+        dest_dirs: None,
     };
 
     assert!(config.validate().is_ok());
@@ -73,6 +74,7 @@ fn test_watcher_and_sync_engine_flow() {
         block_size_bytes: 4,
         verify_writes: true,
         retry_interval_seconds: 10,
+        dest_dirs: None,
     };
 
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
@@ -132,6 +134,7 @@ fn test_propagate_deletions_false() {
         block_size_bytes: 4,
         verify_writes: true,
         retry_interval_seconds: 10,
+        dest_dirs: None,
     };
 
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
@@ -176,6 +179,7 @@ fn test_watcher_rename_event() {
         block_size_bytes: 4,
         verify_writes: true,
         retry_interval_seconds: 10,
+        dest_dirs: None,
     };
 
     let (tx, rx) = channel();
@@ -230,6 +234,7 @@ fn test_path_traversal_prevention() {
         block_size_bytes: 4,
         verify_writes: true,
         retry_interval_seconds: 10,
+        dest_dirs: None,
     };
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);
@@ -268,6 +273,7 @@ fn test_subsecond_sync_precision() {
         block_size_bytes: 4,
         verify_writes: true,
         retry_interval_seconds: 10,
+        dest_dirs: None,
     };
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);

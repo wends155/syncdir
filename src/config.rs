@@ -23,9 +23,25 @@ pub struct Config {
     pub verify_writes: bool,
     #[serde(default = "default_retry_interval")]
     pub retry_interval_seconds: u64,
+    #[serde(default)]
+    pub dest_dirs: Option<Vec<PathBuf>>,
 }
 
 impl Config {
+    /// Return a merged, deduplicated list of all configured destination directories.
+    /// Always includes `dest_dir` first, then appends any unique entries from `dest_dirs`.
+    pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.dest_dir.clone()];
+        if let Some(ref list) = self.dest_dirs {
+            for d in list {
+                if !dirs.contains(d) {
+                    dirs.push(d.clone());
+                }
+            }
+        }
+        dirs
+    }
+
     /// Load configuration from a TOML file at the given path.
     ///
     /// # Errors
@@ -88,43 +104,59 @@ impl Config {
 
 fn preprocess_config_toml(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
+    let mut in_dest_dirs_array = false;
+
     for line in content.lines() {
         let trimmed = line.trim();
-        if (trimmed.starts_with("source_dir") || trimmed.starts_with("dest_dir"))
-            && trimmed.contains('=')
-        {
-            let first_quote = line.find('"');
-            let last_quote = line.rfind('"');
-            if let Some((first, last)) = first_quote.zip(last_quote).filter(|&(f, l)| f < l) {
-                let prefix = &line[..=first];
-                let suffix = &line[last..];
-                let path_part = &line[first + 1..last];
-
-                let mut processed_path = String::with_capacity(path_part.len() * 2);
-                let mut chars = path_part.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        if chars.peek() == Some(&'\\') {
-                            processed_path.push('\\');
-                            processed_path.push('\\');
-                            chars.next();
-                        } else {
-                            processed_path.push('\\');
-                            processed_path.push('\\');
-                        }
-                    } else {
-                        processed_path.push(c);
-                    }
-                }
-                result.push_str(prefix);
-                result.push_str(&processed_path);
-                result.push_str(suffix);
-                result.push('\n');
-                continue;
+        let is_config_line = (trimmed.starts_with("source_dir") || trimmed.starts_with("dest_dir"))
+            && trimmed.contains('=');
+        
+        let starts_dest_dirs = trimmed.starts_with("dest_dirs") && trimmed.contains('=');
+        
+        if starts_dest_dirs {
+            // Check if array is multi-line (has opening bracket but no closing bracket on this line)
+            if trimmed.contains('[') && !trimmed.contains(']') {
+                in_dest_dirs_array = true;
             }
         }
+
+        if is_config_line || starts_dest_dirs || in_dest_dirs_array {
+            let processed = escape_backslashes_in_quotes(line);
+            result.push_str(&processed);
+            result.push('\n');
+
+            if in_dest_dirs_array && trimmed.contains(']') {
+                in_dest_dirs_array = false;
+            }
+            continue;
+        }
+
         result.push_str(line);
         result.push('\n');
+    }
+    result
+}
+
+fn escape_backslashes_in_quotes(line: &str) -> String {
+    let mut result = String::with_capacity(line.len() * 2);
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            result.push('"');
+        } else if c == '\\' && in_quotes {
+            if chars.peek() == Some(&'\\') {
+                result.push('\\');
+                result.push('\\');
+                chars.next();
+            } else {
+                result.push('\\');
+                result.push('\\');
+            }
+        } else {
+            result.push(c);
+        }
     }
     result
 }
@@ -152,6 +184,7 @@ mod tests {
             block_size_bytes: 512,
             verify_writes: true,
             retry_interval_seconds: 10,
+            dest_dirs: None,
         };
         assert!(config.validate().is_ok());
     }
@@ -171,6 +204,7 @@ mod tests {
             block_size_bytes: 512,
             verify_writes: true,
             retry_interval_seconds: 10,
+            dest_dirs: None,
         };
         // Soft validation: missing source directory logs a warning but validation passes
         assert!(config.validate().is_ok());
@@ -191,6 +225,7 @@ mod tests {
             block_size_bytes: 512,
             verify_writes: true,
             retry_interval_seconds: 10,
+            dest_dirs: None,
         };
         assert!(config.validate().is_err());
     }
@@ -210,6 +245,7 @@ mod tests {
             block_size_bytes: 512,
             verify_writes: true,
             retry_interval_seconds: 0,
+            dest_dirs: None,
         };
         assert!(config.validate().is_err());
     }
@@ -275,5 +311,45 @@ mod tests {
             path_str.ends_with("syncdir\\config.toml") || path_str.ends_with("syncdir/config.toml"),
             "Expected path to end with 'syncdir/config.toml', got: {path_str}"
         );
+    }
+
+    #[test]
+    fn test_config_resolved_dest_dirs() {
+        let config = Config {
+            source_dir: PathBuf::from("C:\\src"),
+            dest_dir: PathBuf::from("D:\\dst1"),
+            dest_dirs: Some(vec![PathBuf::from("D:\\dst1"), PathBuf::from("E:\\dst2")]),
+            debounce_seconds: 1,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 10,
+            block_size_bytes: 4,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+        };
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0], PathBuf::from("D:\\dst1"));
+        assert_eq!(resolved[1], PathBuf::from("E:\\dst2"));
+    }
+
+    #[test]
+    fn test_preprocess_dest_dirs_backslashes() {
+        let input = r#"
+            source_dir = "C:\source"
+            dest_dir = "D:\Backup"
+            dest_dirs = ["Y:\Mill Processing\COMMON", "Z:\Archive\Folder"]
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 10
+            block_size_bytes = 4
+            verify_writes = true
+        "#;
+        let processed = preprocess_config_toml(input);
+        let config: Config = toml::from_str(&processed).unwrap();
+        assert_eq!(config.source_dir.to_string_lossy(), r"C:\source");
+        assert_eq!(config.dest_dir.to_string_lossy(), r"D:\Backup");
+        let extras = config.dest_dirs.unwrap();
+        assert_eq!(extras[0].to_string_lossy(), r"Y:\Mill Processing\COMMON");
+        assert_eq!(extras[1].to_string_lossy(), r"Z:\Archive\Folder");
     }
 }
