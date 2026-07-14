@@ -244,6 +244,7 @@ mod tests {
             block_sync_threshold_bytes: block_size * 2,
             block_size_bytes: block_size,
             verify_writes: true,
+            retry_interval_seconds: 10,
         }
     }
 

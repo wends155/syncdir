@@ -22,6 +22,7 @@ fn test_integration_config_db_sync_commands() {
         block_sync_threshold_bytes: 4096,
         block_size_bytes: 1024,
         verify_writes: true,
+        retry_interval_seconds: 10,
     };
 
     assert!(config.validate().is_ok());
@@ -71,14 +72,15 @@ fn test_watcher_and_sync_engine_flow() {
         block_sync_threshold_bytes: 10,
         block_size_bytes: 4,
         verify_writes: true,
+        retry_interval_seconds: 10,
     };
 
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let (tx, rx) = channel();
 
     // Start watcher & sync worker BEFORE writing the file
-    let _watcher = DirectoryWatcher::start(&config, tx).unwrap();
-    let _worker_handle = start_sync_worker(config.clone(), store, rx);
+    let _watcher = DirectoryWatcher::start(&config, tx.clone()).unwrap();
+    let _worker_handle = start_sync_worker(config.clone(), store, rx, tx, None);
 
     // Write a file in source — watcher should pick it up
     let file_path = source.join("notes.txt");
@@ -98,10 +100,12 @@ fn test_watcher_and_sync_engine_flow() {
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn test_tray_module_compiles() {
     // Since run_tray blocks the thread, we only smoke-test compiling it and verifying exports.
     // This is a static analysis verification.
     let _func: fn(
+        winit::event_loop::EventLoop<syncdir::tray::UserEvent>,
         std::path::PathBuf,
         std::path::PathBuf,
         std::sync::mpsc::Sender<syncdir::sync::SyncCommand>,
@@ -127,6 +131,7 @@ fn test_propagate_deletions_false() {
         block_sync_threshold_bytes: 10,
         block_size_bytes: 4,
         verify_writes: true,
+        retry_interval_seconds: 10,
     };
 
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
@@ -170,6 +175,7 @@ fn test_watcher_rename_event() {
         block_sync_threshold_bytes: 10,
         block_size_bytes: 4,
         verify_writes: true,
+        retry_interval_seconds: 10,
     };
 
     let (tx, rx) = channel();
@@ -223,6 +229,7 @@ fn test_path_traversal_prevention() {
         block_sync_threshold_bytes: 10,
         block_size_bytes: 4,
         verify_writes: true,
+        retry_interval_seconds: 10,
     };
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);
@@ -260,6 +267,7 @@ fn test_subsecond_sync_precision() {
         block_sync_threshold_bytes: 10,
         block_size_bytes: 4,
         verify_writes: true,
+        retry_interval_seconds: 10,
     };
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);

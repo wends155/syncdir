@@ -9,7 +9,6 @@ use std::sync::mpsc::channel;
 use syncdir::config::Config;
 use syncdir::db::SqliteHashStore;
 use syncdir::error::SyncError;
-use syncdir::monitor::DirectoryWatcher;
 use syncdir::sync::{SyncCommand, start_sync_worker};
 use syncdir::tray::run_tray;
 use tracing_appender::rolling::{Builder, Rotation};
@@ -45,6 +44,9 @@ block_size_bytes = 1048576
 
 # Verify file integrity after writes using rolling/blake3 checksums.
 verify_writes = true
+
+# The retry interval in seconds when directories are offline.
+retry_interval_seconds = 10
 "#;
         fs::write(&config_path, default_toml).map_err(SyncError::Io)?;
         tracing::warn!(
@@ -66,29 +68,31 @@ verify_writes = true
         return Err(e);
     }
 
+    // Initialize winit event loop on main thread before creating threads
+    let event_loop =
+        winit::event_loop::EventLoopBuilder::<syncdir::tray::UserEvent>::with_user_event()
+            .build()
+            .map_err(|e| SyncError::Tray(format!("Failed to create event loop: {e}")))?;
+    let event_proxy = event_loop.create_proxy();
+
     // 4. Initialize Database
     let db_path = app_dir.join("sigcache.db");
     tracing::info!("Opening signature cache database at: {}", db_path.display());
     let store = SqliteHashStore::new(&db_path, &config)?;
 
-    // 5. Wire channel, watcher, and worker
+    // 5. Wire channel and worker
     let (tx, rx) = channel();
 
-    tracing::info!(
-        "Starting background directory watcher on: {}",
-        config.source_dir.display()
-    );
-    let _watcher = DirectoryWatcher::start(&config, tx.clone())?;
-
     tracing::info!("Starting sync worker thread...");
-    let _worker_handle = start_sync_worker(config.clone(), store, rx);
+    let _worker_handle =
+        start_sync_worker(config.clone(), store, rx, tx.clone(), Some(event_proxy));
 
     // Trigger initial sync scan
     let _ = tx.send(SyncCommand::TriggerFullScan);
 
     // 6. Run tray UI (blocks the main thread)
     tracing::info!("Starting system tray UI loop.");
-    run_tray(config_path, log_dir, tx)?;
+    run_tray(event_loop, config_path, log_dir, tx)?;
 
     tracing::info!("syncdir daemon shut down cleanly.");
     Ok(())

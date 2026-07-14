@@ -7,6 +7,10 @@ use crate::error::SyncError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+fn default_retry_interval() -> u64 {
+    10
+}
+
 /// Runtime configuration for the sync daemon.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -17,6 +21,8 @@ pub struct Config {
     pub block_sync_threshold_bytes: u64,
     pub block_size_bytes: u64,
     pub verify_writes: bool,
+    #[serde(default = "default_retry_interval")]
+    pub retry_interval_seconds: u64,
 }
 
 impl Config {
@@ -35,15 +41,14 @@ impl Config {
     /// Validate that configured directories exist and parameters are valid.
     ///
     /// # Errors
-    /// Returns `SyncError::Validation` if source directory does not exist,
-    /// is not a directory, or debounce is zero.
+    /// Returns `SyncError::Validation` if parameters are invalid.
     pub fn validate(&self) -> Result<(), SyncError> {
         if !self.source_dir.exists() {
-            return Err(SyncError::Validation(
-                "Source directory does not exist".into(),
-            ));
-        }
-        if !self.source_dir.is_dir() {
+            tracing::warn!(
+                path = %self.source_dir.display(),
+                "Source directory does not exist at validation, starting in degraded mode"
+            );
+        } else if !self.source_dir.is_dir() {
             return Err(SyncError::Validation(
                 "Source path is not a directory".into(),
             ));
@@ -51,6 +56,11 @@ impl Config {
         if self.debounce_seconds == 0 {
             return Err(SyncError::Validation(
                 "Debounce seconds must be greater than zero".into(),
+            ));
+        }
+        if self.retry_interval_seconds == 0 {
+            return Err(SyncError::Validation(
+                "Retry interval seconds must be greater than zero".into(),
             ));
         }
         Ok(())
@@ -97,6 +107,7 @@ mod tests {
             block_sync_threshold_bytes: 1024,
             block_size_bytes: 512,
             verify_writes: true,
+            retry_interval_seconds: 10,
         };
         assert!(config.validate().is_ok());
     }
@@ -115,8 +126,10 @@ mod tests {
             block_sync_threshold_bytes: 1024,
             block_size_bytes: 512,
             verify_writes: true,
+            retry_interval_seconds: 10,
         };
-        assert!(config.validate().is_err());
+        // Soft validation: missing source directory logs a warning but validation passes
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -133,8 +146,43 @@ mod tests {
             block_sync_threshold_bytes: 1024,
             block_size_bytes: 512,
             verify_writes: true,
+            retry_interval_seconds: 10,
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_retry_interval() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+
+        let config = Config {
+            source_dir: source,
+            dest_dir: temp.path().join("dest"),
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 1024,
+            block_size_bytes: 512,
+            verify_writes: true,
+            retry_interval_seconds: 0,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_retry_interval_default() {
+        let toml_str = r#"
+            source_dir = "C:\\source"
+            dest_dir = "C:\\dest"
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 1024
+            block_size_bytes = 512
+            verify_writes = true
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.retry_interval_seconds, 10);
     }
 
     #[test]

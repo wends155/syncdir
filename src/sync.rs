@@ -290,6 +290,21 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         // Detect deletions: files in DB but missing from source
         if self.config.propagate_deletions {
+            // Empty source directory safety check:
+            // If we found zero files on disk, but the local database cache contains
+            // tracked files, skip deletion propagation. This protects against
+            // mount-points or drives that appear empty due to unmounting.
+            if source_files.is_empty() {
+                let tracked = self.db.list_files()?;
+                if !tracked.is_empty() {
+                    tracing::warn!(
+                        tracked_count = tracked.len(),
+                        "Source directory is empty but cache contains tracked files. Skipping deletion propagation to prevent accidental target wipe."
+                    );
+                    return Ok(());
+                }
+            }
+
             let tracked = self.db.list_files()?;
             for tracked_path in tracked {
                 if !source_files.contains(&tracked_path) {
@@ -321,18 +336,91 @@ fn is_safe_relative_path(path: &Path) -> bool {
 ///
 /// The worker drains the channel, accumulates pending syncs/deletes with a
 /// deadline based on `config.debounce_seconds`, and executes them once the
-/// deadline expires. Returns the thread join handle.
+/// deadline expires.
+///
+/// # Arguments
+///
+/// * `config` - Runtime configuration containing directories and intervals.
+/// * `db` - Persistent SQLite signature store.
+/// * `rx` - Receiver channel for file system events.
+/// * `tx` - Sender channel cloned and passed to new directory watchers.
+/// * `event_proxy` - Winit user event proxy for status signaling back to the tray.
+///
+/// # Returns
+///
+/// Returns the join handle for the spawned background worker thread.
 pub fn start_sync_worker<S: HashStore + Send + 'static>(
     config: Config,
     db: S,
     rx: std::sync::mpsc::Receiver<SyncCommand>,
+    tx: std::sync::mpsc::Sender<SyncCommand>,
+    event_proxy: Option<winit::event_loop::EventLoopProxy<crate::tray::UserEvent>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let engine = LocalSyncEngine::new(db, config.clone());
         let mut pending_syncs: HashMap<PathBuf, Instant> = HashMap::new();
         let mut pending_deletes: HashMap<PathBuf, Instant> = HashMap::new();
 
+        let mut watcher: Option<crate::monitor::DirectoryWatcher> = None;
+        let mut current_status: Option<crate::tray::EngineStatus> = None;
+        let mut source_online = false;
+        let mut dest_online = false;
+        // Use checked_sub to avoid panic if Instant::now() is within
+        // retry_interval_seconds of the monotonic clock epoch (near boot).
+        let mut last_status_check = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(
+                config.retry_interval_seconds,
+            ))
+            .unwrap_or_else(Instant::now);
+
         loop {
+            let now = Instant::now();
+
+            if now.duration_since(last_status_check)
+                >= std::time::Duration::from_secs(config.retry_interval_seconds)
+            {
+                last_status_check = now;
+
+                source_online = config.source_dir.exists() && config.source_dir.is_dir();
+                dest_online = config.dest_dir.exists() && config.dest_dir.is_dir();
+
+                let new_status = match (source_online, dest_online) {
+                    (true, true) => crate::tray::EngineStatus::Healthy,
+                    (false, true) => crate::tray::EngineStatus::SourceOffline,
+                    (true, false) => crate::tray::EngineStatus::DestinationOffline,
+                    (false, false) => crate::tray::EngineStatus::BothOffline,
+                };
+
+                // Manage watcher lifecycle dynamically
+                if source_online {
+                    if watcher.is_none() {
+                        tracing::info!("Source directory online. Starting directory watcher...");
+                        match crate::monitor::DirectoryWatcher::start(&config, tx.clone()) {
+                            Ok(w) => {
+                                watcher = Some(w);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to start directory watcher: {e}");
+                            }
+                        }
+                    }
+                } else {
+                    if watcher.is_some() {
+                        tracing::warn!(
+                            "Source directory went offline. Dropping directory watcher."
+                        );
+                        watcher = None;
+                    }
+                }
+
+                if Some(new_status) != current_status {
+                    current_status = Some(new_status);
+                    if let Some(ref proxy) = event_proxy {
+                        let _ = proxy.send_event(crate::tray::UserEvent::Status(new_status));
+                    }
+                }
+            }
+
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(SyncCommand::FileModified(path)) => {
                     let deadline =
@@ -347,8 +435,12 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                     pending_syncs.remove(&path);
                 }
                 Ok(SyncCommand::TriggerFullScan) => {
-                    if let Err(e) = engine.run_full_scan() {
-                        tracing::error!(error = %e, "Full scan failed");
+                    if source_online {
+                        if let Err(e) = engine.run_full_scan() {
+                            tracing::error!(error = %e, "Full scan failed");
+                        }
+                    } else {
+                        tracing::warn!("Skipping full scan: source directory is offline");
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -364,8 +456,15 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 .collect();
             for path in ready_syncs {
                 pending_syncs.remove(&path);
-                if let Err(e) = engine.sync_file(&path.to_string_lossy()) {
-                    tracing::warn!(path = %path.display(), error = %e, "Sync failed");
+                if source_online && dest_online {
+                    if let Err(e) = engine.sync_file(&path.to_string_lossy()) {
+                        tracing::warn!(path = %path.display(), error = %e, "Sync failed");
+                    }
+                } else {
+                    tracing::warn!(path = %path.display(), "Skipped syncing file: source or destination offline");
+                    let deadline =
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
+                    pending_syncs.insert(path, deadline);
                 }
             }
 
@@ -376,8 +475,15 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 .collect();
             for path in ready_deletes {
                 pending_deletes.remove(&path);
-                if let Err(e) = engine.delete_file(&path.to_string_lossy()) {
-                    tracing::warn!(path = %path.display(), error = %e, "Delete failed");
+                if dest_online {
+                    if let Err(e) = engine.delete_file(&path.to_string_lossy()) {
+                        tracing::warn!(path = %path.display(), error = %e, "Delete failed");
+                    }
+                } else {
+                    tracing::warn!(path = %path.display(), "Skipped deleting file: destination offline");
+                    let deadline =
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
+                    pending_deletes.insert(path, deadline);
                 }
             }
         }
@@ -399,6 +505,7 @@ mod tests {
             block_sync_threshold_bytes: 10,
             block_size_bytes: 4,
             verify_writes: true,
+            retry_interval_seconds: 10,
         }
     }
 
@@ -505,5 +612,34 @@ mod tests {
 
         // DB record should be gone
         assert!(engine.db.get_file("doomed.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_empty_source_safety_threshold() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = test_config(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(&db_path, &config).unwrap();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // Sync a file first so the database has a record
+        fs::write(source.join("important.txt"), b"save me").unwrap();
+        engine.run_full_scan().unwrap();
+        assert!(dest.join("important.txt").exists());
+
+        // Now delete the source file so the source directory is completely empty
+        fs::remove_file(source.join("important.txt")).unwrap();
+
+        // Run full scan again. Since propagate_deletions is true and source is empty,
+        // it should hit the safety threshold check, log a warning, and skip deletion propagation.
+        engine.run_full_scan().unwrap();
+
+        // The dest file should still exist and not be deleted/archived!
+        assert!(dest.join("important.txt").exists());
     }
 }

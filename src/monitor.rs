@@ -50,6 +50,7 @@ impl DirectoryWatcher {
     /// #     block_sync_threshold_bytes: 1024,
     /// #     block_size_bytes: 512,
     /// #     verify_writes: true,
+    /// #     retry_interval_seconds: 10,
     /// # };
     /// let (tx, rx) = channel();
     /// let watcher = DirectoryWatcher::start(&config, tx)?;
