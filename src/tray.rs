@@ -1,5 +1,5 @@
-use crate::config::StartupRegistry;
 use crate::error::SyncError;
+use crate::startup::StartupRegistry;
 use crate::sync::SyncCommand;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;

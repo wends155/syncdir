@@ -124,7 +124,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--register-startup") {
-        match syncdir::config::StartupRegistry::register() {
+        match syncdir::startup::StartupRegistry::register() {
             Ok(()) => println!("Successfully registered syncdir for Windows startup."),
             Err(e) => {
                 eprintln!("Failed to register startup: {e}");
@@ -135,7 +135,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--unregister-startup") {
-        match syncdir::config::StartupRegistry::unregister() {
+        match syncdir::startup::StartupRegistry::unregister() {
             Ok(()) => println!("Successfully removed syncdir from Windows startup."),
             Err(e) => {
                 eprintln!("Failed to unregister startup: {e}");
@@ -215,6 +215,7 @@ fn main() {
             .unwrap_or_else(|| "unknown location".to_string());
 
         tracing::error!("Daemon panic at {location}: {message}");
+        std::process::exit(1);
     }));
 
     if let Err(e) = try_main(app_dir) {
