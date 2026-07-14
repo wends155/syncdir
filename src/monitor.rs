@@ -51,6 +51,7 @@ impl DirectoryWatcher {
     /// #     block_size_bytes: 512,
     /// #     verify_writes: true,
     /// #     retry_interval_seconds: 10,
+    /// #     dest_dirs: None,
     /// # };
     /// let (tx, rx) = channel();
     /// let watcher = DirectoryWatcher::start(&config, tx)?;
