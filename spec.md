@@ -1,5 +1,7 @@
 # Behavioral Specification: syncdir
 
+> Last verified against: 9d2fdb6
+
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
@@ -8,50 +10,50 @@
 
 ---
 
-## 1. Config Module
+## Module/Component Contracts
+
+### 1. Config Module
 
 > Handles configuration file loading and validation.
 
-### Public API
+#### Public API
 
 | Function | Signature | Returns | Errors |
 |----------|-----------|---------|--------|
-| `load_config` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `ConfigError` (Invalid path, parse failure) |
-| `validate_config` | `(config: &Config) -> Result<(), SyncError>` | `()` | `ValidationError` (Missing/inaccessible paths) |
+| `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
+| `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (Missing paths, zero debounce) |
 
-### Behavioral Scenarios
+#### Behavioral Scenarios
 
 [HAPPY] Config file successfully loaded and validated
 GIVEN a configuration file at a valid path with source "C:/Src" and destination "D:/Dest" (both accessible folders)
-WHEN `load_config` is called followed by `validate_config`
+WHEN `load` is called followed by `validate`
 THEN a valid `Config` struct is returned
 AND validation succeeds
 
 [ERROR] Source folder does not exist
 GIVEN a config where `source_dir` points to a non-existent path "X:/Invalid"
-WHEN `validate_config` is called
-THEN `SyncError::ValidationError("Source directory does not exist")` is returned
+WHEN `validate` is called
+THEN `SyncError::Validation("Source directory does not exist")` is returned
 
-[ERROR] Destination folder is inaccessible
-GIVEN a config where `dest_dir` points to a path "Z:/Backup" which is not readable or writeable
-WHEN `validate_config` is called
-THEN `SyncError::ValidationError("Destination directory is inaccessible")` is returned
+[ERROR] Zero debounce seconds
+GIVEN a config where `debounce_seconds` is zero
+WHEN `validate` is called
+THEN `SyncError::Validation("Debounce seconds must be greater than zero")` is returned
 
----
-
-## 2. DB Module (HashStore)
+### 2. DB Module (HashStore)
 
 > Manages the local persistence of file signatures and metadata.
 
-### Public API
+#### Public API
 
 | Function | Signature | Returns | Errors |
 |----------|-----------|---------|--------|
-| `get_file` | `(&self, path: &str) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `DbError` |
-| `save_file` | `(&self, record: &FileRecord, hashes: &[Blake3Hash]) -> Result<(), SyncError>` | `()` | `DbError` |
-| `delete_file` | `(&self, path: &str) -> Result<(), SyncError>` | `()` | `DbError` |
+| `get_file` | `(&self, path: &str) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `SyncError::Db` |
+| `save_file` | `(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
+| `delete_file` | `(&self, path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
 
-### Behavioral Scenarios
+#### Behavioral Scenarios
 
 [HAPPY] Retrieve existing file signatures
 GIVEN a SQLite database containing file metadata and hashes for "documents/notes.txt"
@@ -69,21 +71,19 @@ GIVEN an existing record for "notes.txt" in the database
 WHEN `delete_file` is called
 THEN the metadata record and all associated block hashes are deleted (cascaded) from the database
 
----
-
-## 3. Sync Module (SyncEngine)
+### 3. Sync Module (SyncEngine)
 
 > Performs delta comparison and block-level updates.
 
-### Public API
+#### Public API
 
 | Function | Signature | Returns | Errors |
 |----------|-----------|---------|--------|
-| `sync_file` | `(&self, relative_path: &str) -> Result<SyncStatus, SyncError>` | `SyncStatus` | `IoError`, `DbError` |
-| `delete_file` | `(&self, relative_path: &str) -> Result<(), SyncError>` | `()` | `IoError` |
-| `run_full_scan` | `(&self) -> Result<ScanReport, SyncError>` | `ScanReport` | `IoError`, `DbError` |
+| `sync_file` | `(&self, relative_path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db` |
+| `delete_file` | `(&self, relative_path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
+| `run_full_scan` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db` |
 
-### Behavioral Scenarios
+#### Behavioral Scenarios
 
 [HAPPY] Sync large modified file with block delta sync and write verification
 GIVEN a source file of size 12MB (threshold is 10MB) where block 3 (offset 2MB-3MB) was modified
@@ -127,7 +127,34 @@ AND the local database signatures are regenerated and saved
 
 ---
 
-## 4. State Machines
+## Data Models
+
+### Config
+Represents the runtime parameters loaded from `config.toml`.
+- `source_dir`: PathBuf (validated to exist and be a directory)
+- `dest_dir`: PathBuf
+- `debounce_seconds`: u64 (must be > 0)
+- `propagate_deletions`: bool
+- `block_sync_threshold_bytes`: u64
+- `block_size_bytes`: u64
+- `verify_writes`: bool
+
+### FileRecord
+Represents a file tracked in the signature database.
+- `id`: Option<i64> (database rowid)
+- `relative_path`: String (unique identifier)
+- `file_size`: i64
+- `last_modified`: i64
+
+### SyncCommand
+Commands passed to the worker channel.
+- `FileModified(PathBuf)`
+- `FileDeleted(PathBuf)`
+- `TriggerFullScan`
+
+---
+
+## State Machines
 
 ### File Synchronization State
 
@@ -148,3 +175,26 @@ stateDiagram-v2
 | InSync | OutOfSync | Real-time file system notification | Queue for sync event debouncer |
 | OutOfSync | InSync | Delta sync execution success | Overwrite changed blocks, update SQLite metadata |
 | InSync | Archived | Source deletion event | Move target file to `.syncdir_archive/`, delete SQLite metadata |
+
+---
+
+## Command/CLI Contracts
+
+The daemon runs in the background. It is invoked with the configuration path:
+```sh
+syncdir --config <path-to-config.toml>
+```
+If no config file is specified, it defaults to looking for `config.toml` in the current working directory.
+
+---
+
+## Integration Points
+
+### 1. SQLite Database (`sigcache.db`)
+Local cache storing block hashes and file metadata. Validates configuration parameters `block_size_bytes` and `block_sync_threshold_bytes` to prevent database schema/metadata configuration drift.
+
+### 2. Filesystem / Network Shares
+Local network shares mounted as folder paths. Delta synchronization reads 1MB block chunks, compares Blake3 hashes, and writes verified offsets.
+
+### 3. Windows System Notification Area (System Tray)
+User interface tray-icon utilizing the `tray-icon` and `winit` crates for controlling/viewing background sync status.
