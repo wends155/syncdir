@@ -15,13 +15,46 @@ pub struct DirectoryWatcher {
 }
 
 impl DirectoryWatcher {
-    /// Start watching the configured source directory.
+    /// Starts watching the configured source directory.
     ///
-    /// File events are debounced by the sync worker, not here.
+    /// Hooks into the OS filesystem event notifications via `notify` to capture
+    /// creation, modification, removal, and rename events. Converts these OS events
+    /// to [`SyncCommand`] instances and forwards them onto the sync worker channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Runtime configuration specifying the source directory to monitor.
+    /// * `tx` - Sender channel handle to transmit [`SyncCommand`] messages to the background worker.
+    ///
+    /// # Returns
+    ///
+    /// Returns a new [`DirectoryWatcher`] instance holding the active OS file system hook handle.
     ///
     /// # Errors
-    /// Returns `SyncError::Watcher` if the OS watcher cannot be created
-    /// or the directory cannot be watched.
+    ///
+    /// Returns [`SyncError::Watcher`] if the underlying watcher hook fails to initialize
+    /// or if it fails to bind to the source directory path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::mpsc::channel;
+    /// # use syncdir::config::Config;
+    /// # use syncdir::monitor::DirectoryWatcher;
+    /// # use std::path::PathBuf;
+    /// # let config = Config {
+    /// #     source_dir: PathBuf::from("C:/source"),
+    /// #     dest_dir: PathBuf::from("D:/dest"),
+    /// #     debounce_seconds: 3,
+    /// #     propagate_deletions: true,
+    /// #     block_sync_threshold_bytes: 1024,
+    /// #     block_size_bytes: 512,
+    /// #     verify_writes: true,
+    /// # };
+    /// let (tx, rx) = channel();
+    /// let watcher = DirectoryWatcher::start(&config, tx)?;
+    /// # Ok::<(), syncdir::error::SyncError>(())
+    /// ```
     pub fn start(config: &Config, tx: Sender<SyncCommand>) -> Result<Self, SyncError> {
         let source = config.source_dir.clone();
 

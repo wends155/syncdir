@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
 
-> Last verified against: a8302db
+> Last verified against: 224bc95
 
 | Field | Value |
 |-------|-------|
@@ -150,6 +150,33 @@ GIVEN the application is registered in startup registry
 WHEN `unregister` is called on Windows
 THEN the registry value named "syncdir" is deleted
 AND `is_registered` subsequently returns `false`
+
+### 5. Monitor Module
+
+> Watches the source directory for file modifications, creations, deletions, and renames.
+
+#### Public API
+
+| Function | Signature | Returns | Errors |
+|----------|-----------|---------|--------|
+| `DirectoryWatcher::start` | `(config: &Config, tx: Sender<SyncCommand>) -> Result<DirectoryWatcher, SyncError>` | `DirectoryWatcher` | `SyncError::Watcher` (failed to set up watcher) |
+
+#### Behavioral Scenarios
+
+[HAPPY] Watcher generates modify sync command for created or modified files
+GIVEN the watcher is running on the source directory
+WHEN a file "notes.txt" is created or written to
+THEN `SyncCommand::FileModified("notes.txt")` is sent to the sync channel
+
+[HAPPY] Watcher generates deletion sync command for removed files
+GIVEN the watcher is running on the source directory
+WHEN a file "notes.txt" is deleted from the source directory
+THEN `SyncCommand::FileDeleted("notes.txt")` is sent to the sync channel
+
+[HAPPY] Watcher generates paired deletion and modification commands for rename events
+GIVEN the watcher is running on the source directory
+WHEN a file "old.txt" is renamed to "new.txt"
+THEN `SyncCommand::FileDeleted("old.txt")` and `SyncCommand::FileModified("new.txt")` are sent to the sync channel
 
 ---
 
