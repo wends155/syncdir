@@ -21,6 +21,10 @@ pub enum SyncError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// Database connection lock was poisoned.
+    #[error("Database lock error: {0}")]
+    LockPoison(String),
+
     /// File watcher failure.
     #[error("Watcher error: {0}")]
     Watcher(#[from] notify::Error),

@@ -53,11 +53,14 @@ impl SqliteHashStore {
         Ok(store)
     }
 
-    fn init_schema(&self) -> Result<(), SyncError> {
-        let conn = self
-            .conn
+    fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SyncError> {
+        self.conn
             .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+            .map_err(|e| SyncError::LockPoison(format!("DB lock poisoned: {e}")))
+    }
+
+    fn init_schema(&self) -> Result<(), SyncError> {
+        let conn = self.conn()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS file_metadata (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,36 +86,35 @@ impl SqliteHashStore {
     fn enforce_metadata(&self, config: &Config) -> Result<(), SyncError> {
         let cached_block_size = self.get_meta_value("block_size_bytes")?;
         let cached_threshold = self.get_meta_value("block_sync_threshold_bytes")?;
+        let cached_version = self.get_meta_value("db_version")?;
 
         let current_block_size = config.block_size_bytes.to_string();
         let current_threshold = config.block_sync_threshold_bytes.to_string();
+        let current_version = "2";
 
-        // Treat any missing key as a mismatch requiring full purge
-        let needs_purge = match (cached_block_size, cached_threshold) {
-            (Some(b), Some(t)) => b != current_block_size || t != current_threshold,
-            (None, None) => false, // Fresh database, no purge needed
-            _ => true,             // Partial metadata = corrupted state
+        // Treat any missing key or mismatch as requiring a full purge
+        let needs_purge = match (cached_block_size, cached_threshold, cached_version) {
+            (Some(b), Some(t), Some(v)) => {
+                b != current_block_size || t != current_threshold || v != current_version
+            }
+            (None, None, None) => false, // Fresh database, no purge needed
+            _ => true,             // Partial metadata/old schema version = corrupted/migration needed
         };
 
         if needs_purge {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+            let conn = self.conn()?;
             conn.execute("DELETE FROM file_metadata", [])?;
             // block_hashes cleaned by CASCADE
         }
 
         self.set_meta_value("block_size_bytes", &current_block_size)?;
         self.set_meta_value("block_sync_threshold_bytes", &current_threshold)?;
+        self.set_meta_value("db_version", current_version)?;
         Ok(())
     }
 
     fn get_meta_value(&self, key: &str) -> Result<Option<String>, SyncError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT value FROM db_metadata WHERE key = ?")?;
         let mut rows = stmt.query(params![key])?;
         if let Some(row) = rows.next()? {
@@ -124,10 +126,7 @@ impl SqliteHashStore {
     }
 
     fn set_meta_value(&self, key: &str, value: &str) -> Result<(), SyncError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let conn = self.conn()?;
         conn.execute(
             "INSERT OR REPLACE INTO db_metadata (key, value) VALUES (?, ?)",
             params![key, value],
@@ -138,10 +137,7 @@ impl SqliteHashStore {
 
 impl HashStore for SqliteHashStore {
     fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, relative_path, file_size, last_modified \
              FROM file_metadata WHERE relative_path = ?",
@@ -160,10 +156,7 @@ impl HashStore for SqliteHashStore {
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
         // UPSERT preserves the rowid on conflict, keeping FK references stable.
@@ -200,10 +193,7 @@ impl HashStore for SqliteHashStore {
     }
 
     fn get_block_hashes(&self, file_id: i64) -> Result<Vec<Vec<u8>>, SyncError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT hash FROM block_hashes WHERE file_id = ? \
              ORDER BY block_index ASC",
@@ -217,10 +207,7 @@ impl HashStore for SqliteHashStore {
     }
 
     fn delete_file(&self, path: &str) -> Result<(), SyncError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let conn = self.conn()?;
         conn.execute(
             "DELETE FROM file_metadata WHERE relative_path = ?",
             params![path],
@@ -229,10 +216,7 @@ impl HashStore for SqliteHashStore {
     }
 
     fn list_files(&self) -> Result<Vec<String>, SyncError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let conn = self.conn()?;
         let mut stmt =
             conn.prepare("SELECT relative_path FROM file_metadata ORDER BY relative_path ASC")?;
         let mut rows = stmt.query([])?;
