@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::error::SyncError;
 use rusqlite::{Connection, params};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Metadata record for a tracked file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +30,7 @@ pub trait HashStore {
 
 /// SQLite implementation of `HashStore`.
 pub struct SqliteHashStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl SqliteHashStore {
@@ -44,14 +45,20 @@ impl SqliteHashStore {
     pub fn new(db_path: &Path, config: &Config) -> Result<Self, SyncError> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let store = SqliteHashStore { conn };
+        let store = SqliteHashStore {
+            conn: Mutex::new(conn),
+        };
         store.init_schema()?;
         store.enforce_metadata(config)?;
         Ok(store)
     }
 
     fn init_schema(&self) -> Result<(), SyncError> {
-        self.conn.execute_batch(
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS file_metadata (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 relative_path TEXT NOT NULL UNIQUE,
@@ -88,7 +95,11 @@ impl SqliteHashStore {
         };
 
         if needs_purge {
-            self.conn.execute("DELETE FROM file_metadata", [])?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+            conn.execute("DELETE FROM file_metadata", [])?;
             // block_hashes cleaned by CASCADE
         }
 
@@ -98,9 +109,11 @@ impl SqliteHashStore {
     }
 
     fn get_meta_value(&self, key: &str) -> Result<Option<String>, SyncError> {
-        let mut stmt = self
+        let conn = self
             .conn
-            .prepare("SELECT value FROM db_metadata WHERE key = ?")?;
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let mut stmt = conn.prepare("SELECT value FROM db_metadata WHERE key = ?")?;
         let mut rows = stmt.query(params![key])?;
         if let Some(row) = rows.next()? {
             let val: String = row.get(0)?;
@@ -111,7 +124,11 @@ impl SqliteHashStore {
     }
 
     fn set_meta_value(&self, key: &str, value: &str) -> Result<(), SyncError> {
-        self.conn.execute(
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        conn.execute(
             "INSERT OR REPLACE INTO db_metadata (key, value) VALUES (?, ?)",
             params![key, value],
         )?;
@@ -121,7 +138,11 @@ impl SqliteHashStore {
 
 impl HashStore for SqliteHashStore {
     fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let mut stmt = conn.prepare(
             "SELECT id, relative_path, file_size, last_modified \
              FROM file_metadata WHERE relative_path = ?",
         )?;
@@ -139,8 +160,14 @@ impl HashStore for SqliteHashStore {
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let tx = conn.transaction()?;
+
         // UPSERT preserves the rowid on conflict, keeping FK references stable.
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO file_metadata (relative_path, file_size, last_modified) \
              VALUES (?1, ?2, ?3) \
              ON CONFLICT(relative_path) DO UPDATE SET \
@@ -150,29 +177,34 @@ impl HashStore for SqliteHashStore {
         )?;
 
         // Retrieve the stable rowid (works for both insert and update)
-        let file_id: i64 = self.conn.query_row(
+        let file_id: i64 = tx.query_row(
             "SELECT id FROM file_metadata WHERE relative_path = ?",
             params![record.relative_path],
             |row| row.get(0),
         )?;
 
         // Replace all block hashes for this file
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM block_hashes WHERE file_id = ?",
             params![file_id],
         )?;
         for (idx, hash) in hashes.iter().enumerate() {
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO block_hashes (file_id, block_index, hash) \
                  VALUES (?, ?, ?)",
                 params![file_id, idx as i64, hash],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     fn get_block_hashes(&self, file_id: i64) -> Result<Vec<Vec<u8>>, SyncError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let mut stmt = conn.prepare(
             "SELECT hash FROM block_hashes WHERE file_id = ? \
              ORDER BY block_index ASC",
         )?;
@@ -185,7 +217,11 @@ impl HashStore for SqliteHashStore {
     }
 
     fn delete_file(&self, path: &str) -> Result<(), SyncError> {
-        self.conn.execute(
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        conn.execute(
             "DELETE FROM file_metadata WHERE relative_path = ?",
             params![path],
         )?;
@@ -193,9 +229,12 @@ impl HashStore for SqliteHashStore {
     }
 
     fn list_files(&self) -> Result<Vec<String>, SyncError> {
-        let mut stmt = self
+        let conn = self
             .conn
-            .prepare("SELECT relative_path FROM file_metadata ORDER BY relative_path ASC")?;
+            .lock()
+            .map_err(|e| SyncError::Config(format!("DB lock poisoned: {e}")))?;
+        let mut stmt =
+            conn.prepare("SELECT relative_path FROM file_metadata ORDER BY relative_path ASC")?;
         let mut rows = stmt.query([])?;
         let mut paths = Vec::new();
         while let Some(row) = rows.next()? {
@@ -256,6 +295,8 @@ mod tests {
 
         let count: i64 = store
             .conn
+            .lock()
+            .unwrap()
             .query_row(
                 "SELECT count(*) FROM block_hashes WHERE file_id = ?",
                 params![file_id],

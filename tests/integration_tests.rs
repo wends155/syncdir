@@ -144,6 +144,8 @@ fn test_propagate_deletions_false() {
     engine.delete_file("test.txt").unwrap();
 
     // Since propagate_deletions = false, the destination file MUST remain
-    assert!(dest_path.exists(), "Destination file must not be deleted when propagate_deletions is false");
+    assert!(
+        dest_path.exists(),
+        "Destination file must not be deleted when propagate_deletions is false"
+    );
 }
-
