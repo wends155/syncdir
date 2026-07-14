@@ -14,7 +14,12 @@ This file documents the chronological history, design decisions, and rules conte
 * **UI & Configuration**:
   * Run as a silent windowless tray icon in the notification area.
   * Configuration in `config.toml` under `%APPDATA%\syncdir\config.toml`.
-  * Tray Menu: Open Config, View Logs, Sync Now, Exit.
+  * Tray Menu: Open Config, View Logs, Sync Now, Start on System Startup (Checkable), Exit.
+* **Startup Registry & Headless CLI Options**:
+  * Chose Windows Registry integration (`StartupRegistry`) under HKCU Run key (`Software\Microsoft\Windows\CurrentVersion\Run`) for user login startup.
+  * Provided early-exit native CLI arguments (`--register-startup`, `--unregister-startup`, `--help`, `--version`) that print to stdout/stderr and exit immediately.
+  * Auto-start trigger detection: Log distinct telemetry when running with `--autostart` flag.
+  * UI Integration: Checkbox in tray menu syncs state with registry, with fallback restoration if registry writes fail.
 * **Conflict & Deletion Strategy**:
   * One-way synchronization (source is source of truth).
   * Source deletions are propagated to destination (with `propagate_deletions = true` default).
@@ -34,5 +39,4 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-14**: Builder successfully completed Phase 1 implementation (Project Foundation & Core Infrastructure). Created Cargo dependencies, core `SyncError` definitions, validated `Config` structures with tests, defined the `SyncCommand` channel-passing and `SyncEngine` interfaces, and implemented a robust `SqliteHashStore` for signature caching with automated cascades and configuration invalidation. Verified with 7 passing tests and zero clippy/fmt compiler alerts.
 * **2026-07-14**: Builder successfully completed Phase 2 implementation (Delta Sync Engine & Directory Monitoring). Designed and implemented the in-place block-level delta sync engine, real-time filesystem watcher using `notify` (wrapping Windows directory notifications), background worker with debouncing, database deletion list helpers, and comprehensive test suite containing unit tests for delta sync / deletion archiving and end-to-end integration tests. Verified with 12 passing tests and clean clippy / formatter verification.
 * **2026-07-14**: Builder successfully completed Phase 3 implementation (System Tray UI, Tracing, and Application Wiring). Configured a non-blocking dual-appender tracing system writing daily to `%APPDATA%\syncdir\logs` and standard output. Integrated a windowless system tray interface using `winit` v0.29 event loops and `tray-icon` menus. Added configuration autoload/auto-create patterns for seamless user experience. Verified with 15 passing tests and zero clippy/fmt compiler warnings.
-
-
+* **2026-07-14**: Builder successfully completed Phase 4 implementation (Startup Registry Integration & Logging). Integrated `winreg` crate to read/write the HKCU `Software\Microsoft\Windows\CurrentVersion\Run` key with `--autostart` suffix. Added native argument parser in `main()` supporting early-exit flags and auto-start detection logging. Embedded a checkable startup option in the system tray UI with fallbacks. Verified with 16 passing tests and clean format/clippy checks.
