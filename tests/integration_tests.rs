@@ -229,11 +229,17 @@ fn test_path_traversal_prevention() {
 
     // Absolute path
     let res1 = engine.sync_file("/etc/passwd");
-    assert!(matches!(res1, Err(syncdir::error::SyncError::Validation(_))));
+    assert!(matches!(
+        res1,
+        Err(syncdir::error::SyncError::Validation(_))
+    ));
 
     // Traversal path
     let res2 = engine.sync_file("../test.txt");
-    assert!(matches!(res2, Err(syncdir::error::SyncError::Validation(_))));
+    assert!(matches!(
+        res2,
+        Err(syncdir::error::SyncError::Validation(_))
+    ));
 }
 
 #[test]
@@ -261,10 +267,16 @@ fn test_subsecond_sync_precision() {
     let file_path = source.join("fast.txt");
     std::fs::write(&file_path, b"initial").unwrap();
     engine.sync_file("fast.txt").unwrap();
-    assert_eq!(std::fs::read_to_string(dest.join("fast.txt")).unwrap(), "initial");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("fast.txt")).unwrap(),
+        "initial"
+    );
 
     // Write a second time immediately
     std::fs::write(&file_path, b"updated").unwrap();
     engine.sync_file("fast.txt").unwrap();
-    assert_eq!(std::fs::read_to_string(dest.join("fast.txt")).unwrap(), "updated");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("fast.txt")).unwrap(),
+        "updated"
+    );
 }

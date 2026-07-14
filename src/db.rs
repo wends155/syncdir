@@ -98,7 +98,7 @@ impl SqliteHashStore {
                 b != current_block_size || t != current_threshold || v != current_version
             }
             (None, None, None) => false, // Fresh database, no purge needed
-            _ => true,             // Partial metadata/old schema version = corrupted/migration needed
+            _ => true, // Partial metadata/old schema version = corrupted/migration needed
         };
 
         if needs_purge {
