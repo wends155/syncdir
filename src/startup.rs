@@ -1,3 +1,8 @@
+//! Startup Registry module for syncdir.
+//!
+//! This module provides target-specific methods to configure the application
+//! to automatically launch at user login session via the Windows Registry.
+
 use crate::error::SyncError;
 
 #[cfg(windows)]
