@@ -1,0 +1,9 @@
+# Rust Build
+target/
+
+# AI and Agent-related context
+.agents/
+.gemini/
+GEMINI.md
+task.md
+implementation_plan.md
