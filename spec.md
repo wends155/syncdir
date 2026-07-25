@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 4092fd4
+> Last verified against: 3de93a5
  
 | Field | Value |
 |-------|-------|
@@ -361,23 +361,23 @@ syncdir [OPTIONS]
  
 | Option | Description | Action | Exit Code |
 |--------|-------------|--------|-----------|
-| `--help`, `-h` | Prints help and usage details | Prints to stdout | `0` |
-| `--version`, `-v` | Prints current package version | Prints to stdout | `0` |
+| `--help`, `-h` | Prints version, description, copyright (`(c) 2026 Wendell Saligan`), repository URL, and usage options | Prints to stdout | `0` |
+| `--version`, `-v` | Prints current package version and copyright (`syncdir 0.1.5 (c) 2026 Wendell Saligan`) | Prints to stdout | `0` |
 | `--register-startup` | Registers the daemon in Windows startup registry | Writes HKCU run key (with `--autostart` suffix) | `0` (success), `1` (registry error) |
 | `--unregister-startup` | Unregisters the daemon from Windows startup registry | Deletes HKCU run key | `0` (success), `1` (registry error) |
 | `--autostart` | Windows Auto-Start trigger | Starts background sync daemon | — |
- 
+
 If no options are specified, the daemon starts the background sync. It defaults to looking for `%APPDATA%\syncdir\config.toml` (loading configuration and initializing DB / tray loop).
- 
+
 ---
- 
+
 ## Integration Points
- 
+
 ### 1. SQLite Database (`sigcache.db`)
 Local cache storing block hashes and file metadata. Validates configuration parameters `block_size_bytes` and `block_sync_threshold_bytes` to prevent database schema/metadata configuration drift.
- 
+
 ### 2. Filesystem / Network Shares
 Local network shares mounted as folder paths. Delta synchronization reads 1MB block chunks, compares Blake3 hashes, and writes verified offsets.
- 
+
 ### 3. Windows System Notification Area (System Tray)
-User interface tray-icon utilizing the `tray-icon` and `winit` crates for controlling/viewing background sync status. Displays RGBA-rendered visual presence indicators and status tooltips.
+User interface tray-icon utilizing the `tray-icon` and `winit` crates for controlling/viewing background sync status. Displays RGBA-rendered visual presence indicators and status tooltips. The context menu provides actions for opening configuration, viewing logs, forcing immediate sync, toggling Windows startup, inspecting destination target statuses, opening an "About" modal dialog box (via Win32 `MessageBoxW`), and exiting the daemon.
