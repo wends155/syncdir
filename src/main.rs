@@ -226,6 +226,8 @@ fn main() {
             "syncdir v{} — Windows background folder synchronization daemon",
             env!("CARGO_PKG_VERSION")
         );
+        println!("{}", syncdir::COPYRIGHT);
+        println!("{}", env!("CARGO_PKG_REPOSITORY"));
         println!();
         println!("USAGE:");
         println!("    syncdir [OPTIONS]");
@@ -243,7 +245,11 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-v") {
-        println!("syncdir {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "syncdir {} {}",
+            env!("CARGO_PKG_VERSION"),
+            syncdir::COPYRIGHT
+        );
         std::process::exit(0);
     }
 

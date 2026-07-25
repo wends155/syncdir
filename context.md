@@ -69,6 +69,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Architect executed `/update-doc` workflow. Synchronized rustdoc comments in `src/startup.rs`, updated `spec.md` behavioral contracts and verification commit hash to `4092fd4`, and confirmed zero drift across `Cargo.toml`, `lib.rs`, and `README.md`.
 * **2026-07-25**: Builder updated `architecture.md` § 5 Module Boundaries to accurately reflect `MockHashStore`, `RegistryBackend`, `MockStartupRegistry`, and optional `dest_dir` configuration support.
 * **2026-07-25**: Builder bumped version to `0.1.5`, updated `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.5` git tag, verified `cargo publish --dry-run`, and published GitHub Release `v0.1.5` at `https://github.com/wends155/syncdir/releases/tag/v0.1.5`.
+* **2026-07-25**: Builder added `authors = ["Wendell Saligan"]` to `Cargo.toml`, exported `COPYRIGHT` in `src/lib.rs`, updated `--help` and `--version` CLI output in `src/main.rs`, and added an "About" menu item in `src/tray.rs` triggering a native Windows `MessageBoxW` modal dialog (34/34 passing tests).
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, publish GitHub Release `v0.1.5`, expand unit testing suite, fix Markdown LaTeX rendering defects, make `dest_dir` optional in `Config`, and sync `architecture.md` module boundaries

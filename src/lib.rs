@@ -9,3 +9,6 @@ pub mod monitor;
 pub mod startup;
 pub mod sync;
 pub mod tray;
+
+/// Copyright notice for syncdir.
+pub const COPYRIGHT: &str = "(c) 2026 Wendell Saligan";

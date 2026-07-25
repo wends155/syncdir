@@ -99,6 +99,43 @@ fn open_path(path: &std::path::Path) -> Result<(), SyncError> {
     Ok(())
 }
 
+/// Display a native Windows About modal dialog box containing version, description, copyright, and URL.
+#[cfg(target_os = "windows")]
+fn show_about_dialog() {
+    use std::os::windows::ffi::OsStrExt;
+    let title: Vec<u16> = std::ffi::OsStr::new("About syncdir\0")
+        .encode_wide()
+        .collect();
+    let msg_text = format!(
+        "syncdir v{} — Windows background folder synchronization daemon\n{}\n{}\0",
+        env!("CARGO_PKG_VERSION"),
+        crate::COPYRIGHT,
+        env!("CARGO_PKG_REPOSITORY")
+    );
+    let text: Vec<u16> = std::ffi::OsStr::new(&msg_text).encode_wide().collect();
+    // SAFETY: MessageBoxW is a standard Win32 API function. Passing null hwnd and valid
+    // null-terminated wide character array pointers is safe and opens a native modal dialog.
+    unsafe {
+        unsafe extern "system" {
+            fn MessageBoxW(
+                hwnd: *mut std::ffi::c_void,
+                text: *const u16,
+                caption: *const u16,
+                utype: u32,
+            ) -> i32;
+        }
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            0x00000040,
+        ); // MB_OK | MB_ICONINFORMATION
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_about_dialog() {}
+
 /// Launch the system tray event loop (blocking).
 ///
 /// Creates a tray icon in the Windows notification area with a checkable
@@ -134,6 +171,7 @@ pub fn run_tray(
     let startup_toggle =
         CheckMenuItem::new("Start on System Startup", true, initially_checked, None);
 
+    let about = MenuItem::new("About", true, None);
     let exit = MenuItem::new("Exit", true, None);
 
     let menu = Menu::new();
@@ -165,6 +203,8 @@ pub fn run_tray(
     let separator_exit = PredefinedMenuItem::separator();
     menu.append(&separator_exit)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
+    menu.append(&about)
+        .map_err(|e| SyncError::Tray(e.to_string()))?;
     menu.append(&exit)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
 
@@ -186,6 +226,7 @@ pub fn run_tray(
     let view_logs_id = view_logs.id().clone();
     let sync_now_id = sync_now.id().clone();
     let startup_toggle_id = startup_toggle.id().clone();
+    let about_id = about.id().clone();
     let exit_id = exit.id().clone();
 
     let num_targets = dests.len();
@@ -233,6 +274,8 @@ pub fn run_tray(
                                 }
                             }
                         }
+                    } else if menu_event.id == about_id {
+                        show_about_dialog();
                     }
                 }
                 #[allow(unused_assignments)]

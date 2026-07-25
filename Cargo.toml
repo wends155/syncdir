@@ -3,6 +3,7 @@ name = "syncdir"
 version = "0.1.5"
 edition = "2024"
 description = "A lightweight Windows user-session background sync utility with block-level delta synchronization."
+authors = ["Wendell Saligan"]
 license = "MIT"
 repository = "https://github.com/wends155/syncdir"
 homepage = "https://github.com/wends155/syncdir"
