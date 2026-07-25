@@ -4,6 +4,20 @@ All notable changes to the `syncdir` project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [v0.1.7] - 2026-07-25
+
+### Added
+- **System Tray "Reload Config" Menu**: Added a "Reload Config" option directly below "Open Config" in the system tray context menu. Validates `config.toml` and performs a clean process re-launch (`restart_process`); displays a native Windows error modal (`show_error_dialog` via `MessageBoxW` with `MB_ICONERROR`) if validation fails while keeping the current daemon running.
+- **Shared Test Fixture Helper**: Added `Config::test_default()` helper in `src/config.rs`, refactoring test setup across all unit and integration tests.
+- **Expanded Test Suite**: Added unit/integration tests for offline `TriggerFullScan` behavior, `Reload Config` validation error handling, and nested directory archive structure preservation (expanded to 37 passing tests).
+
+### Fixed
+- **Startup Full Scan Race Condition**: Fixed race condition where `TriggerFullScan` was skipped at startup due to cached atomic status by evaluating live directory presence.
+
+### Improved
+- **Architecture & Behavioral Specifications**: Updated `architecture.md` Sections 2, 5, 10, 14 and `spec.md` to document process re-launch mechanisms, test helpers, and `RegistryBackend` static call decoupling debt.
+
+---
 
 ## [v0.1.6] - 2026-07-25
 
