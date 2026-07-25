@@ -81,6 +81,8 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder updated `run_full_scan()` in `src/sync.rs` to handle file sync and deletion errors gracefully with `tracing::warn!` logging and skip-count summaries instead of early-aborting on unmapped/offline destination paths (38/38 passing tests).
 * **2026-07-25**: Builder added `SystemDiagnosticInfo::collect()` in `src/startup.rs` and structured startup logging in `src/main.rs`, logging OS version/edition, build number, arch, hostname, username, and app version (39/39 passing tests).
 * **2026-07-25**: Builder synchronized Tray UI status telemetry with worker full scan write failures by returning `Ok(false)` on 100% file sync failure and notifying tray loop to update icon to yellow/DestinationOffline (40/40 passing tests).
+* **2026-07-25**: Builder added `tracing::info!` file copy telemetry logging and SMB ±2000 ms destination timestamp tolerance in `src/sync.rs` for Windows network share synchronization (41/41 passing tests).
+
 
 
 

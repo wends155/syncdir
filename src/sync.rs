@@ -138,7 +138,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 && record.file_size == src_size
                 && record.last_modified == src_mod
                 && dest_size == src_size
-                && dest_mod == src_mod
+                && (dest_mod - src_mod).abs() <= 2000
             {
                 return Ok(());
             }
@@ -164,6 +164,12 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 last_modified: src_mod,
             };
             self.db.save_file(&record, &src_hashes)?;
+            tracing::info!(
+                path = %rel_path.display(),
+                target = %dest_dir.display(),
+                size = src_size,
+                "Synced file to destination"
+            );
             return Ok(());
         }
 
@@ -230,6 +236,12 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             last_modified: src_mod,
         };
         self.db.save_file(&record, &src_hashes)?;
+        tracing::info!(
+            path = %rel_path.display(),
+            target = %dest_dir.display(),
+            size = src_size,
+            "Synced file to destination (delta)"
+        );
         Ok(())
     }
 
@@ -886,5 +898,40 @@ mod tests {
 
         // Run full scan: 100% of files fail (1/1 file failed), so run_full_scan returns Ok(false)
         assert!(!engine.run_full_scan().unwrap());
+    }
+
+    #[test]
+    fn test_smb_timestamp_tolerance_fast_path() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let file_name = "test.txt";
+        fs::write(source.join(file_name), b"test content").unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // First sync
+        engine.sync_file(file_name).unwrap();
+        assert!(dest.join(file_name).exists());
+
+        // Modify destination file timestamp slightly (1500 ms off) to simulate SMB rounding
+        let dest_file = OpenOptions::new()
+            .write(true)
+            .open(dest.join(file_name))
+            .unwrap();
+        let src_meta = fs::metadata(source.join(file_name)).unwrap();
+        let src_mtime = src_meta.modified().unwrap();
+        let rounded_mtime = src_mtime - std::time::Duration::from_millis(1500);
+        dest_file
+            .set_times(fs::FileTimes::new().set_modified(rounded_mtime))
+            .unwrap();
+
+        // Second sync: should fast-path return Ok(()) due to ±2000 ms tolerance
+        engine.sync_file(file_name).unwrap();
     }
 }
