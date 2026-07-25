@@ -61,6 +61,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder updated `.ast-grep/rules/path-traversal-leak.yml` to include `fs::remove_file` and `fs::remove_dir_all` deletion patterns per review findings. Verified rule detection and verified zero-exit on linter, formatter, and test suites.
 * **2026-07-25**: Architect executed `/update-doc` workflow. Verified zero drift across package descriptions, updated `spec.md` verification commit hash to `cafe65f`, and validated doc-tests.
 * **2026-07-25**: Builder updated `architecture.md` to document `startup` module boundaries and dependency direction rules per architecture audit findings.
+* **2026-07-25**: Builder enriched `Cargo.toml` with crates.io package metadata (`repository`, `homepage`, `documentation`, `readme`, `keywords`, `categories`) and bumped version to `0.1.4`. Verified zero-warning `cargo publish --dry-run`.
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules and document `startup` architecture boundaries
