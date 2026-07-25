@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Initial public release of `syncdir` daemon on GitHub.
-- In-place block-level delta synchronization for files $\ge$ 10MB using 1MB Blake3 hashed blocks.
+- In-place block-level delta synchronization for files ≥ 10MB using 1MB Blake3 hashed blocks.
 - Real-time directory monitoring with 3-second write debouncing.
 - Safe deletion archiving to `.syncdir_archive/` subfolder.
 - MIT License and release binary distribution.

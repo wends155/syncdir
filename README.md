@@ -76,7 +76,7 @@ verify_writes = true
 ## Features / Feature Flags
 
 - **Multiple Destinations**: Broadcasts filesystem change events from a single source folder to multiple independent target directories, running concurrent isolated sync processes.
-- **Block-level Delta Synchronization**: Only transfers modified 1MB blocks of files $\ge$ 10MB.
+- **Block-level Delta Synchronization**: Only transfers modified 1MB blocks of files ≥ 10MB.
 - **Write Verification**: Reads back and hashes blocks immediately after writing to guarantee block integrity.
 - **Timestamp Alignment**: Automatically syncs destination file timestamps to match the source file, allowing fast-path comparison.
 - **Real-Time Fs Watcher**: Uses Windows directory notification hooks (`notify` crate) with a configurable debounce filter.

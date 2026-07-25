@@ -64,6 +64,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder enriched `Cargo.toml` with crates.io package metadata (`repository`, `homepage`, `documentation`, `readme`, `keywords`, `categories`) and bumped version to `0.1.4`. Verified zero-warning `cargo publish --dry-run`.
 * **2026-07-25**: Builder created `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.4` git tag, and published GitHub Release `v0.1.4` at `https://github.com/wends155/syncdir/releases/tag/v0.1.4`.
 * **2026-07-25**: Builder implemented `MockHashStore` in `src/db.rs`, `RegistryBackend` trait abstraction in `src/startup.rs`, and expanded unit test suite in `src/sync.rs` with 0-byte file, exact block multiple, and worker queue storm debouncing tests (24/24 passing unit tests).
+* **2026-07-25**: Builder replaced raw LaTeX math delimiters (`$\ge$`) with standard UTF-8 characters (`≥`) in `CHANGELOG.md`, `README.md`, and GitHub Release `v0.1.4` notes to fix browser Markdown rendering defects.
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, publish GitHub Release `v0.1.4`, and expand unit testing suite
