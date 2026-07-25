@@ -15,7 +15,8 @@ fn default_retry_interval() -> u64 {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub source_dir: PathBuf,
-    pub dest_dir: PathBuf,
+    #[serde(default)]
+    pub dest_dir: Option<PathBuf>,
     pub debounce_seconds: u64,
     pub propagate_deletions: bool,
     pub block_sync_threshold_bytes: u64,
@@ -29,9 +30,12 @@ pub struct Config {
 
 impl Config {
     /// Return a merged, deduplicated list of all configured destination directories.
-    /// Always includes `dest_dir` first, then appends any unique entries from `dest_dirs`.
+    /// Includes `dest_dir` first (if set), then appends any unique entries from `dest_dirs`.
     pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = vec![self.dest_dir.clone()];
+        let mut dirs = Vec::new();
+        if let Some(ref primary) = self.dest_dir {
+            dirs.push(primary.clone());
+        }
         if let Some(ref list) = self.dest_dirs {
             for d in list {
                 if !dirs.contains(d) {
@@ -68,6 +72,12 @@ impl Config {
         } else if !self.source_dir.is_dir() {
             return Err(SyncError::Validation(
                 "Source path is not a directory".into(),
+            ));
+        }
+        if self.resolved_dest_dirs().is_empty() {
+            return Err(SyncError::Validation(
+                "At least one destination directory must be specified (via dest_dir or dest_dirs)"
+                    .into(),
             ));
         }
         if self.debounce_seconds == 0 {
@@ -177,7 +187,7 @@ mod tests {
 
         let config = Config {
             source_dir: source,
-            dest_dir: dest,
+            dest_dir: Some(dest),
             debounce_seconds: 3,
             propagate_deletions: true,
             block_sync_threshold_bytes: 1024,
@@ -197,7 +207,7 @@ mod tests {
 
         let config = Config {
             source_dir: temp.path().join("nonexistent"),
-            dest_dir: dest,
+            dest_dir: Some(dest),
             debounce_seconds: 3,
             propagate_deletions: true,
             block_sync_threshold_bytes: 1024,
@@ -218,7 +228,7 @@ mod tests {
 
         let config = Config {
             source_dir: source,
-            dest_dir: temp.path().join("dest"),
+            dest_dir: Some(temp.path().join("dest")),
             debounce_seconds: 0,
             propagate_deletions: true,
             block_sync_threshold_bytes: 1024,
@@ -238,7 +248,7 @@ mod tests {
 
         let config = Config {
             source_dir: source,
-            dest_dir: temp.path().join("dest"),
+            dest_dir: Some(temp.path().join("dest")),
             debounce_seconds: 3,
             propagate_deletions: true,
             block_sync_threshold_bytes: 1024,
@@ -282,7 +292,7 @@ mod tests {
             config.source_dir.to_string_lossy(),
             r#"Y:\Mill Processing\COMMON\MAINTENANCE"#
         );
-        assert_eq!(config.dest_dir.to_string_lossy(), r#"Z:\Backup\Folder"#);
+        assert_eq!(config.dest_dir.unwrap().to_string_lossy(), r#"Z:\Backup\Folder"#);
     }
 
     #[test]
@@ -317,7 +327,7 @@ mod tests {
     fn test_config_resolved_dest_dirs() {
         let config = Config {
             source_dir: PathBuf::from("C:\\src"),
-            dest_dir: PathBuf::from("D:\\dst1"),
+            dest_dir: Some(PathBuf::from("D:\\dst1")),
             dest_dirs: Some(vec![PathBuf::from("D:\\dst1"), PathBuf::from("E:\\dst2")]),
             debounce_seconds: 1,
             propagate_deletions: true,
@@ -347,9 +357,50 @@ mod tests {
         let processed = preprocess_config_toml(input);
         let config: Config = toml::from_str(&processed).unwrap();
         assert_eq!(config.source_dir.to_string_lossy(), r"C:\source");
-        assert_eq!(config.dest_dir.to_string_lossy(), r"D:\Backup");
+        assert_eq!(config.dest_dir.unwrap().to_string_lossy(), r"D:\Backup");
         let extras = config.dest_dirs.unwrap();
         assert_eq!(extras[0].to_string_lossy(), r"Y:\Mill Processing\COMMON");
         assert_eq!(extras[1].to_string_lossy(), r"Z:\Archive\Folder");
+    }
+
+    #[test]
+    fn test_config_only_dest_dirs() {
+        let input = r#"
+            source_dir = "C:\source"
+            dest_dirs = ["D:\Backup1", "E:\Backup2"]
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 10
+            block_size_bytes = 4
+            verify_writes = true
+        "#;
+        let processed = preprocess_config_toml(input);
+        let config: Config = toml::from_str(&processed).unwrap();
+        assert!(config.dest_dir.is_none());
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0], PathBuf::from(r"D:\Backup1"));
+        assert_eq!(resolved[1], PathBuf::from(r"E:\Backup2"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_no_dests() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+
+        let config = Config {
+            source_dir: source,
+            dest_dir: None,
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 1024,
+            block_size_bytes: 512,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+            dest_dirs: None,
+        };
+        assert!(config.validate().is_err());
     }
 }

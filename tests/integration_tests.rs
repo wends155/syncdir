@@ -16,7 +16,7 @@ fn test_integration_config_db_sync_commands() {
 
     let config = Config {
         source_dir: source,
-        dest_dir: dest,
+        dest_dir: Some(dest),
         debounce_seconds: 5,
         propagate_deletions: false,
         block_sync_threshold_bytes: 4096,
@@ -67,7 +67,7 @@ fn test_watcher_and_sync_engine_flow() {
 
     let config = Config {
         source_dir: source.clone(),
-        dest_dir: dest.clone(),
+        dest_dir: Some(dest.clone()),
         debounce_seconds: 1,
         propagate_deletions: true,
         block_sync_threshold_bytes: 10,
@@ -129,7 +129,7 @@ fn test_propagate_deletions_false() {
 
     let config = Config {
         source_dir: source.clone(),
-        dest_dir: dest.clone(),
+        dest_dir: Some(dest.clone()),
         debounce_seconds: 1,
         propagate_deletions: false,
         block_sync_threshold_bytes: 10,
@@ -174,7 +174,7 @@ fn test_watcher_rename_event() {
 
     let config = Config {
         source_dir: source.clone(),
-        dest_dir: dest.clone(),
+        dest_dir: Some(dest.clone()),
         debounce_seconds: 1,
         propagate_deletions: true,
         block_sync_threshold_bytes: 10,
@@ -229,7 +229,7 @@ fn test_path_traversal_prevention() {
 
     let config = Config {
         source_dir: source.clone(),
-        dest_dir: dest.clone(),
+        dest_dir: Some(dest.clone()),
         debounce_seconds: 1,
         propagate_deletions: true,
         block_sync_threshold_bytes: 10,
@@ -268,7 +268,7 @@ fn test_subsecond_sync_precision() {
 
     let config = Config {
         source_dir: source.clone(),
-        dest_dir: dest.clone(),
+        dest_dir: Some(dest.clone()),
         debounce_seconds: 1,
         propagate_deletions: true,
         block_sync_threshold_bytes: 10,

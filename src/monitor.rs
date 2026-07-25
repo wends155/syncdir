@@ -44,7 +44,7 @@ impl DirectoryWatcher {
     /// # use std::path::PathBuf;
     /// # let config = Config {
     /// #     source_dir: PathBuf::from("C:/source"),
-    /// #     dest_dir: PathBuf::from("D:/dest"),
+    /// #     dest_dir: Some(PathBuf::from("D:/dest")),
     /// #     debounce_seconds: 3,
     /// #     propagate_deletions: true,
     /// #     block_sync_threshold_bytes: 1024,

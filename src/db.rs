@@ -332,7 +332,7 @@ mod tests {
     fn dummy_config(block_size: u64) -> Config {
         Config {
             source_dir: PathBuf::from("."),
-            dest_dir: PathBuf::from("."),
+            dest_dir: Some(PathBuf::from(".")),
             debounce_seconds: 3,
             propagate_deletions: true,
             block_sync_threshold_bytes: block_size * 2,

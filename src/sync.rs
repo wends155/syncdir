@@ -83,12 +83,19 @@ impl<S: HashStore> LocalSyncEngine<S> {
             for rest in components {
                 archive_rel.push(rest);
             }
-            self.config
+            let dest_dir = self
+                .config
                 .dest_dir
-                .join(".syncdir_archive")
-                .join(archive_rel)
+                .as_ref()
+                .expect("dest_dir must be set for target worker");
+            dest_dir.join(".syncdir_archive").join(archive_rel)
         } else {
-            self.config.dest_dir.join(".syncdir_archive")
+            let dest_dir = self
+                .config
+                .dest_dir
+                .as_ref()
+                .expect("dest_dir must be set for target worker");
+            dest_dir.join(".syncdir_archive")
         }
     }
 }
@@ -103,7 +110,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             )));
         }
         let src_path = self.config.source_dir.join(&rel_path);
-        let dest_path = self.config.dest_dir.join(&rel_path);
+        let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
+            SyncError::Validation("Destination directory not configured".to_string())
+        })?;
+        let dest_path = dest_dir.join(&rel_path);
 
         if !src_path.exists() {
             return Err(SyncError::Io(std::io::Error::new(
@@ -231,7 +241,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 path
             )));
         }
-        let dest_path = self.config.dest_dir.join(&rel_path);
+        let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
+            SyncError::Validation("Destination directory not configured".to_string())
+        })?;
+        let dest_path = dest_dir.join(&rel_path);
 
         if dest_path.exists() && self.config.propagate_deletions {
             let timestamp = SystemTime::now()
@@ -382,7 +395,11 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
 
                 let current_source_online =
                     source_online_atomic.load(std::sync::atomic::Ordering::Relaxed);
-                let current_dest_online = config.dest_dir.exists() && config.dest_dir.is_dir();
+                let current_dest_online = config
+                    .dest_dir
+                    .as_ref()
+                    .map(|d| d.exists() && d.is_dir())
+                    .unwrap_or(false);
 
                 source_online = current_source_online;
                 dest_online = current_dest_online;
@@ -479,7 +496,7 @@ mod tests {
     fn test_config(source: PathBuf, dest: PathBuf) -> Config {
         Config {
             source_dir: source,
-            dest_dir: dest,
+            dest_dir: Some(dest),
             debounce_seconds: 1,
             propagate_deletions: true,
             block_sync_threshold_bytes: 10,

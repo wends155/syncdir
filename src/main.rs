@@ -88,7 +88,7 @@ retry_interval_seconds = 10
     // 4. Initialize target databases and workers
     for (idx, dest) in dests.iter().enumerate() {
         let mut target_config = config.clone();
-        target_config.dest_dir = dest.clone();
+        target_config.dest_dir = Some(dest.clone());
 
         // Calculate isolated SQLite database filename using Blake3 hash of the target path
         let dest_str = dest.to_string_lossy();

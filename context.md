@@ -65,6 +65,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder created `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.4` git tag, and published GitHub Release `v0.1.4` at `https://github.com/wends155/syncdir/releases/tag/v0.1.4`.
 * **2026-07-25**: Builder implemented `MockHashStore` in `src/db.rs`, `RegistryBackend` trait abstraction in `src/startup.rs`, and expanded unit test suite in `src/sync.rs` with 0-byte file, exact block multiple, and worker queue storm debouncing tests (24/24 passing unit tests).
 * **2026-07-25**: Builder replaced raw LaTeX math delimiters (`$\ge$`) with standard UTF-8 characters (`≥`) in `CHANGELOG.md`, `README.md`, and GitHub Release `v0.1.4` notes to fix browser Markdown rendering defects.
+* **2026-07-25**: Builder made `dest_dir` optional (`Option<PathBuf>`) in `Config`, allowing multi-destination configurations specified solely via `dest_dirs`. Updated `resolved_dest_dirs()`, `validate()`, engine/worker callers, doc-tests, and test helpers across 6 files (26/26 passing unit tests).
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, publish GitHub Release `v0.1.4`, expand unit testing suite, and fix Markdown LaTeX rendering defects
