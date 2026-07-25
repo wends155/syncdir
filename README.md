@@ -64,6 +64,18 @@ block_size_bytes = 1048576
 verify_writes = true
 ```
 
+### Windows & Network Share (UNC) Path Formatting Gotchas
+
+When configuring Windows paths in `config.toml`, pay attention to backslashes:
+
+1. **UNC Network Paths (`\\server\share` or `\\172.16.0.60\share`)**:
+   - In TOML, double-quoted strings (`"..."`) interpret `\` as an escape character. Writing `"\\172.16.0.60\share"` in double quotes causes TOML to unescape `\\` to a single `\`.
+   - **Recommended**: Use single-quoted literal strings (`'\\172.16.0.60\share'`) or forward slashes (`"//172.16.0.60/share"`) in `config.toml` to avoid escaping issues entirely.
+   - **Automatic Safeguard**: `syncdir` automatically pre-processes configuration files to escape double backslashes in quoted TOML strings and defensively normalizes single-leading-backslash UNC paths (`\172.16...` -> `\\172.16...`) at runtime.
+
+2. **Absolute Path Requirement**:
+   - All destination paths must be absolute (starting with a drive letter like `C:\`, `Z:\` or a UNC network prefix `\\`). Relative paths (e.g. `backup/folder`) are rejected during startup validation.
+
 ### CLI Options
 
 `syncdir` can also be run with specific command-line arguments:

@@ -190,6 +190,7 @@ sequenceDiagram
 ## 14. Known Constraints & Technical Debt
 * **Network Latency**: If the network connection to a destination mapped share drops, `syncdir` will record the failure for that specific target worker, skip sync for the file, and attempt to sync during the next periodic scan or when the share becomes reachable.
 * **Local DB Location**: Stored in `%APPDATA%\syncdir\sigcache_<hash>.db` (where `<hash>` is the Blake3 hash of the destination directory path). If deleted, it will rebuild automatically during the next full scan by hashing the source directory.
+* **UNC Path TOML Escaping Gotcha**: In standard TOML, double-quoted strings (`"\\172.16.0.60\share"`) unescape `\\` to a single backslash (`\172.16...`). `syncdir` works around this by pre-processing TOML strings to convert `\\` to `\\\\` before parsing, defensively auto-correcting single-leading-backslash UNC paths (`\172...` -> `\\172...`), and recommending single-quoted literal strings (`'\\172.16.0.60\share'`) or forward slashes (`"//172.16.0.60/share"`).
 * **Startup Registry Decoupling**: `RegistryBackend` trait and `MockStartupRegistry` exist for trait-based unit testing, but `run_tray` in `src/tray.rs` calls `StartupRegistry` static methods directly. Dependency injection for `run_tray` is deferred as design debt until a second UI surface is introduced.
 
 ## 15. Data Model
