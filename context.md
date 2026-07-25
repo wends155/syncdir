@@ -65,12 +65,12 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder created `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.4` git tag, and published GitHub Release `v0.1.4` at `https://github.com/wends155/syncdir/releases/tag/v0.1.4`.
 
 ## 3. Context Compression
-* **Feature:** Configure `ast-grep` (`sg`) custom security rules and document `startup` architecture boundaries
-* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`. Extended `path-traversal-leak.yml` to audit `fs::remove_file` and `fs::remove_dir_all`. Documented `startup` module boundaries and dependency rules in `architecture.md`.
+* **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, and publish GitHub Release `v0.1.4`
+* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`. Extended `path-traversal-leak.yml` to audit `fs::remove_file` and `fs::remove_dir_all`. Documented `startup` module boundaries and dependency rules in `architecture.md`. Enriched `Cargo.toml` manifest metadata, created `CHANGELOG.md`, and published GitHub Release `v0.1.4`.
 * **New Constraints:** 
   - Raw `.unwrap()` / `panic!()` / `todo!()` are banned in production code (triggers `unwrap-in-production`).
   - Dynamic string formatting inside database executions is banned (triggers `sql-injection`).
   - Raw filesystem functions (including deletions) must be wrapped, config-driven, or validated (triggers `path-traversal-leak` hint).
   - Environment variables must be central in `src/config.rs` (triggers `scattered-env-var`).
   - `startup` module may import `config` and `error`, but must NOT import `sync`, `db`, `monitor`, `tray`.
-* **Pruned:** Manual checks for unwraps, env variables, filesystem operations, and architecture boundary alignment are now automated.
+* **Pruned:** Manual checks for unwraps, env variables, filesystem operations, and release packaging are now automated.
