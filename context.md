@@ -62,10 +62,10 @@ This file documents the chronological history, design decisions, and rules conte
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules
-* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`.
+* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`. Extended `path-traversal-leak.yml` to audit `fs::remove_file` and `fs::remove_dir_all`.
 * **New Constraints:** 
   - Raw `.unwrap()` / `panic!()` / `todo!()` are banned in production code (triggers `unwrap-in-production`).
   - Dynamic string formatting inside database executions is banned (triggers `sql-injection`).
-  - Raw filesystem functions must be wrapped, config-driven, or validated (triggers `path-traversal-leak` hint).
+  - Raw filesystem functions (including deletions) must be wrapped, config-driven, or validated (triggers `path-traversal-leak` hint).
   - Environment variables must be central in `src/config.rs` (triggers `scattered-env-var`).
-* **Pruned:** Manual checks for unwraps and env variables are now automated.
+* **Pruned:** Manual checks for unwraps, env variables, and filesystem operations are now automated.
