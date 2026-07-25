@@ -5,6 +5,17 @@ All notable changes to the `syncdir` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.6] - 2026-07-25
+
+### Added
+- **System Tray "About" Menu**: Added an "About" option to the system tray context menu that triggers a native Windows modal dialog (`MessageBoxW`) displaying version, description, copyright notice, and repository URL.
+- **Package Author Metadata**: Added `authors = ["Wendell Saligan"]` in `Cargo.toml` and exported shared `pub const COPYRIGHT` constant in `src/lib.rs`.
+
+### Improved
+- **CLI Help & Version Output**: Enriched `syncdir --help` and `syncdir --version` with copyright notice (`(c) 2026 Wendell Saligan`) and repository link (`https://github.com/wends155/syncdir`).
+
+---
+
 ## [v0.1.5] - 2026-07-25
 
 ### Added

@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
-| **Version** | 0.1.5 |
+| **Version** | 0.1.6 |
 | **Last Updated** | 2026-07-25 |
 
 ---
@@ -362,7 +362,7 @@ syncdir [OPTIONS]
 | Option | Description | Action | Exit Code |
 |--------|-------------|--------|-----------|
 | `--help`, `-h` | Prints version, description, copyright (`(c) 2026 Wendell Saligan`), repository URL, and usage options | Prints to stdout | `0` |
-| `--version`, `-v` | Prints current package version and copyright (`syncdir 0.1.5 (c) 2026 Wendell Saligan`) | Prints to stdout | `0` |
+| `--version`, `-v` | Prints current package version and copyright | Prints to stdout | `0` |
 | `--register-startup` | Registers the daemon in Windows startup registry | Writes HKCU run key (with `--autostart` suffix) | `0` (success), `1` (registry error) |
 | `--unregister-startup` | Unregisters the daemon from Windows startup registry | Deletes HKCU run key | `0` (success), `1` (registry error) |
 | `--autostart` | Windows Auto-Start trigger | Starts background sync daemon | — |
