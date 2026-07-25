@@ -375,7 +375,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
         let mut pending_syncs: HashMap<PathBuf, Instant> = HashMap::new();
         let mut pending_deletes: HashMap<PathBuf, Instant> = HashMap::new();
 
-        let mut source_online = false;
+        let mut source_online = source_online_atomic.load(std::sync::atomic::Ordering::Relaxed);
         let mut dest_online = false;
         let mut last_sent_dest_online = None;
 
@@ -432,7 +432,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                     pending_syncs.remove(&path);
                 }
                 Ok(SyncCommand::TriggerFullScan) => {
-                    if source_online {
+                    if config.source_dir.exists() && config.source_dir.is_dir() {
                         if let Err(e) = engine.run_full_scan() {
                             tracing::error!(error = %e, "Full scan failed");
                         }

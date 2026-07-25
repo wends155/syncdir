@@ -83,7 +83,9 @@ retry_interval_seconds = 10
 
     let dests = config.resolved_dest_dirs();
     let mut worker_txs = Vec::new();
-    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let initial_source_online = config.source_dir.exists() && config.source_dir.is_dir();
+    let source_online =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(initial_source_online));
 
     // 4. Initialize target databases and workers
     for (idx, dest) in dests.iter().enumerate() {
