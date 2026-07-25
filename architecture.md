@@ -18,7 +18,7 @@ This document outlines the architecture, design patterns, and contracts for the 
 * **Local Signature Caches**: Maintain isolated local SQLite databases of block hashes for each destination. This prevents downloading or reading destination files over network CIFS/SMB shares to verify differences.
 * **Real-time File Watching**: Use a central Windows directory notification hook via `ReadDirectoryChangesW` (debounced by 3 seconds) that broadcasts events to independent destination workers.
 * **Archive on Deletion**: Move deleted or overwritten destination files to a `.syncdir_archive/` subfolder on the target share with a timestamp prefix to enable easy manual restore.
-* **System Tray Menu**: Right-click menu displaying status details for each configured destination, with options to "Open Config", "View Logs", "Sync Now", and "Exit".
+* **System Tray Menu**: Right-click menu displaying status details for each configured destination, with options to "Open Config", "Reload Config" (validates & re-launches process), "View Logs", "Sync Now", "Start on System Startup" (registry auto-start toggle), "About" (version & copyright modal), and "Exit".
 
 ### Non-Goals
 * Two-way directory synchronization (strictly one-way source -> destination).
@@ -81,7 +81,7 @@ syncdir/
 * **Does NOT own**: Sync execution (delegates to `SyncEngine` worker threads).
 
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications.
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, managing process re-launch on config reload (`restart_process`), displaying native error modal dialogs (`show_error_dialog`), and toggling Windows startup registration.
 * **Does NOT own**: Filesystem watching or database execution.
 
 ### `startup`
@@ -126,8 +126,10 @@ syncdir/
 * **Log Levels**: `INFO` for sync completion, `WARN` for recoverable errors, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
-* **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs`, `src/db.rs`, and `src/sync.rs`.
-* **Integration Tests**: `tests/integration_tests.rs` simulating standard files, deletions, and directory updates using `tempfile`.
+* **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs`, `src/db.rs`, `src/sync.rs`, and `src/startup.rs`.
+* **Integration Tests**: `tests/integration_tests.rs` simulating standard files, deletions, directory updates, and configuration reload validation using `tempfile`.
+* **Shared Test Fixtures**: `Config::test_default()` helper for consistent test configuration across unit and integration tests.
+* **In-Memory Mocks**: `MockHashStore` (`src/db.rs`) and `MockStartupRegistry` (`src/startup.rs`) for isolated in-memory unit testing without disk or registry side-effects.
 
 ## 11. Documentation Conventions
 * Every public struct, trait, and function must be documented using standard triple-slash `///` comments.
@@ -187,6 +189,7 @@ sequenceDiagram
 ## 14. Known Constraints & Technical Debt
 * **Network Latency**: If the network connection to a destination mapped share drops, `syncdir` will record the failure for that specific target worker, skip sync for the file, and attempt to sync during the next periodic scan or when the share becomes reachable.
 * **Local DB Location**: Stored in `%APPDATA%\syncdir\sigcache_<hash>.db` (where `<hash>` is the Blake3 hash of the destination directory path). If deleted, it will rebuild automatically during the next full scan by hashing the source directory.
+* **Startup Registry Decoupling**: `RegistryBackend` trait and `MockStartupRegistry` exist for trait-based unit testing, but `run_tray` in `src/tray.rs` calls `StartupRegistry` static methods directly. Dependency injection for `run_tray` is deferred as design debt until a second UI surface is introduced.
 
 ## 15. Data Model
 
