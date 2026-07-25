@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 35f8f80
+> Last verified against: 9e945b2
  
 | Field | Value |
 |-------|-------|
@@ -21,7 +21,7 @@
 | Function | Signature | Returns | Errors |
 |----------|-----------|---------|--------|
 | `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
-| `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid parameters or missing destination directories) |
+| `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid parameters, relative paths, or missing destination directories) |
 | `Config::resolved_dest_dirs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
  
 #### Behavioral Scenarios
@@ -31,7 +31,13 @@ GIVEN a configuration file at a valid path with source "C:/Src" and destination 
 WHEN `load` is called followed by `validate`
 THEN a valid `Config` struct is returned
 AND validation succeeds
- 
+
+[HAPPY] Single-backslash UNC path normalization
+GIVEN a destination path configured with a single leading backslash `"\172.16.0.60\scada_data"`
+WHEN `resolved_dest_dirs` is called
+THEN the path is automatically normalized to double-backslash UNC `"\\172.16.0.60\scada_data"`
+AND a warning is logged
+
 [HAPPY] Missing source directory at startup (soft validation)
 GIVEN a config where `source_dir` points to a non-existent path "X:/Invalid"
 WHEN `validate` is called
@@ -52,6 +58,11 @@ THEN `SyncError::Validation("Retry interval seconds must be greater than zero")`
 GIVEN a config where `dest_dir` is `None` and `dest_dirs` is `None` (or empty)
 WHEN `validate` is called
 THEN `SyncError::Validation("At least one destination directory must be specified (via dest_dir or dest_dirs)")` is returned
+
+[ERROR] Invalid relative destination path
+GIVEN a config where destination path is a relative path "relative/folder/path" (not starting with `C:\` or `\\`)
+WHEN `validate` is called
+THEN `SyncError::Validation` is returned rejecting the invalid destination path format
 
 
 
@@ -115,8 +126,15 @@ AND the database is updated with the new block 3 signature
 [HAPPY] Timestamp alignment on successful sync
 GIVEN a successful file sync operation
 WHEN all sync writes complete
-THEN the engine sets the destination file's last-modified timestamp to exactly match the source file's last-modified timestamp
+THEN the engine sets the destination file's last-modified timestamp to match the source file's last-modified timestamp
 AND the local SQLite cache is updated with this matching timestamp
+AND a structured `tracing::info!` log event is emitted containing `path`, `target`, and `size`
+
+[HAPPY] SMB 2-second timestamp tolerance fast-path match
+GIVEN a source file whose metadata `record.last_modified == src_mod`
+AND the destination file timestamp on an SMB share is within ±2000 ms of `src_mod` due to SMB 1-2 second rounding
+WHEN `sync_file` is called
+THEN the fast-path check evaluates to true and skips re-copying the file
  
 [HAPPY] Sync small modified file using standard copy
 GIVEN a source file of size 5MB (below threshold) with a modified timestamp
