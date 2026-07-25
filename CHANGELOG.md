@@ -1,0 +1,48 @@
+# Changelog
+
+All notable changes to the `syncdir` project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [v0.1.4] - 2026-07-25
+
+### Added
+- **Multi-Destination Synchronization (Broadcaster Engine)**: Broadcaster architecture supporting multiple target paths (`dest_dirs` array in `config.toml`). Spawns dedicated sync workers per target with isolated Blake3-hashed SQLite cache databases (`sigcache_<hash>.db`).
+- **Tray Status UI Telemetry**: Aggregated health status painting and tooltips (Healthy/Blue, Source Offline/Red, Destination Offline/Yellow, Both Offline/Gray) with checkable target status menu entries.
+- **Static Security Analysis Rules**: Added `ast-grep` (`sg`) security rules (`unwrap-in-production`, `sql-injection`, `path-traversal-leak`, `scattered-env-var`) including path traversal deletion checks (`fs::remove_file`, `fs::remove_dir_all`).
+- **Crates.io Publishing Readiness**: Enriched `Cargo.toml` with `repository`, `homepage`, `documentation`, `readme`, `keywords`, and `categories` metadata.
+
+### Improved
+- **Directory Presence & Recovery**: Dynamic directory watcher lifecycle binding (dropping handles when source goes offline and respawning when online).
+- **TOML Path Parsing**: Automatic preprocessor doubling of Windows single backslashes in path strings.
+- **Documentation Alignment**: Synchronized `architecture.md`, `spec.md`, and module-level rustdoc comments.
+
+---
+
+## [v0.1.3] - 2026-07-14
+
+### Added
+- **Windows Startup Registry Integration**: Native HKCU Run key registration (`StartupRegistry`) with `--register-startup`, `--unregister-startup`, and `--autostart` flags.
+- **System Tray Checkable Startup Toggle**: Dynamic menu checkbox in tray UI linked to registry state.
+- **Crash Diagnostic Panic Hook**: Custom panic hook logging detailed panic location and message before clean exit.
+
+---
+
+## [v0.1.2] - 2026-07-14
+
+### Added
+- **Rename Event Processing**: Real-time directory monitor handling of `RenameMode` events paired into `FileDeleted` and `FileModified` sync commands.
+- **Relative Path Validation**: Input boundary path sanitization (`is_safe_relative_path`).
+- **Database Mutex Refactoring**: Centralized SQLite connection locking and `SyncError::LockPoison` error handling.
+
+---
+
+## [v0.1.1] - 2026-07-14
+
+### Added
+- Initial public release of `syncdir` daemon on GitHub.
+- In-place block-level delta synchronization for files $\ge$ 10MB using 1MB Blake3 hashed blocks.
+- Real-time directory monitoring with 3-second write debouncing.
+- Safe deletion archiving to `.syncdir_archive/` subfolder.
+- MIT License and release binary distribution.
