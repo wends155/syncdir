@@ -4,6 +4,21 @@ All notable changes to the `syncdir` project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [v0.1.8] - 2026-07-25
+
+### Added
+- **UNC Path Normalization & Preprocessing**: Added TOML 4-backslash UNC string escaping (`preprocess_config_toml()`) and defensive single-to-double backslash normalization (`\172...` -> `\\172...`), preventing TOML unescaping pitfalls on network share paths.
+- **Strict Destination Format Validation**: Enforced strict path validation in `Config::validate()`, rejecting relative destination paths that do not start with a drive letter (`C:\`) or UNC network prefix (`\\`).
+- **File Telemetry & SMB Timestamp Tolerance**: Added structured `tracing::info!` file copy telemetry (`path`, `target`, `size`) and ±2000 ms destination timestamp tolerance fast-path match for Windows SMB network shares.
+- **System Environment & Target Diagnostic Telemetry**: Added `SystemDiagnosticInfo::collect()` in `src/startup.rs` to log OS edition, build number, arch, hostname, username, and app version at startup. Added startup target reachability checking (`dest.exists()`) with structured `INFO` (online) or `WARN` (unreachable) logging.
+- **Documentation**: Documented Windows UNC path formatting gotchas in `README.md` and updated `architecture.md` (Sections 2, 5, 9, 14) and `spec.md`.
+
+### Fixed
+- **Full Scan Resiliency**: `run_full_scan()` now handles individual file sync and deletion I/O errors gracefully with `tracing::warn!` logging and skip-count summaries instead of aborting the scan.
+- **Tray Status UI Telemetry Sync**: Synchronized tray status telemetry with full scan write failures (returning `Ok(false)` on 100% write failure to set tray icon to yellow/DestinationOffline).
+
+---
+
 ## [v0.1.7] - 2026-07-25
 
 ### Added
