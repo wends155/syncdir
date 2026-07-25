@@ -473,7 +473,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::SqliteHashStore;
+    use crate::db::{MockHashStore, SqliteHashStore};
     use tempfile::tempdir;
 
     fn test_config(source: PathBuf, dest: PathBuf) -> Config {
@@ -622,5 +622,85 @@ mod tests {
 
         // The dest file should still exist and not be deleted/archived!
         assert!(dest.join("important.txt").exists());
+    }
+
+    #[test]
+    fn test_zero_byte_file_sync() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = test_config(source.clone(), dest.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // Create a 0-byte file
+        fs::write(source.join("empty.txt"), b"").unwrap();
+        engine.sync_file("empty.txt").unwrap();
+
+        assert!(dest.join("empty.txt").exists());
+        assert_eq!(fs::read(dest.join("empty.txt")).unwrap(), b"");
+        assert!(engine.db.get_file("empty.txt").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_exact_block_multiple_sync() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let mut config = test_config(source.clone(), dest.clone());
+        config.block_sync_threshold_bytes = 4;
+        config.block_size_bytes = 4;
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // 8 bytes payload = exactly 2 blocks of 4 bytes
+        fs::write(source.join("exact.bin"), b"12345678").unwrap();
+        engine.sync_file("exact.bin").unwrap();
+
+        assert_eq!(fs::read(dest.join("exact.bin")).unwrap(), b"12345678");
+        let rec = engine.db.get_file("exact.bin").unwrap().unwrap();
+        let hashes = engine.db.get_block_hashes(rec.id.unwrap()).unwrap();
+        assert_eq!(hashes.len(), 2);
+    }
+
+    #[test]
+    fn test_worker_queue_debouncing_storm() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let mut config = test_config(source.clone(), dest.clone());
+        config.debounce_seconds = 1;
+        let store = MockHashStore::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let _handle = start_sync_worker(0, config, store, rx, None, source_online);
+
+        // Write source file
+        fs::write(source.join("storm.txt"), b"storm data").unwrap();
+
+        // Send rapid burst of interleaved modified/deleted events
+        tx.send(SyncCommand::FileModified(PathBuf::from("storm.txt")))
+            .unwrap();
+        tx.send(SyncCommand::FileDeleted(PathBuf::from("storm.txt")))
+            .unwrap();
+        tx.send(SyncCommand::FileModified(PathBuf::from("storm.txt")))
+            .unwrap();
+
+        // Wait for debounce window (1s + margin)
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // The final state should be synced (FileModified won)
+        assert!(dest.join("storm.txt").exists());
+        assert_eq!(fs::read(dest.join("storm.txt")).unwrap(), b"storm data");
     }
 }

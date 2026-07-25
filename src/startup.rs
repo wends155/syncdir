@@ -85,6 +85,70 @@ impl StartupRegistry {
     }
 }
 
+/// Trait abstraction for Windows Startup Registry operations.
+pub trait RegistryBackend {
+    fn is_registered(&self) -> Result<bool, SyncError>;
+    fn register(&self) -> Result<(), SyncError>;
+    fn unregister(&self) -> Result<(), SyncError>;
+}
+
+/// In-memory mock startup registry for cross-platform unit testing.
+#[derive(Debug, Default, Clone)]
+pub struct MockStartupRegistry {
+    registered: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl MockStartupRegistry {
+    /// Create a new mock registry with given initial registration state.
+    pub fn new(initial: bool) -> Self {
+        Self {
+            registered: std::sync::Arc::new(std::sync::Mutex::new(initial)),
+        }
+    }
+}
+
+impl RegistryBackend for MockStartupRegistry {
+    fn is_registered(&self) -> Result<bool, SyncError> {
+        let val = self
+            .registered
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        Ok(*val)
+    }
+
+    fn register(&self) -> Result<(), SyncError> {
+        let mut val = self
+            .registered
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        *val = true;
+        Ok(())
+    }
+
+    fn unregister(&self) -> Result<(), SyncError> {
+        let mut val = self
+            .registered
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        *val = false;
+        Ok(())
+    }
+}
+
+impl RegistryBackend for StartupRegistry {
+    fn is_registered(&self) -> Result<bool, SyncError> {
+        Self::is_registered()
+    }
+
+    fn register(&self) -> Result<(), SyncError> {
+        Self::register()
+    }
+
+    fn unregister(&self) -> Result<(), SyncError> {
+        Self::unregister()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +178,17 @@ mod tests {
 
         StartupRegistry::unregister().unwrap();
         assert!(!StartupRegistry::is_registered().unwrap());
+    }
+
+    #[test]
+    fn test_mock_startup_registry() {
+        let mock = MockStartupRegistry::new(false);
+        assert!(!mock.is_registered().unwrap());
+
+        mock.register().unwrap();
+        assert!(mock.is_registered().unwrap());
+
+        mock.unregister().unwrap();
+        assert!(!mock.is_registered().unwrap());
     }
 }

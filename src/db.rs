@@ -228,6 +228,100 @@ impl HashStore for SqliteHashStore {
     }
 }
 
+/// In-memory implementation of `HashStore` for fast, isolated unit testing.
+#[derive(Debug, Default, Clone)]
+pub struct MockHashStore {
+    records: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FileRecord>>>,
+    hashes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, Vec<Vec<u8>>>>>,
+    next_id: std::sync::Arc<std::sync::Mutex<i64>>,
+}
+
+impl MockHashStore {
+    /// Create a new empty in-memory hash store.
+    pub fn new() -> Self {
+        Self {
+            records: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            hashes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            next_id: std::sync::Arc::new(std::sync::Mutex::new(1)),
+        }
+    }
+}
+
+impl HashStore for MockHashStore {
+    fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        Ok(records.get(path).cloned())
+    }
+
+    fn save_file(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        let mut all_hashes = self
+            .hashes
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        let mut next_id = self
+            .next_id
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+
+        let id = if let Some(existing) = records.get(&record.relative_path) {
+            existing.id.unwrap_or(1)
+        } else {
+            let assigned = *next_id;
+            *next_id += 1;
+            assigned
+        };
+
+        let mut updated = record.clone();
+        updated.id = Some(id);
+        records.insert(record.relative_path.clone(), updated);
+        all_hashes.insert(id, hashes.to_vec());
+        Ok(())
+    }
+
+    fn get_block_hashes(&self, file_id: i64) -> Result<Vec<Vec<u8>>, SyncError> {
+        let hashes = self
+            .hashes
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        Ok(hashes.get(&file_id).cloned().unwrap_or_default())
+    }
+
+    fn delete_file(&self, path: &str) -> Result<(), SyncError> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        let mut hashes = self
+            .hashes
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+
+        if let Some(removed) = records.remove(path)
+            && let Some(id) = removed.id
+        {
+            hashes.remove(&id);
+        }
+        Ok(())
+    }
+
+    fn list_files(&self) -> Result<Vec<String>, SyncError> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+        let mut keys: Vec<String> = records.keys().cloned().collect();
+        keys.sort();
+        Ok(keys)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +477,34 @@ mod tests {
         store.delete_file("a_first.txt").unwrap();
         let files = store.list_files().unwrap();
         assert_eq!(files, vec!["b_second.txt"]);
+    }
+
+    #[test]
+    fn test_mock_hash_store_crud() {
+        let store = MockHashStore::new();
+
+        assert!(store.list_files().unwrap().is_empty());
+
+        let record = FileRecord {
+            id: None,
+            relative_path: "docs/readme.txt".to_string(),
+            file_size: 1024,
+            last_modified: 999,
+        };
+        let hashes = vec![vec![0xAA; 32]];
+        store.save_file(&record, &hashes).unwrap();
+
+        let fetched = store.get_file("docs/readme.txt").unwrap().unwrap();
+        assert_eq!(fetched.file_size, 1024);
+        let id = fetched.id.unwrap();
+
+        let block_hashes = store.get_block_hashes(id).unwrap();
+        assert_eq!(block_hashes, vec![vec![0xAA; 32]]);
+
+        assert_eq!(store.list_files().unwrap(), vec!["docs/readme.txt"]);
+
+        store.delete_file("docs/readme.txt").unwrap();
+        assert!(store.get_file("docs/readme.txt").unwrap().is_none());
+        assert!(store.list_files().unwrap().is_empty());
     }
 }
