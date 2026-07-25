@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 8aafa40
+> Last verified against: cafe65f
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 1 |
-| **Last Updated** | 2026-07-14 |
+| **Last Updated** | 2026-07-25 |
 
 ---
 
