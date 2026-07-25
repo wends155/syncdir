@@ -85,6 +85,8 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder implemented UNC path TOML escaping, defensive `\172...` -> `\\172...` normalization, strict path format validation in `src/config.rs`, and startup target reachability logging in `src/main.rs` (44/44 passing tests).
 * **2026-07-25**: Architect synchronized `spec.md` behavioral contracts with commit `d1b4b44`, adding UNC path normalization, strict path validation, SMB 2-second timestamp tolerance, and file telemetry logging scenarios.
 * **2026-07-25**: Builder synchronized `architecture.md` technical design (Key Features §2, Module Boundaries §5, Observability & Logging §9) with recent UNC path normalization, SMB timestamp tolerance, file telemetry logging, and startup reachability features.
+* **2026-07-25**: Builder bumped version to `0.1.8`, updated `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.8` git tag, verified `cargo publish --dry-run`, and published GitHub Release `v0.1.8` at `https://github.com/wends155/syncdir/releases/tag/v0.1.8` (44/44 passing tests).
+
 
 
 
