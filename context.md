@@ -58,6 +58,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-14**: Architect synchronized documentation and spec contracts. Updated `spec.md` with new `UserEvent::WatcherStatus` enum structure, revised `start_sync_worker` signatures, and recorded verified commit `64c477d` as the baseline. Enriched rustdoc comments in `src/sync.rs` for `start_sync_worker` parameters.
 * **2026-07-14**: Builder successfully executed an S-Tier plan to update and correct outdated details in `architecture.md`. Rewrote Overview, Key Features, Module Boundaries, Diagrams, Known Constraints, and Environment Configuration sections to accurately reflect the multi-destination coordinator-broadcaster engine, namespaced SQLite cache databases, and tray status UI details. Checked with 27 passing tests.
 * **2026-07-15**: Builder successfully configured `ast-grep` (`sg`) with project-specific static analysis rules for Rust code safety, SQL injection prevention, path traversal auditing, and scattered environment variable centralization. Verified rule functionality and verified zero-exit on linter, formatter, and test suites.
+* **2026-07-25**: Builder updated `.ast-grep/rules/path-traversal-leak.yml` to include `fs::remove_file` and `fs::remove_dir_all` deletion patterns per review findings. Verified rule detection and verified zero-exit on linter, formatter, and test suites.
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules

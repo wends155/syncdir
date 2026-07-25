@@ -13,6 +13,8 @@ rule:
     - pattern: fs::write($$$ARGS)
     - pattern: fs::rename($$$ARGS)
     - pattern: fs::read($$$ARGS)
+    - pattern: fs::remove_file($$$ARGS)
+    - pattern: fs::remove_dir_all($$$ARGS)
 ignores:
   - "tests/**"
   - "src/config.rs"
