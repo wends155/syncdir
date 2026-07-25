@@ -78,6 +78,8 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Architect executed `/update-doc` workflow. Synchronized `spec.md` behavioral contracts and verification commit hash to `35f8f80`, and confirmed zero metadata drift across `Cargo.toml`, `lib.rs`, and `README.md`.
 * **2026-07-25**: Builder updated `architecture.md` Sections 2, 5, 10, 14 per Architecture Recommendations Report to document Reload Config tray menu features, process restart capabilities, `Config::test_default()` shared test helper, and `RegistryBackend` static call decoupling debt.
 * **2026-07-25**: Builder bumped version to `0.1.7`, updated `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.7` git tag, verified `cargo publish --dry-run`, and published GitHub Release `v0.1.7` at `https://github.com/wends155/syncdir/releases/tag/v0.1.7` (37/37 passing tests).
+* **2026-07-25**: Builder updated `run_full_scan()` in `src/sync.rs` to handle file sync and deletion errors gracefully with `tracing::warn!` logging and skip-count summaries instead of early-aborting on unmapped/offline destination paths (38/38 passing tests).
+
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, publish GitHub Release `v0.1.6`, expand unit testing suite, fix Markdown LaTeX rendering defects, make `dest_dir` optional in `Config`, sync `architecture.md` module boundaries, add CLI copyright/repository branding & system tray About menu, fix startup initial scan race condition, add live Reload Config tray menu option, and sync `architecture.md`

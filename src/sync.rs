@@ -297,8 +297,19 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         )?;
 
         // Sync all source files
+        let mut sync_skip_count = 0usize;
         for rel_path in &source_files {
-            self.sync_file(rel_path)?;
+            if let Err(e) = self.sync_file(rel_path) {
+                tracing::warn!(path = %rel_path, error = %e, "Skipped file during full scan");
+                sync_skip_count += 1;
+            }
+        }
+        if sync_skip_count > 0 {
+            tracing::warn!(
+                skipped = sync_skip_count,
+                total = source_files.len(),
+                "Full scan completed with sync errors"
+            );
         }
 
         // Detect deletions: files in DB but missing from source
@@ -319,10 +330,20 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             }
 
             let tracked = self.db.list_files()?;
+            let mut delete_skip_count = 0usize;
             for tracked_path in tracked {
-                if !source_files.contains(&tracked_path) {
-                    self.delete_file(&tracked_path)?;
+                if !source_files.contains(&tracked_path)
+                    && let Err(e) = self.delete_file(&tracked_path)
+                {
+                    tracing::warn!(path = %tracked_path, error = %e, "Skipped deletion during full scan");
+                    delete_skip_count += 1;
                 }
+            }
+            if delete_skip_count > 0 {
+                tracing::warn!(
+                    skipped = delete_skip_count,
+                    "Full scan completed with deletion errors"
+                );
             }
         }
 
@@ -783,5 +804,41 @@ mod tests {
 
         // DB record should be gone
         assert!(engine.db.get_file("subdir/deep.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_full_scan_continues_past_file_errors() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        // Create a valid file in source
+        fs::write(source.join("good.txt"), b"good content").unwrap();
+
+        // Create a nested file in source under "bad/nested.txt"
+        fs::create_dir_all(source.join("bad")).unwrap();
+        fs::write(source.join("bad").join("nested.txt"), b"bad content").unwrap();
+
+        // Create a file in destination at "dst/bad" so create_dir_all fails on "dst/bad/nested.txt"
+        fs::write(dest.join("bad"), b"blocking file").unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // Run full scan: should return Ok(()) despite "bad/nested.txt" failing
+        assert!(engine.run_full_scan().is_ok());
+
+        // "good.txt" should be successfully synced
+        assert!(dest.join("good.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dest.join("good.txt")).unwrap(),
+            "good content"
+        );
+
+        // "bad/nested.txt" should not exist because creation failed
+        assert!(!dest.join("bad").join("nested.txt").exists());
     }
 }
