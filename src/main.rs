@@ -325,6 +325,16 @@ fn main() {
         )
         .init();
 
+    let sys_info = syncdir::startup::SystemDiagnosticInfo::collect();
+    tracing::info!(
+        version = %sys_info.app_version,
+        os = %sys_info.os_version,
+        arch = %sys_info.arch,
+        host = %sys_info.hostname,
+        user = %sys_info.username,
+        "System environment"
+    );
+
     if args.iter().any(|a| a == "--autostart") {
         tracing::info!("syncdir initialized (Trigger: Windows Auto-Start)");
     } else {

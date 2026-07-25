@@ -152,6 +152,77 @@ impl RegistryBackend for StartupRegistry {
     }
 }
 
+/// Structure containing OS and environment diagnostic information for troubleshooting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemDiagnosticInfo {
+    /// Operating system product name and build (e.g. "Windows 10 Pro 22H2 (Build 19045)")
+    pub os_version: String,
+    /// System architecture (e.g. "x86_64")
+    pub arch: String,
+    /// Computer hostname if available
+    pub hostname: String,
+    /// Current execution username if available
+    pub username: String,
+    /// Application version
+    pub app_version: String,
+}
+
+impl SystemDiagnosticInfo {
+    /// Queries the OS and environment to gather diagnostic details.
+    ///
+    /// This method is infallible and degrades gracefully with fallback strings if registry
+    /// or environment variable queries fail.
+    pub fn collect() -> Self {
+        #[cfg(windows)]
+        let os_version = {
+            use winreg::RegKey;
+            use winreg::enums::HKEY_LOCAL_MACHINE;
+            let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+            if let Ok(key) = hklm.open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") {
+                let product_name: String = key
+                    .get_value("ProductName")
+                    .unwrap_or_else(|_| "Windows".to_string());
+                let display_version: String = key
+                    .get_value("DisplayVersion")
+                    .or_else(|_| key.get_value("ReleaseId"))
+                    .unwrap_or_default();
+                let build_number: String = key.get_value("CurrentBuildNumber").unwrap_or_default();
+
+                let mut version_str = product_name;
+                if !display_version.is_empty() {
+                    version_str.push(' ');
+                    version_str.push_str(&display_version);
+                }
+                if !build_number.is_empty() {
+                    version_str.push_str(&format!(" (Build {build_number})"));
+                }
+                version_str
+            } else {
+                format!("Windows ({})", std::env::consts::ARCH)
+            }
+        };
+
+        #[cfg(not(windows))]
+        let os_version = format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH);
+
+        let hostname = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "UnknownHost".to_string());
+
+        let username = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "UnknownUser".to_string());
+
+        Self {
+            os_version,
+            arch: std::env::consts::ARCH.to_string(),
+            hostname,
+            username,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +264,18 @@ mod tests {
 
         mock.unregister().unwrap();
         assert!(!mock.is_registered().unwrap());
+    }
+
+    #[test]
+    fn test_system_diagnostic_info_collect() {
+        let info = SystemDiagnosticInfo::collect();
+        assert!(
+            !info.os_version.is_empty(),
+            "os_version should not be empty"
+        );
+        assert!(!info.arch.is_empty(), "arch should not be empty");
+        assert!(!info.hostname.is_empty(), "hostname should not be empty");
+        assert!(!info.username.is_empty(), "username should not be empty");
+        assert_eq!(info.app_version, env!("CARGO_PKG_VERSION"));
     }
 }
