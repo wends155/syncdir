@@ -67,8 +67,8 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder replaced raw LaTeX math delimiters (`$\ge$`) with standard UTF-8 characters (`≥`) in `CHANGELOG.md`, `README.md`, and GitHub Release `v0.1.4` notes to fix browser Markdown rendering defects.
 
 ## 3. Context Compression
-* **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, publish GitHub Release `v0.1.4`, and expand unit testing suite
-* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`. Extended `path-traversal-leak.yml` to audit `fs::remove_file` and `fs::remove_dir_all`. Documented `startup` module boundaries and dependency rules in `architecture.md`. Enriched `Cargo.toml` manifest metadata, created `CHANGELOG.md`, published GitHub Release `v0.1.4`, implemented `MockHashStore` and `RegistryBackend` trait abstraction, and added 0-byte, block boundary, and queue storm debouncing unit tests.
+* **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, publish GitHub Release `v0.1.4`, expand unit testing suite, and fix Markdown LaTeX rendering defects
+* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`. Extended `path-traversal-leak.yml` to audit `fs::remove_file` and `fs::remove_dir_all`. Documented `startup` module boundaries and dependency rules in `architecture.md`. Enriched `Cargo.toml` manifest metadata, created `CHANGELOG.md`, published GitHub Release `v0.1.4`, implemented `MockHashStore` and `RegistryBackend` trait abstraction, added 0-byte/boundary unit tests, and replaced raw LaTeX math delimiters (`$\ge$`) with standard UTF-8 characters (`≥`) across documentation and release notes.
 * **New Constraints:** 
   - Raw `.unwrap()` / `panic!()` / `todo!()` are banned in production code (triggers `unwrap-in-production`).
   - Dynamic string formatting inside database executions is banned (triggers `sql-injection`).
@@ -76,4 +76,5 @@ This file documents the chronological history, design decisions, and rules conte
   - Environment variables must be central in `src/config.rs` (triggers `scattered-env-var`).
   - `startup` module may import `config` and `error`, but must NOT import `sync`, `db`, `monitor`, `tray`.
   - `MockHashStore` and `MockStartupRegistry` are available for isolated in-memory unit tests.
-* **Pruned:** Manual checks for unwraps, env variables, filesystem operations, release packaging, and mock testing structures are now automated.
+  - Use standard UTF-8 comparison characters (`≥`) in Markdown documentation instead of LaTeX math syntax (`$\ge$`).
+* **Pruned:** Manual checks for unwraps, env variables, filesystem operations, release packaging, mock testing structures, and LaTeX rendering defects are now automated.
