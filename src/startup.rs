@@ -87,8 +87,11 @@ impl StartupRegistry {
 
 /// Trait abstraction for Windows Startup Registry operations.
 pub trait RegistryBackend {
+    /// Checks if the startup registration exists.
     fn is_registered(&self) -> Result<bool, SyncError>;
+    /// Registers the application in startup registry.
     fn register(&self) -> Result<(), SyncError>;
+    /// Removes the application from startup registry.
     fn unregister(&self) -> Result<(), SyncError>;
 }
 

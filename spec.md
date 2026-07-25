@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: cafe65f
+> Last verified against: 4092fd4
  
 | Field | Value |
 |-------|-------|
@@ -21,7 +21,8 @@
 | Function | Signature | Returns | Errors |
 |----------|-----------|---------|--------|
 | `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
-| `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (Invalid parameters like zero debounce/retry interval) |
+| `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid parameters or missing destination directories) |
+| `Config::resolved_dest_dirs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
  
 #### Behavioral Scenarios
  
@@ -46,6 +47,12 @@ THEN `SyncError::Validation("Debounce seconds must be greater than zero")` is re
 GIVEN a config where `retry_interval_seconds` is zero
 WHEN `validate` is called
 THEN `SyncError::Validation("Retry interval seconds must be greater than zero")` is returned
+
+[ERROR] No destination directory specified
+GIVEN a config where `dest_dir` is `None` and `dest_dirs` is `None` (or empty)
+WHEN `validate` is called
+THEN `SyncError::Validation("At least one destination directory must be specified (via dest_dir or dest_dirs)")` is returned
+
 
 
 ### 2. DB Module (HashStore)
@@ -173,11 +180,13 @@ AND a warning is logged
 
 #### Public API
 
-| Function | Signature | Returns | Errors |
-|----------|-----------|---------|--------|
+| Function / Trait | Signature | Returns | Errors |
+|------------------|-----------|---------|--------|
 | `StartupRegistry::is_registered` | `() -> Result<bool, SyncError>` | `bool` | `SyncError::Io` (failed to get current exe path) |
 | `StartupRegistry::register` | `() -> Result<(), SyncError>` | `()` | `SyncError::Config` (registry write failure) |
 | `StartupRegistry::unregister` | `() -> Result<(), SyncError>` | `()` | — |
+| `RegistryBackend` | `trait` | — | — |
+| `MockStartupRegistry` | `struct` | — | — |
 
 #### Behavioral Scenarios
 
@@ -253,7 +262,8 @@ AND if registry write fails, the checkable state of the menu item is restored to
 ### Config
 Represents the runtime parameters loaded from `config.toml`.
 - `source_dir`: PathBuf (validated to exist and be a directory)
-- `dest_dir`: PathBuf
+- `dest_dir`: Option<PathBuf> (optional primary destination directory)
+- `dest_dirs`: Option<Vec<PathBuf>> (optional additional destination directories)
 - `debounce_seconds`: u64 (must be > 0)
 - `retry_interval_seconds`: u64 (must be > 0)
 - `propagate_deletions`: bool

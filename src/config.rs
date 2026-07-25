@@ -292,7 +292,10 @@ mod tests {
             config.source_dir.to_string_lossy(),
             r#"Y:\Mill Processing\COMMON\MAINTENANCE"#
         );
-        assert_eq!(config.dest_dir.unwrap().to_string_lossy(), r#"Z:\Backup\Folder"#);
+        assert_eq!(
+            config.dest_dir.unwrap().to_string_lossy(),
+            r#"Z:\Backup\Folder"#
+        );
     }
 
     #[test]
