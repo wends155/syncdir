@@ -62,6 +62,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Architect executed `/update-doc` workflow. Verified zero drift across package descriptions, updated `spec.md` verification commit hash to `cafe65f`, and validated doc-tests.
 * **2026-07-25**: Builder updated `architecture.md` to document `startup` module boundaries and dependency direction rules per architecture audit findings.
 * **2026-07-25**: Builder enriched `Cargo.toml` with crates.io package metadata (`repository`, `homepage`, `documentation`, `readme`, `keywords`, `categories`) and bumped version to `0.1.4`. Verified zero-warning `cargo publish --dry-run`.
+* **2026-07-25**: Builder created `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.4` git tag, and published GitHub Release `v0.1.4` at `https://github.com/wends155/syncdir/releases/tag/v0.1.4`.
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules and document `startup` architecture boundaries
