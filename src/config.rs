@@ -28,18 +28,36 @@ pub struct Config {
     pub dest_dirs: Option<Vec<PathBuf>>,
 }
 
+fn normalize_dest_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with('\\') && !s.starts_with("\\\\") {
+        let normalized = format!("\\{}", s);
+        tracing::warn!(
+            raw = %s,
+            normalized = %normalized,
+            "Normalized single-backslash path to UNC network path"
+        );
+        PathBuf::from(normalized)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 impl Config {
     /// Return a merged, deduplicated list of all configured destination directories.
     /// Includes `dest_dir` first (if set), then appends any unique entries from `dest_dirs`.
+    /// Automatically normalizes single-backslash UNC network paths (`\172...` -> `\\172...`).
     pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(ref primary) = self.dest_dir {
-            dirs.push(primary.clone());
+            let normalized = normalize_dest_path(primary);
+            dirs.push(normalized);
         }
         if let Some(ref list) = self.dest_dirs {
             for d in list {
-                if !dirs.contains(d) {
-                    dirs.push(d.clone());
+                let normalized = normalize_dest_path(d);
+                if !dirs.contains(&normalized) {
+                    dirs.push(normalized);
                 }
             }
         }
@@ -60,6 +78,7 @@ impl Config {
     }
 
     /// Validate that configured directories exist and parameters are valid.
+    /// Enforces that destination paths are valid drive paths (`C:\`) or UNC network paths (`\\`).
     ///
     /// # Errors
     /// Returns `SyncError::Validation` if parameters are invalid.
@@ -74,12 +93,30 @@ impl Config {
                 "Source path is not a directory".into(),
             ));
         }
-        if self.resolved_dest_dirs().is_empty() {
+
+        let dests = self.resolved_dest_dirs();
+        if dests.is_empty() {
             return Err(SyncError::Validation(
                 "At least one destination directory must be specified (via dest_dir or dest_dirs)"
                     .into(),
             ));
         }
+
+        for dest in &dests {
+            let s = dest.to_string_lossy();
+            let is_unc = s.starts_with("\\\\");
+            let is_drive =
+                s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic();
+            let is_unix_abs = s.starts_with('/');
+
+            if !is_unc && !is_drive && !is_unix_abs {
+                return Err(SyncError::Validation(format!(
+                    "Invalid destination path '{}': must start with a drive letter (e.g. C:\\) or UNC network prefix (e.g. \\\\server\\share)",
+                    s
+                )));
+            }
+        }
+
         if self.debounce_seconds == 0 {
             return Err(SyncError::Validation(
                 "Debounce seconds must be greater than zero".into(),
@@ -157,6 +194,8 @@ fn escape_backslashes_in_quotes(line: &str) -> String {
             result.push('"');
         } else if c == '\\' && in_quotes {
             if chars.peek() == Some(&'\\') {
+                result.push('\\');
+                result.push('\\');
                 result.push('\\');
                 result.push('\\');
                 chars.next();
@@ -414,6 +453,69 @@ mod tests {
         let config = Config {
             source_dir: source,
             dest_dir: None,
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 1024,
+            block_size_bytes: 512,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+            dest_dirs: None,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_preprocess_unc_paths_preserved() {
+        let input = r#"
+            source_dir = "C:\source"
+            dest_dirs = ["\\172.16.0.60\scada_data\Files", "\\172.16.0.130\Files"]
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 10
+            block_size_bytes = 4
+            verify_writes = true
+        "#;
+        let processed = preprocess_config_toml(input);
+        let config: Config = toml::from_str(&processed).unwrap();
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            resolved[0].to_string_lossy(),
+            r"\\172.16.0.60\scada_data\Files"
+        );
+        assert_eq!(resolved[1].to_string_lossy(), r"\\172.16.0.130\Files");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_resolved_dest_dirs_normalizes_single_backslash_unc() {
+        let config = Config {
+            source_dir: PathBuf::from("C:\\src"),
+            dest_dir: Some(PathBuf::from(r"\172.16.0.60\scada_data")),
+            dest_dirs: Some(vec![PathBuf::from(r"\172.16.0.130\Files")]),
+            debounce_seconds: 1,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 10,
+            block_size_bytes: 4,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+        };
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].to_string_lossy(), r"\\172.16.0.60\scada_data");
+        assert_eq!(resolved[1].to_string_lossy(), r"\\172.16.0.130\Files");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_invalid_relative_dest() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+
+        let config = Config {
+            source_dir: source,
+            dest_dir: Some(PathBuf::from("relative/folder/path")),
             debounce_seconds: 3,
             propagate_deletions: true,
             block_sync_threshold_bytes: 1024,
