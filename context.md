@@ -63,11 +63,12 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder updated `architecture.md` to document `startup` module boundaries and dependency direction rules per architecture audit findings.
 
 ## 3. Context Compression
-* **Feature:** Configure `ast-grep` (`sg`) custom security rules
-* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`. Extended `path-traversal-leak.yml` to audit `fs::remove_file` and `fs::remove_dir_all`.
+* **Feature:** Configure `ast-grep` (`sg`) custom security rules and document `startup` architecture boundaries
+* **Changes:** Added `sgconfig.yml` at project root and 4 security rules under `.ast-grep/rules/`. Extended `path-traversal-leak.yml` to audit `fs::remove_file` and `fs::remove_dir_all`. Documented `startup` module boundaries and dependency rules in `architecture.md`.
 * **New Constraints:** 
   - Raw `.unwrap()` / `panic!()` / `todo!()` are banned in production code (triggers `unwrap-in-production`).
   - Dynamic string formatting inside database executions is banned (triggers `sql-injection`).
   - Raw filesystem functions (including deletions) must be wrapped, config-driven, or validated (triggers `path-traversal-leak` hint).
   - Environment variables must be central in `src/config.rs` (triggers `scattered-env-var`).
-* **Pruned:** Manual checks for unwraps, env variables, and filesystem operations are now automated.
+  - `startup` module may import `config` and `error`, but must NOT import `sync`, `db`, `monitor`, `tray`.
+* **Pruned:** Manual checks for unwraps, env variables, filesystem operations, and architecture boundary alignment are now automated.
