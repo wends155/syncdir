@@ -5,6 +5,20 @@ All notable changes to the `syncdir` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.5] - 2026-07-25
+
+### Added
+- **Optional Destination Directory**: `dest_dir` is now optional (`Option<PathBuf>`) in `Config`, enabling configurations that specify destination directories exclusively via `dest_dirs = [...]`.
+- **In-Memory Testing Harnesses**: Added `MockHashStore` (`src/db.rs`) and `RegistryBackend` with `MockStartupRegistry` (`src/startup.rs`) for fast, isolated, cross-platform unit testing.
+
+### Improved
+- **Documentation & Behavioral Contracts**: Fully synchronized `architecture.md` module boundaries, `spec.md` behavioral specifications, and rustdoc comments across all public traits and structs.
+
+### Fixed
+- **Configuration Parsing**: Fixed a `missing field dest_dir` TOML deserialization error when `config.toml` contains only `dest_dirs`.
+
+---
+
 ## [v0.1.4] - 2026-07-25
 
 ### Added
