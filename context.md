@@ -80,6 +80,8 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder bumped version to `0.1.7`, updated `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.7` git tag, verified `cargo publish --dry-run`, and published GitHub Release `v0.1.7` at `https://github.com/wends155/syncdir/releases/tag/v0.1.7` (37/37 passing tests).
 * **2026-07-25**: Builder updated `run_full_scan()` in `src/sync.rs` to handle file sync and deletion errors gracefully with `tracing::warn!` logging and skip-count summaries instead of early-aborting on unmapped/offline destination paths (38/38 passing tests).
 * **2026-07-25**: Builder added `SystemDiagnosticInfo::collect()` in `src/startup.rs` and structured startup logging in `src/main.rs`, logging OS version/edition, build number, arch, hostname, username, and app version (39/39 passing tests).
+* **2026-07-25**: Builder synchronized Tray UI status telemetry with worker full scan write failures by returning `Ok(false)` on 100% file sync failure and notifying tray loop to update icon to yellow/DestinationOffline (40/40 passing tests).
+
 
 
 

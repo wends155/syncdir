@@ -30,8 +30,8 @@ pub trait SyncEngine {
     fn sync_file(&self, path: &str) -> Result<(), SyncError>;
     /// Handle deletion of a file (archive on destination).
     fn delete_file(&self, path: &str) -> Result<(), SyncError>;
-    /// Perform a full directory scan and sync all changed files.
-    fn run_full_scan(&self) -> Result<(), SyncError>;
+    /// Perform a full directory scan and sync all changed files. Returns Ok(true) if healthy/clean, or Ok(false) if 100% of files failed to sync.
+    fn run_full_scan(&self) -> Result<bool, SyncError>;
 }
 
 /// Delta sync engine backed by a `HashStore` for signature caching.
@@ -262,7 +262,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         Ok(())
     }
 
-    fn run_full_scan(&self) -> Result<(), SyncError> {
+    fn run_full_scan(&self) -> Result<bool, SyncError> {
         if !self.config.source_dir.exists() {
             return Err(SyncError::Validation(
                 "Source directory does not exist".to_string(),
@@ -325,7 +325,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                         tracked_count = tracked.len(),
                         "Source directory is empty but cache contains tracked files. Skipping deletion propagation to prevent accidental target wipe."
                     );
-                    return Ok(());
+                    return Ok(true);
                 }
             }
 
@@ -347,7 +347,12 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             }
         }
 
-        Ok(())
+        // If 100% of files failed to sync (and there were files to sync), destination is inaccessible
+        if !source_files.is_empty() && sync_skip_count == source_files.len() {
+            Ok(false)
+        } else {
+            Ok(true)
+        }
     }
 }
 
@@ -454,8 +459,26 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 }
                 Ok(SyncCommand::TriggerFullScan) => {
                     if config.source_dir.exists() && config.source_dir.is_dir() {
-                        if let Err(e) = engine.run_full_scan() {
-                            tracing::error!(error = %e, "Full scan failed");
+                        match engine.run_full_scan() {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!(
+                                    "Full scan failed all destination file writes. Setting destination status to offline."
+                                );
+                                dest_online = false;
+                                last_sent_dest_online = Some(false);
+                                if let Some(ref proxy) = event_proxy {
+                                    let _ = proxy.send_event(crate::tray::UserEvent::StatusUpdate(
+                                        crate::tray::TargetStatusUpdate {
+                                            target_index,
+                                            dest_online: false,
+                                        },
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Full scan failed");
+                            }
                         }
                     } else {
                         tracing::warn!("Skipping full scan: source directory is offline");
@@ -828,8 +851,8 @@ mod tests {
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, config);
 
-        // Run full scan: should return Ok(()) despite "bad/nested.txt" failing
-        assert!(engine.run_full_scan().is_ok());
+        // Run full scan: should return Ok(true) because good.txt succeeded despite "bad/nested.txt" failing
+        assert!(engine.run_full_scan().unwrap());
 
         // "good.txt" should be successfully synced
         assert!(dest.join("good.txt").exists());
@@ -840,5 +863,28 @@ mod tests {
 
         // "bad/nested.txt" should not exist because creation failed
         assert!(!dest.join("bad").join("nested.txt").exists());
+    }
+
+    #[test]
+    fn test_full_scan_all_skipped_returns_false() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        // Create a nested file in source under "bad/nested.txt"
+        fs::create_dir_all(source.join("bad")).unwrap();
+        fs::write(source.join("bad").join("nested.txt"), b"bad content").unwrap();
+
+        // Create a file in destination at "dst/bad" so create_dir_all fails on "dst/bad/nested.txt"
+        fs::write(dest.join("bad"), b"blocking file").unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // Run full scan: 100% of files fail (1/1 file failed), so run_full_scan returns Ok(false)
+        assert!(!engine.run_full_scan().unwrap());
     }
 }
