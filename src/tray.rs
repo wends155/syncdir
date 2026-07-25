@@ -136,6 +136,47 @@ fn show_about_dialog() {
 #[cfg(not(target_os = "windows"))]
 fn show_about_dialog() {}
 
+/// Display a native Windows Error modal dialog box.
+#[cfg(target_os = "windows")]
+fn show_error_dialog(title_str: &str, msg_str: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    let title_wide: Vec<u16> = std::ffi::OsStr::new(&format!("{}\0", title_str))
+        .encode_wide()
+        .collect();
+    let msg_wide: Vec<u16> = std::ffi::OsStr::new(&format!("{}\0", msg_str))
+        .encode_wide()
+        .collect();
+    // SAFETY: MessageBoxW is a standard Win32 API function.
+    unsafe {
+        unsafe extern "system" {
+            fn MessageBoxW(
+                hwnd: *mut std::ffi::c_void,
+                text: *const u16,
+                caption: *const u16,
+                utype: u32,
+            ) -> i32;
+        }
+        MessageBoxW(
+            std::ptr::null_mut(),
+            msg_wide.as_ptr(),
+            title_wide.as_ptr(),
+            0x00000010,
+        ); // MB_OK | MB_ICONERROR
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_error_dialog(_title_str: &str, _msg_str: &str) {}
+
+/// Re-spawns the current syncdir executable and exits the current process.
+fn restart_process() {
+    if let Ok(exe) = std::env::current_exe() {
+        tracing::info!("Re-launching process: {}", exe.display());
+        let _ = std::process::Command::new(exe).spawn();
+    }
+    std::process::exit(0);
+}
+
 /// Launch the system tray event loop (blocking).
 ///
 /// Creates a tray icon in the Windows notification area with a checkable
@@ -164,6 +205,7 @@ pub fn run_tray(
     dests: Vec<PathBuf>,
 ) -> Result<(), SyncError> {
     let open_config = MenuItem::new("Open Config", true, None);
+    let reload_config = MenuItem::new("Reload Config", true, None);
     let view_logs = MenuItem::new("View Logs", true, None);
     let sync_now = MenuItem::new("Sync Now", true, None);
 
@@ -176,6 +218,8 @@ pub fn run_tray(
 
     let menu = Menu::new();
     menu.append(&open_config)
+        .map_err(|e| SyncError::Tray(e.to_string()))?;
+    menu.append(&reload_config)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
     menu.append(&view_logs)
         .map_err(|e| SyncError::Tray(e.to_string()))?;
@@ -223,6 +267,7 @@ pub fn run_tray(
     }));
 
     let open_config_id = open_config.id().clone();
+    let reload_config_id = reload_config.id().clone();
     let view_logs_id = view_logs.id().clone();
     let sync_now_id = sync_now.id().clone();
     let startup_toggle_id = startup_toggle.id().clone();
@@ -249,6 +294,29 @@ pub fn run_tray(
                         tracing::info!("Manual sync triggered from tray menu");
                     } else if menu_event.id == open_config_id {
                         let _ = open_path(&config_path);
+                    } else if menu_event.id == reload_config_id {
+                        tracing::info!("Reload Config requested via tray menu.");
+                        match crate::config::Config::load(&config_path) {
+                            Ok(new_config) => {
+                                if let Err(e) = new_config.validate() {
+                                    let err_msg =
+                                        format!("Configuration validation failed:\n\n{e}");
+                                    tracing::error!("{err_msg}");
+                                    show_error_dialog("Config Reload Error", &err_msg);
+                                } else {
+                                    tracing::info!(
+                                        "Configuration validated successfully. Restarting daemon..."
+                                    );
+                                    MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+                                    restart_process();
+                                }
+                            }
+                            Err(e) => {
+                                let err_msg = format!("Failed to parse configuration file:\n\n{e}");
+                                tracing::error!("{err_msg}");
+                                show_error_dialog("Config Reload Error", &err_msg);
+                            }
+                        }
                     } else if menu_event.id == view_logs_id {
                         let _ = open_path(&log_dir);
                     } else if menu_event.id == startup_toggle_id {

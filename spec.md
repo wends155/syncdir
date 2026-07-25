@@ -254,6 +254,17 @@ GIVEN the startup menu item is toggled by the user
 WHEN the menu click event is received
 THEN `StartupRegistry` is updated to register or unregister the startup path
 AND if registry write fails, the checkable state of the menu item is restored to its previous value
+
+[HAPPY] Reload Config menu item validates config and restarts daemon
+GIVEN the user selects "Reload Config" from the system tray context menu
+WHEN `config.toml` is valid
+THEN the daemon re-launches a fresh `syncdir.exe` process and exits cleanly
+
+[EDGE] Reload Config validation failure displays error dialog
+GIVEN the user selects "Reload Config" from the system tray context menu
+WHEN `config.toml` is invalid or unparseable
+THEN a native Windows error dialog (`MessageBoxW` with `MB_ICONERROR`) is displayed showing the error details
+AND the current daemon process remains running unaffected
  
 ---
  
