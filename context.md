@@ -84,6 +84,8 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder added `tracing::info!` file copy telemetry logging and SMB ±2000 ms destination timestamp tolerance in `src/sync.rs` for Windows network share synchronization (41/41 passing tests).
 * **2026-07-25**: Builder implemented UNC path TOML escaping, defensive `\172...` -> `\\172...` normalization, strict path format validation in `src/config.rs`, and startup target reachability logging in `src/main.rs` (44/44 passing tests).
 * **2026-07-25**: Architect synchronized `spec.md` behavioral contracts with commit `d1b4b44`, adding UNC path normalization, strict path validation, SMB 2-second timestamp tolerance, and file telemetry logging scenarios.
+* **2026-07-25**: Builder synchronized `architecture.md` technical design (Key Features §2, Module Boundaries §5, Observability & Logging §9) with recent UNC path normalization, SMB timestamp tolerance, file telemetry logging, and startup reachability features.
+
 
 
 

@@ -18,6 +18,7 @@ This document outlines the architecture, design patterns, and contracts for the 
 * **Local Signature Caches**: Maintain isolated local SQLite databases of block hashes for each destination. This prevents downloading or reading destination files over network CIFS/SMB shares to verify differences.
 * **Real-time File Watching**: Use a central Windows directory notification hook via `ReadDirectoryChangesW` (debounced by 3 seconds) that broadcasts events to independent destination workers.
 * **Archive on Deletion**: Move deleted or overwritten destination files to a `.syncdir_archive/` subfolder on the target share with a timestamp prefix to enable easy manual restore.
+* **Startup Target Telemetry & Diagnostic Logging**: On launch, `syncdir` queries Windows Registry (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`) for OS version/edition, build number, arch, hostname, username, and app version (`SystemDiagnosticInfo::collect()`). It tests reachability (`dest.exists()`) for each resolved target and logs `INFO` (online) or `WARN` (unreachable).
 * **System Tray Menu**: Right-click menu displaying status details for each configured destination, with options to "Open Config", "Reload Config" (validates & re-launches process), "View Logs", "Sync Now", "Start on System Startup" (registry auto-start toggle), "About" (version & copyright modal), and "Exit".
 
 ### Non-Goals
@@ -58,7 +59,7 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, validation of directory paths, optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, and runtime settings.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), defensive single-to-double backslash normalization (`\172...` -> `\\172...`), strict path format validation (`Config::validate()` enforcing drive letters `C:\` or `\\` UNC prefix), optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, and runtime settings.
 * **Does NOT own**: Filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 
@@ -70,7 +71,7 @@ syncdir/
 * **Mock Availability**: `MockHashStore` (implemented in `src/db.rs`) for in-memory unit testing.
 
 ### `sync`
-* **Owns**: Scanning directory trees, comparing source/destination state, hashing files in 1MB blocks via Blake3, performing in-place block updates, handling deletions (moving to archive), and running concurrent background worker loops (`start_sync_worker`) spawned per target destination folder.
+* **Owns**: Scanning directory trees, comparing source/destination state with ±2000 ms SMB timestamp tolerance, hashing files in 1MB blocks via Blake3, performing in-place block updates, emitting structured `tracing::info!` file copy telemetry (`path`, `target`, `size`), handling deletions (moving to archive), and running concurrent background worker loops (`start_sync_worker`) spawned per target destination folder.
 * **Does NOT own**: Watching directories, UI interactions.
 * **Trait Interfaces**:
   * `SyncEngine`: Core sync execution controller.
@@ -85,7 +86,7 @@ syncdir/
 * **Does NOT own**: Filesystem watching or database execution.
 
 ### `startup`
-* **Owns**: Reading, registering, and unregistering Windows startup registry keys (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+* **Owns**: Reading, registering, and unregistering Windows startup registry keys (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`), and collecting system environment telemetry (`SystemDiagnosticInfo`).
 * **Does NOT own**: Configuration validation or UI execution.
 * **Trait Interfaces**:
   * `RegistryBackend`: Interface for Windows startup registry operations.
@@ -122,8 +123,8 @@ syncdir/
 * **Framework**: `tracing` with `tracing-subscriber`.
 * **Outputs**:
   * Dev: Stdout
-  * Prod: `%APPDATA%\syncdir\sync.log`
-* **Log Levels**: `INFO` for sync completion, `WARN` for recoverable errors, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
+  * Prod: `%APPDATA%\syncdir\logs\syncdir.log.YYYY-MM-DD` (daily log rotation via `tracing-appender`)
+* **Log Levels**: `INFO` for file copy telemetry and target reachability, `WARN` for recoverable errors/unreachable targets, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
 * **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs`, `src/db.rs`, `src/sync.rs`, and `src/startup.rs`.
