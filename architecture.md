@@ -84,6 +84,11 @@ syncdir/
 * **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications.
 * **Does NOT own**: Filesystem watching or database execution.
 
+### `startup`
+* **Owns**: Reading, registering, and unregistering Windows startup registry keys (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+* **Does NOT own**: Configuration validation or UI execution.
+* **Trait Interfaces**: None.
+
 ---
 
 ## 6. Dependency Direction Rules
@@ -94,6 +99,7 @@ syncdir/
 | `monitor` | `sync`, `config`, `error` | `db`, `tray` |
 | `sync` | `db` (trait), `config`, `error` | `monitor`, `tray` |
 | `db` | `config`, `error` | `sync`, `monitor`, `tray` |
+| `startup` | `config`, `error` | `sync`, `db`, `monitor`, `tray` |
 | `config` | `error` | `sync`, `db`, `monitor`, `tray` |
 | `error` | None | All |
 

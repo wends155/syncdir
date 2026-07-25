@@ -60,6 +60,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-15**: Builder successfully configured `ast-grep` (`sg`) with project-specific static analysis rules for Rust code safety, SQL injection prevention, path traversal auditing, and scattered environment variable centralization. Verified rule functionality and verified zero-exit on linter, formatter, and test suites.
 * **2026-07-25**: Builder updated `.ast-grep/rules/path-traversal-leak.yml` to include `fs::remove_file` and `fs::remove_dir_all` deletion patterns per review findings. Verified rule detection and verified zero-exit on linter, formatter, and test suites.
 * **2026-07-25**: Architect executed `/update-doc` workflow. Verified zero drift across package descriptions, updated `spec.md` verification commit hash to `cafe65f`, and validated doc-tests.
+* **2026-07-25**: Builder updated `architecture.md` to document `startup` module boundaries and dependency direction rules per architecture audit findings.
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules
