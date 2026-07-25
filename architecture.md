@@ -58,7 +58,7 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, validation of directory paths, and runtime settings.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, validation of directory paths, optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, and runtime settings.
 * **Does NOT own**: Filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 
@@ -67,7 +67,7 @@ syncdir/
 * **Does NOT own**: Calculating block hashes or filesystem read/writes.
 * **Trait Interfaces**:
   * `HashStore`: Interface for persisting and querying file block signatures.
-* **Mock Availability**: `MockHashStore` will be implemented for sync engine testing.
+* **Mock Availability**: `MockHashStore` (implemented in `src/db.rs`) for in-memory unit testing.
 
 ### `sync`
 * **Owns**: Scanning directory trees, comparing source/destination state, hashing files in 1MB blocks via Blake3, performing in-place block updates, handling deletions (moving to archive), and running concurrent background worker loops (`start_sync_worker`) spawned per target destination folder.
@@ -87,7 +87,9 @@ syncdir/
 ### `startup`
 * **Owns**: Reading, registering, and unregistering Windows startup registry keys (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
 * **Does NOT own**: Configuration validation or UI execution.
-* **Trait Interfaces**: None.
+* **Trait Interfaces**:
+  * `RegistryBackend`: Interface for Windows startup registry operations.
+* **Mock Availability**: `MockStartupRegistry` (implemented in `src/startup.rs`) for cross-platform unit testing.
 
 ---
 

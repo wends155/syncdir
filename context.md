@@ -67,6 +67,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder replaced raw LaTeX math delimiters (`$\ge$`) with standard UTF-8 characters (`≥`) in `CHANGELOG.md`, `README.md`, and GitHub Release `v0.1.4` notes to fix browser Markdown rendering defects.
 * **2026-07-25**: Builder made `dest_dir` optional (`Option<PathBuf>`) in `Config`, allowing multi-destination configurations specified solely via `dest_dirs`. Updated `resolved_dest_dirs()`, `validate()`, engine/worker callers, doc-tests, and test helpers across 6 files (26/26 passing unit tests).
 * **2026-07-25**: Architect executed `/update-doc` workflow. Synchronized rustdoc comments in `src/startup.rs`, updated `spec.md` behavioral contracts and verification commit hash to `4092fd4`, and confirmed zero drift across `Cargo.toml`, `lib.rs`, and `README.md`.
+* **2026-07-25**: Builder updated `architecture.md` § 5 Module Boundaries to accurately reflect `MockHashStore`, `RegistryBackend`, `MockStartupRegistry`, and optional `dest_dir` configuration support.
 
 ## 3. Context Compression
 * **Feature:** Configure `ast-grep` (`sg`) custom security rules, document `startup` architecture boundaries, publish GitHub Release `v0.1.4`, expand unit testing suite, fix Markdown LaTeX rendering defects, and make `dest_dir` optional in `Config`
