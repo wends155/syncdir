@@ -171,6 +171,24 @@ fn escape_backslashes_in_quotes(line: &str) -> String {
     result
 }
 
+impl Config {
+    /// Create a Config with sensible test defaults for the given source and dest.
+    #[doc(hidden)]
+    pub fn test_default(source: PathBuf, dest: PathBuf) -> Self {
+        Self {
+            source_dir: source,
+            dest_dir: Some(dest),
+            debounce_seconds: 1,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 10,
+            block_size_bytes: 4,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+            dest_dirs: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

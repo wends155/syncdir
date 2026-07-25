@@ -90,4 +90,5 @@ This file documents the chronological history, design decisions, and rules conte
   - Rust 2024 edition requires `unsafe extern "system"` modifier syntax for Win32 FFI blocks.
   - `TriggerFullScan` evaluates live `source_dir.exists()` to prevent startup scan race conditions.
   - "Reload Config" validates configuration and uses process restart (`restart_process`) to apply new settings cleanly.
+  - `RegistryBackend` trait is defined but currently disconnected from `run_tray` (calls `StartupRegistry` static methods directly). Refactoring `run_tray` for dependency injection is deferred as design debt until a second UI surface is introduced.
 * **Pruned:** Manual checks for unwraps, env variables, filesystem operations, release packaging, mock testing structures, LaTeX rendering defects, single-destination configuration constraints, startup scan timing race conditions, and architecture module boundary status drift are now automated.

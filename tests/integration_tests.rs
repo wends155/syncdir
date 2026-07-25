@@ -14,17 +14,11 @@ fn test_integration_config_db_sync_commands() {
     let dest = dir.path().join("dest");
     std::fs::create_dir(&dest).unwrap();
 
-    let config = Config {
-        source_dir: source,
-        dest_dir: Some(dest),
-        debounce_seconds: 5,
-        propagate_deletions: false,
-        block_sync_threshold_bytes: 4096,
-        block_size_bytes: 1024,
-        verify_writes: true,
-        retry_interval_seconds: 10,
-        dest_dirs: None,
-    };
+    let mut config = Config::test_default(source, dest);
+    config.debounce_seconds = 5;
+    config.propagate_deletions = false;
+    config.block_sync_threshold_bytes = 4096;
+    config.block_size_bytes = 1024;
 
     assert!(config.validate().is_ok());
 
@@ -65,17 +59,7 @@ fn test_watcher_and_sync_engine_flow() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&dest).unwrap();
 
-    let config = Config {
-        source_dir: source.clone(),
-        dest_dir: Some(dest.clone()),
-        debounce_seconds: 1,
-        propagate_deletions: true,
-        block_sync_threshold_bytes: 10,
-        block_size_bytes: 4,
-        verify_writes: true,
-        retry_interval_seconds: 10,
-        dest_dirs: None,
-    };
+    let config = Config::test_default(source.clone(), dest.clone());
 
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let (tx, rx) = channel();
@@ -127,17 +111,8 @@ fn test_propagate_deletions_false() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&dest).unwrap();
 
-    let config = Config {
-        source_dir: source.clone(),
-        dest_dir: Some(dest.clone()),
-        debounce_seconds: 1,
-        propagate_deletions: false,
-        block_sync_threshold_bytes: 10,
-        block_size_bytes: 4,
-        verify_writes: true,
-        retry_interval_seconds: 10,
-        dest_dirs: None,
-    };
+    let mut config = Config::test_default(source.clone(), dest.clone());
+    config.propagate_deletions = false;
 
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);
@@ -172,17 +147,7 @@ fn test_watcher_rename_event() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&dest).unwrap();
 
-    let config = Config {
-        source_dir: source.clone(),
-        dest_dir: Some(dest.clone()),
-        debounce_seconds: 1,
-        propagate_deletions: true,
-        block_sync_threshold_bytes: 10,
-        block_size_bytes: 4,
-        verify_writes: true,
-        retry_interval_seconds: 10,
-        dest_dirs: None,
-    };
+    let config = Config::test_default(source.clone(), dest.clone());
 
     let (tx, rx) = channel();
     let _watcher = DirectoryWatcher::start(&config, tx).unwrap();
@@ -227,17 +192,7 @@ fn test_path_traversal_prevention() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&dest).unwrap();
 
-    let config = Config {
-        source_dir: source.clone(),
-        dest_dir: Some(dest.clone()),
-        debounce_seconds: 1,
-        propagate_deletions: true,
-        block_sync_threshold_bytes: 10,
-        block_size_bytes: 4,
-        verify_writes: true,
-        retry_interval_seconds: 10,
-        dest_dirs: None,
-    };
+    let config = Config::test_default(source.clone(), dest.clone());
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);
 
@@ -266,17 +221,7 @@ fn test_subsecond_sync_precision() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&dest).unwrap();
 
-    let config = Config {
-        source_dir: source.clone(),
-        dest_dir: Some(dest.clone()),
-        debounce_seconds: 1,
-        propagate_deletions: true,
-        block_sync_threshold_bytes: 10,
-        block_size_bytes: 4,
-        verify_writes: true,
-        retry_interval_seconds: 10,
-        dest_dirs: None,
-    };
+    let config = Config::test_default(source.clone(), dest.clone());
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);
 
@@ -294,5 +239,38 @@ fn test_subsecond_sync_precision() {
     assert_eq!(
         std::fs::read_to_string(dest.join("fast.txt")).unwrap(),
         "updated"
+    );
+}
+
+#[test]
+fn test_reload_config_validation_error() {
+    // Test that Config::load fails on invalid TOML
+    let dir = tempdir().unwrap();
+    let bad_config = dir.path().join("bad_config.toml");
+    std::fs::write(&bad_config, "this is not valid toml [[[").unwrap();
+    assert!(Config::load(&bad_config).is_err());
+
+    // Test that Config::validate fails when no destinations are configured
+    let no_dest_config = dir.path().join("no_dest.toml");
+    let source = dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(
+        &no_dest_config,
+        format!(
+            r#"source_dir = "{}"
+debounce_seconds = 3
+propagate_deletions = true
+block_sync_threshold_bytes = 1024
+block_size_bytes = 512
+verify_writes = true
+"#,
+            source.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .unwrap();
+    let config = Config::load(&no_dest_config).unwrap();
+    assert!(
+        config.validate().is_err(),
+        "Config with no destinations should fail validation"
     );
 }

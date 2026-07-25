@@ -494,17 +494,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_config(source: PathBuf, dest: PathBuf) -> Config {
-        Config {
-            source_dir: source,
-            dest_dir: Some(dest),
-            debounce_seconds: 1,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 10,
-            block_size_bytes: 4,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        }
+        Config::test_default(source, dest)
     }
 
     #[test]
@@ -719,5 +709,79 @@ mod tests {
         // The final state should be synced (FileModified won)
         assert!(dest.join("storm.txt").exists());
         assert_eq!(fs::read(dest.join("storm.txt")).unwrap(), b"storm data");
+    }
+
+    #[test]
+    fn test_trigger_full_scan_skipped_offline() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("nonexistent_source");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::test_default(source, dest.clone());
+        let store = MockHashStore::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let _handle = start_sync_worker(0, config, store, rx, None, source_online);
+
+        // Send TriggerFullScan
+        tx.send(SyncCommand::TriggerFullScan).unwrap();
+
+        // Wait for processing
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Dest should remain empty — no sync occurred
+        let entries: Vec<_> = fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "Destination should be empty when source is offline"
+        );
+    }
+
+    #[test]
+    fn test_nested_directory_deletion_archive() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(source.join("subdir")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(&db_path, &config).unwrap();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // Sync a nested file
+        fs::write(source.join("subdir").join("deep.txt"), b"nested content").unwrap();
+        engine.sync_file("subdir/deep.txt").unwrap();
+        assert!(dest.join("subdir").join("deep.txt").exists());
+
+        // Delete it
+        engine.delete_file("subdir/deep.txt").unwrap();
+
+        // Original should be gone
+        assert!(!dest.join("subdir").join("deep.txt").exists());
+
+        // Should be in .syncdir_archive with nested path preserved
+        let archive = dest.join(".syncdir_archive");
+        assert!(archive.exists());
+        let entries: Vec<_> = fs::read_dir(&archive)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let archived_entry = &entries[0];
+        let nested = archived_entry.path().join("deep.txt");
+        assert!(
+            nested.exists(),
+            "Archived nested file should preserve directory structure"
+        );
+
+        // DB record should be gone
+        assert!(engine.db.get_file("subdir/deep.txt").unwrap().is_none());
     }
 }

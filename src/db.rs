@@ -330,17 +330,10 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn dummy_config(block_size: u64) -> Config {
-        Config {
-            source_dir: PathBuf::from("."),
-            dest_dir: Some(PathBuf::from(".")),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: block_size * 2,
-            block_size_bytes: block_size,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        }
+        let mut c = Config::test_default(PathBuf::from("."), PathBuf::from("."));
+        c.block_sync_threshold_bytes = block_size * 2;
+        c.block_size_bytes = block_size;
+        c
     }
 
     #[test]
