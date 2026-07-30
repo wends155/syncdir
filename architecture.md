@@ -19,7 +19,8 @@ This document outlines the architecture, design patterns, and contracts for the 
 * **Real-time File Watching**: Use a central Windows directory notification hook via `ReadDirectoryChangesW` (debounced by 3 seconds) that broadcasts events to independent destination workers.
 * **Archive on Deletion**: Move deleted or overwritten destination files to a `.syncdir_archive/` subfolder on the target share with a timestamp prefix to enable easy manual restore.
 * **Startup Target Telemetry & Diagnostic Logging**: On launch, `syncdir` queries Windows Registry (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`) for OS version/edition, build number, arch, hostname, username, and app version (`SystemDiagnosticInfo::collect()`). It tests reachability (`dest.exists()`) for each resolved target and logs `INFO` (online) or `WARN` (unreachable).
-* **System Tray Menu**: Right-click menu displaying status details for each configured destination, with options to "Open Config", "Reload Config" (validates & re-launches process), "View Logs", "Sync Now", "Start on System Startup" (registry auto-start toggle), "About" (version & copyright modal), and "Exit".
+* **System Tray Menu**: Right-click menu displaying status details for each configured destination, with options to "Open Config", "Reload Config" (validates configuration, returns `TrayExitReason::Restart` to `main()`, unregisters tray icon, and re-launches process), "View Logs", "Sync Now", "Start on System Startup" (registry auto-start toggle), "About" (version & copyright modal), and "Exit".
+* **Single-Instance Process Execution**: On boot, `syncdir` acquires a session-local named Win32 mutex (`Local\syncdir_single_instance`) wrapped in a `SingleInstanceGuard` RAII handle. If another instance is already running, the secondary process outputs a message to stderr and exits with code 0 without spawning duplicate tray icons.
 
 ### Non-Goals
 * Two-way directory synchronization (strictly one-way source -> destination).
@@ -81,8 +82,12 @@ syncdir/
 * **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`), debouncing file events, and broadcasting `SyncCommand` events to multiple destination sync workers via crossbeam/std mpsc channels.
 * **Does NOT own**: Sync execution (delegates to `SyncEngine` worker threads).
 
+### `main`
+* **Owns**: Application entry point, CLI argument parsing, single-instance process mutex acquisition (`acquire_single_instance_mutex` / `SingleInstanceGuard`), dual-writer logging setup, system diagnostic telemetry collection, panic hook registration, and process restart handoff.
+* **Does NOT own**: Filesystem watching, tray menu construction, or SQLite database operations.
+
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, managing process re-launch on config reload (`restart_process`), displaying native error modal dialogs (`show_error_dialog`), and toggling Windows startup registration.
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), and toggling Windows startup registration.
 * **Does NOT own**: Filesystem watching or database execution.
 
 ### `startup`

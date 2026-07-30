@@ -88,6 +88,7 @@ This file documents the chronological history, design decisions, and rules conte
 * **2026-07-25**: Builder bumped version to `0.1.8`, updated `CHANGELOG.md`, compiled release binary `syncdir.exe`, pushed `v0.1.8` git tag, verified `cargo publish --dry-run`, and published GitHub Release `v0.1.8` at `https://github.com/wends155/syncdir/releases/tag/v0.1.8` (44/44 passing tests).
 * **2026-07-30**: Builder implemented single-instance Win32 named mutex (`Local\syncdir_single_instance`) in `src/main.rs` with `SingleInstanceGuard` RAII handle, and refactored process restart in `src/tray.rs` to return `TrayExitReason` enum from `run_tray` so `TrayIcon::Drop` (`Shell_NotifyIconW(NIM_DELETE)`) runs cleanly before spawning new process, resolving multiple taskbar tray icon instances and ghost icons (44/44 passing tests).
 * **2026-07-30**: Architect synchronized `spec.md` behavioral contracts with commit `5c2e63a`, adding single-instance process execution scenarios, updating `run_tray` return signature to `TrayExitReason`, and adding `TrayExitReason` and `SingleInstanceGuard` data models.
+* **2026-07-30**: Builder updated `architecture.md` Sections 2 and 5 per Architecture Recommendations Report, documenting single-instance process mutex guard, `SingleInstanceGuard` RAII handle, `main` module boundary, and clean tray process restart handoff via `TrayExitReason` enum.
 
 ## 3. Context Compression
 
