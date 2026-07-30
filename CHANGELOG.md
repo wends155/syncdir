@@ -4,6 +4,22 @@ All notable changes to the `syncdir` project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [v0.1.9] - 2026-07-30
+
+### Added
+- **Single-Instance Process Execution Enforcement**: Added Win32 session-local named mutex (`Local\syncdir_single_instance`) and `SingleInstanceGuard` RAII handle in `src/main.rs`. Secondary process launches output a message to stderr and exit cleanly with code `0` without spawning duplicate tray icons.
+- **TrayExitReason Enum**: Returned by `run_tray` in `src/tray.rs` to signal clean event loop exit reasons (`UserExit`, `Restart`) to `main()`.
+
+### Fixed
+- **Taskbar Tray Icon Duplication**: Prevented multiple concurrent daemon instances from launching in the same user login session.
+- **Ghost Tray Icon on Process Restart**: Refactored "Reload Config" restart handoff so `TrayIcon::Drop` (`Shell_NotifyIconW(NIM_DELETE)`) unregisters the tray icon from Windows Shell before `main()` drops the process mutex and spawns `syncdir.exe`.
+
+### Documentation
+- Updated `spec.md` behavioral specifications and `architecture.md` (Sections 2 and 5) with single-instance mutex enforcement and clean restart handoff contracts.
+
+---
+
 ## [v0.1.8] - 2026-07-25
 
 ### Added
