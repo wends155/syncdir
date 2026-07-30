@@ -24,6 +24,18 @@ pub enum EngineStatus {
     BothOffline,
 }
 
+/// Reason the tray event loop exited.
+///
+/// Returned by [`run_tray`] so the caller can decide whether to
+/// re-launch the process after the tray icon has been cleanly dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayExitReason {
+    /// User selected "Exit" from the tray menu.
+    UserExit,
+    /// User selected "Reload Config" — caller should re-spawn the process.
+    Restart,
+}
+
 /// Per-target status report sent from worker threads to the tray event loop.
 #[derive(Debug, Clone)]
 pub struct TargetStatusUpdate {
@@ -168,15 +180,6 @@ fn show_error_dialog(title_str: &str, msg_str: &str) {
 #[cfg(not(target_os = "windows"))]
 fn show_error_dialog(_title_str: &str, _msg_str: &str) {}
 
-/// Re-spawns the current syncdir executable and exits the current process.
-fn restart_process() {
-    if let Ok(exe) = std::env::current_exe() {
-        tracing::info!("Re-launching process: {}", exe.display());
-        let _ = std::process::Command::new(exe).spawn();
-    }
-    std::process::exit(0);
-}
-
 /// Launch the system tray event loop (blocking).
 ///
 /// Creates a tray icon in the Windows notification area with a checkable
@@ -191,7 +194,7 @@ fn restart_process() {
 ///
 /// # Returns
 ///
-/// Returns `Ok(())` when the daemon is shut down via the "Exit" menu item.
+/// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
 ///
 /// # Errors
 ///
@@ -203,7 +206,7 @@ pub fn run_tray(
     log_dir: PathBuf,
     tx: Sender<SyncCommand>,
     dests: Vec<PathBuf>,
-) -> Result<(), SyncError> {
+) -> Result<TrayExitReason, SyncError> {
     let open_config = MenuItem::new("Open Config", true, None);
     let reload_config = MenuItem::new("Reload Config", true, None);
     let view_logs = MenuItem::new("View Logs", true, None);
@@ -279,6 +282,7 @@ pub fn run_tray(
     let mut watcher_active = false;
     let mut dest_online = vec![false; num_targets];
     let mut needs_repaint = false;
+    let mut exit_reason = TrayExitReason::UserExit;
 
     event_loop
         .run(move |event, elwt| {
@@ -308,7 +312,8 @@ pub fn run_tray(
                                         "Configuration validated successfully. Restarting daemon..."
                                     );
                                     MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
-                                    restart_process();
+                                    exit_reason = TrayExitReason::Restart;
+                                    elwt.exit();
                                 }
                             }
                             Err(e) => {
@@ -423,5 +428,5 @@ pub fn run_tray(
         })
         .map_err(|e| SyncError::Tray(format!("Event loop error: {e}")))?;
 
-    Ok(())
+    Ok(exit_reason)
 }

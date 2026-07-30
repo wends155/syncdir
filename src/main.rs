@@ -10,11 +10,11 @@ use syncdir::config::Config;
 use syncdir::db::SqliteHashStore;
 use syncdir::error::SyncError;
 use syncdir::sync::{SyncCommand, start_sync_worker};
-use syncdir::tray::run_tray;
+use syncdir::tray::{TrayExitReason, run_tray};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-fn try_main(app_dir: PathBuf) -> Result<(), SyncError> {
+fn try_main(app_dir: PathBuf) -> Result<TrayExitReason, SyncError> {
     let log_dir = app_dir.join("logs");
     tracing::info!("Initializing syncdir daemon...");
 
@@ -62,7 +62,7 @@ retry_interval_seconds = 10
         tracing::warn!(
             "Please edit the configuration file with valid paths and restart the daemon."
         );
-        return Ok(());
+        return Ok(TrayExitReason::UserExit);
     }
 
     let config = Config::load(&config_path)?;
@@ -228,10 +228,73 @@ retry_interval_seconds = 10
 
     // 6. Run tray UI (blocks the main thread)
     tracing::info!("Starting system tray UI loop.");
-    run_tray(event_loop, config_path, log_dir, tx, dests)?;
+    let exit_reason = run_tray(event_loop, config_path, log_dir, tx, dests)?;
 
-    tracing::info!("syncdir daemon shut down cleanly.");
-    Ok(())
+    Ok(exit_reason)
+}
+
+/// RAII guard holding the single-instance Windows mutex handle.
+///
+/// Automatically closes the mutex handle via Win32 `CloseHandle` when dropped.
+#[cfg(target_os = "windows")]
+pub struct SingleInstanceGuard(*mut std::ffi::c_void);
+
+#[cfg(target_os = "windows")]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: CloseHandle is a standard Win32 API function.
+            unsafe {
+                unsafe extern "system" {
+                    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                }
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub struct SingleInstanceGuard;
+
+/// Acquire a session-local named mutex to enforce single-instance execution.
+///
+/// Returns the mutex guard on success. The guard must be kept alive
+/// for the lifetime of the process — dropping it releases the mutex.
+/// Returns `None` if another instance already holds the mutex.
+#[cfg(target_os = "windows")]
+fn acquire_single_instance_mutex() -> Option<SingleInstanceGuard> {
+    use std::os::windows::ffi::OsStrExt;
+    // SAFETY: CreateMutexW and GetLastError are standard Win32 APIs called with a valid null-terminated wide string.
+    unsafe {
+        unsafe extern "system" {
+            fn CreateMutexW(
+                lp_mutex_attributes: *const std::ffi::c_void,
+                b_initial_owner: i32,
+                lp_name: *const u16,
+            ) -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        }
+        const ERROR_ALREADY_EXISTS: u32 = 183;
+        let name: Vec<u16> = std::ffi::OsStr::new("Local\\syncdir_single_instance\0")
+            .encode_wide()
+            .collect();
+        let handle = CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr());
+        if handle.is_null() {
+            return None;
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(handle);
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn acquire_single_instance_mutex() -> Option<SingleInstanceGuard> {
+    Some(SingleInstanceGuard)
 }
 
 fn main() {
@@ -290,6 +353,15 @@ fn main() {
         }
         std::process::exit(0);
     }
+
+    // Enforce single-instance execution
+    let _mutex_guard = match acquire_single_instance_mutex() {
+        Some(handle) => handle,
+        None => {
+            eprintln!("syncdir is already running. Only one instance is allowed.");
+            std::process::exit(0);
+        }
+    };
 
     // Computes default app dir and sets up logging
     let app_dir = match Config::default_app_dir() {
@@ -374,8 +446,24 @@ fn main() {
         std::process::exit(1);
     }));
 
-    if let Err(e) = try_main(app_dir) {
-        tracing::error!("Fatal error: {e}");
-        std::process::exit(1);
+    match try_main(app_dir) {
+        Ok(exit_reason) => match exit_reason {
+            TrayExitReason::UserExit => {
+                tracing::info!("syncdir daemon shut down cleanly.");
+            }
+            TrayExitReason::Restart => {
+                tracing::info!("Restarting syncdir daemon...");
+                // Drop the mutex guard BEFORE spawning so the new instance can acquire it immediately.
+                drop(_mutex_guard);
+                if let Ok(exe) = std::env::current_exe() {
+                    tracing::info!("Re-launching process: {}", exe.display());
+                    let _ = std::process::Command::new(exe).spawn();
+                }
+            }
+        },
+        Err(e) => {
+            tracing::error!("Fatal error: {e}");
+            std::process::exit(1);
+        }
     }
 }
