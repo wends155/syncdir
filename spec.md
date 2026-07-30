@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 9e945b2
+> Last verified against: 5c2e63a
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 0.1.8 |
-| **Last Updated** | 2026-07-25 |
+| **Last Updated** | 2026-07-30 |
 
 ---
 
@@ -255,11 +255,19 @@ THEN `SyncCommand::FileDeleted("old.txt")` and `SyncCommand::FileModified("new.t
 
 | Function / Component | Signature | Returns | Errors |
 |----------------------|-----------|---------|--------|
-| `run_tray` | `(event_loop: EventLoop<UserEvent>, config_path: PathBuf, log_dir: PathBuf, tx: Sender<SyncCommand>) -> Result<(), SyncError>` | `()` | `SyncError::Tray` |
+| `run_tray` | `(event_loop: EventLoop<UserEvent>, config_path: PathBuf, log_dir: PathBuf, tx: Sender<SyncCommand>, dests: Vec<PathBuf>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
+| `TrayExitReason` | `enum` | — | — |
 | `EngineStatus` | `enum` | — | — |
 | `UserEvent` | `enum` | — | — |
 
 #### Behavioral Scenarios
+
+[HAPPY] Single-instance execution enforcement
+GIVEN an instance of syncdir is already running in the user session
+WHEN a second syncdir process is launched
+THEN `acquire_single_instance_mutex` detects existing mutex ownership
+AND prints "syncdir is already running. Only one instance is allowed." to stderr
+AND exits with code 0 without creating a second tray icon
 
 [HAPPY] Update icon and tooltip on status change
 GIVEN the system tray event loop receives a `UserEvent::Status(status)` event
@@ -276,7 +284,9 @@ AND if registry write fails, the checkable state of the menu item is restored to
 [HAPPY] Reload Config menu item validates config and restarts daemon
 GIVEN the user selects "Reload Config" from the system tray context menu
 WHEN `config.toml` is valid
-THEN the daemon re-launches a fresh `syncdir.exe` process and exits cleanly
+THEN `run_tray` returns `TrayExitReason::Restart` and exits the winit event loop cleanly
+AND `TrayIcon::Drop` unregisters the tray icon from Windows Shell (`Shell_NotifyIconW`)
+AND `main()` drops the single-instance mutex guard before spawning a fresh `syncdir.exe` process
 
 [EDGE] Reload Config validation failure displays error dialog
 GIVEN the user selects "Reload Config" from the system tray context menu
@@ -324,13 +334,22 @@ Custom events processed by the winit main thread UI event loop.
 - `Menu(MenuEvent)`
 - `StatusUpdate(TargetStatusUpdate)`
 - `WatcherStatus { source_online: bool, watcher_active: bool }`
- 
+
+### TrayExitReason
+Represents the reason the system tray event loop exited.
+- `UserExit` (user selected "Exit" from context menu)
+- `Restart` (user selected "Reload Config", triggering process restart)
+
+### SingleInstanceGuard
+RAII guard holding the single-instance Windows named mutex handle (`Local\syncdir_single_instance`).
+- `0`: `*mut c_void` (Win32 mutex handle, automatically closed via `CloseHandle` when dropped)
+
 ### SyncCommand
 Commands passed to the worker channel.
 - `FileModified(PathBuf)`
 - `FileDeleted(PathBuf)`
 - `TriggerFullScan`
- 
+
 ---
  
 ## State Machines
