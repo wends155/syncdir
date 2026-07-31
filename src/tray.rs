@@ -206,6 +206,7 @@ pub fn run_tray(
     log_dir: PathBuf,
     tx: Sender<SyncCommand>,
     dests: Vec<PathBuf>,
+    initial_dest_online: Vec<bool>,
 ) -> Result<TrayExitReason, SyncError> {
     let open_config = MenuItem::new("Open Config", true, None);
     let reload_config = MenuItem::new("Reload Config", true, None);
@@ -238,8 +239,11 @@ pub fn run_tray(
         menu.append(&separator)
             .map_err(|e| SyncError::Tray(e.to_string()))?;
 
-        for d in &dests {
-            let label = format!("○ {} (Offline)", d.display());
+        for (i, d) in dests.iter().enumerate() {
+            let is_online = initial_dest_online.get(i).copied().unwrap_or(false);
+            let indicator = if is_online { "●" } else { "○" };
+            let status_str = if is_online { "Online" } else { "Offline" };
+            let label = format!("{} {} ({})", indicator, d.display(), status_str);
             let item = MenuItem::new(&label, false, None); // Read-only / disabled
             menu.append(&item)
                 .map_err(|e| SyncError::Tray(e.to_string()))?;
@@ -280,8 +284,8 @@ pub fn run_tray(
     let num_targets = dests.len();
     let mut source_online = false;
     let mut watcher_active = false;
-    let mut dest_online = vec![false; num_targets];
-    let mut needs_repaint = false;
+    let mut dest_online = initial_dest_online;
+    let mut needs_repaint = true;
     let mut exit_reason = TrayExitReason::UserExit;
 
     event_loop

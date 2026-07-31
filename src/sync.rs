@@ -470,7 +470,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                     pending_syncs.remove(&path);
                 }
                 Ok(SyncCommand::TriggerFullScan) => {
-                    if config.source_dir.exists() && config.source_dir.is_dir() {
+                    if source_online_atomic.load(std::sync::atomic::Ordering::Relaxed) {
                         match engine.run_full_scan() {
                             Ok(true) => {}
                             Ok(false) => {

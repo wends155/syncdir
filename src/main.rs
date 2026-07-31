@@ -228,7 +228,15 @@ retry_interval_seconds = 10
 
     // 6. Run tray UI (blocks the main thread)
     tracing::info!("Starting system tray UI loop.");
-    let exit_reason = run_tray(event_loop, config_path, log_dir, tx, dests)?;
+    let initial_dest_online = dests.iter().map(|d| d.exists() && d.is_dir()).collect();
+    let exit_reason = run_tray(
+        event_loop,
+        config_path,
+        log_dir,
+        tx,
+        dests,
+        initial_dest_online,
+    )?;
 
     Ok(exit_reason)
 }

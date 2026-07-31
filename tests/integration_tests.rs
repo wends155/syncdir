@@ -97,6 +97,7 @@ fn test_tray_module_compiles() {
         std::path::PathBuf,
         std::sync::mpsc::Sender<syncdir::sync::SyncCommand>,
         std::vec::Vec<std::path::PathBuf>,
+        std::vec::Vec<bool>,
     ) -> Result<syncdir::tray::TrayExitReason, syncdir::error::SyncError> = syncdir::tray::run_tray;
 }
 
