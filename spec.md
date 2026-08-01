@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 5c2e63a
+> Last verified against: 204e4b9
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 0.1.9 |
-| **Last Updated** | 2026-07-30 |
+| **Last Updated** | 2026-08-01 |
 
 ---
 
@@ -255,7 +255,13 @@ THEN `SyncCommand::FileDeleted("old.txt")` and `SyncCommand::FileModified("new.t
 
 | Function / Component | Signature | Returns | Errors |
 |----------------------|-----------|---------|--------|
-| `run_tray` | `(event_loop: EventLoop<UserEvent>, config_path: PathBuf, log_dir: PathBuf, tx: Sender<SyncCommand>, dests: Vec<PathBuf>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
+| `run_tray` | `(event_loop: EventLoop<UserEvent>, config_path: PathBuf, log_dir: PathBuf, tx: Sender<SyncCommand>, dests: Vec<PathBuf>, initial_dest_online: Vec<bool>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
+| `TrayState::new` | `(initial_dest_online: Vec<bool>) -> Self` | `TrayState` | — |
+| `TrayState::update_target_status` | `(&mut self, target_index: usize, online: bool) -> bool` | `bool` (changed) | — |
+| `TrayState::update_watcher_status` | `(&mut self, source_online: bool, watcher_active: bool) -> bool` | `bool` (changed) | — |
+| `TrayState::overall_status` | `(&self) -> EngineStatus` | `EngineStatus` | — |
+| `TrayState::online_dest_count` | `(&self) -> usize` | `usize` | — |
+| `TrayState::tooltip_text` | `(&self) -> String` | `String` | — |
 | `TrayExitReason` | `enum` | — | — |
 | `EngineStatus` | `enum` | — | — |
 | `UserEvent` | `enum` | — | — |
@@ -293,6 +299,13 @@ GIVEN the user selects "Reload Config" from the system tray context menu
 WHEN `config.toml` is invalid or unparseable
 THEN a native Windows error dialog (`MessageBoxW` with `MB_ICONERROR`) is displayed showing the error details
 AND the current daemon process remains running unaffected
+
+[HAPPY] Pure TrayState status calculation and tooltip text generation
+GIVEN a `TrayState` initialized with destination reachability states
+WHEN `update_watcher_status` or `update_target_status` is called
+THEN `overall_status()` calculates `Healthy`, `SourceOffline`, `DestinationOffline`, or `BothOffline` without GUI event loop side effects
+AND `tooltip_text()` formats the tooltip string `"syncdir — Src: <status> | Dests: N/M Online"`
+
  
 ---
  
@@ -339,6 +352,12 @@ Custom events processed by the winit main thread UI event loop.
 Represents the reason the system tray event loop exited.
 - `UserExit` (user selected "Exit" from context menu)
 - `Restart` (user selected "Reload Config", triggering process restart)
+
+### TrayState
+Pure state container tracking visual status and connectivity for system tray UI.
+- `source_online`: bool
+- `watcher_active`: bool
+- `dest_online`: Vec<bool>
 
 ### SingleInstanceGuard
 RAII guard holding the single-instance Windows named mutex handle (`Local\syncdir_single_instance`).
@@ -429,3 +448,6 @@ Local network shares mounted as folder paths. Delta synchronization reads 1MB bl
 
 ### 3. Windows System Notification Area (System Tray)
 User interface tray-icon utilizing the `tray-icon` and `winit` crates for controlling/viewing background sync status. Displays RGBA-rendered visual presence indicators and status tooltips. The context menu provides actions for opening configuration, viewing logs, forcing immediate sync, toggling Windows startup, inspecting destination target statuses, opening an "About" modal dialog box (via Win32 `MessageBoxW`), and exiting the daemon.
+
+### 4. Testing Frameworks & Verification Infrastructure
+Multi-layered testing infrastructure combining colorized failure diffs (`pretty_assertions`), regression-guarding snapshot testing (`insta` for `Config`, `SyncError`, `FileRecord`), generative property-based invariant testing (`proptest` for block boundary division, TOML round-tripping, SMB timestamp tolerance, path traversal safety, sync idempotency, and delta sync isolation), and pure struct unit testing (`TrayState`).
