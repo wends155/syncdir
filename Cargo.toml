@@ -32,4 +32,11 @@ pretty_assertions = "1"
 insta = "1"
 proptest = "1"
 
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+
 
