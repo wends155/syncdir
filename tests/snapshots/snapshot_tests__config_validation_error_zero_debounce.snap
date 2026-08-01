@@ -1,0 +1,5 @@
+---
+source: tests/snapshot_tests.rs
+expression: err.to_string()
+---
+Validation error: Debounce seconds must be greater than zero

@@ -547,6 +547,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
 mod tests {
     use super::*;
     use crate::db::{MockHashStore, SqliteHashStore};
+    use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     fn test_config(source: PathBuf, dest: PathBuf) -> Config {

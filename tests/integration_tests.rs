@@ -1,3 +1,4 @@
+use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 use syncdir::config::Config;
 use syncdir::db::{FileRecord, HashStore, SqliteHashStore};

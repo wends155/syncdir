@@ -1,0 +1,5 @@
+---
+source: tests/snapshot_tests.rs
+expression: err.to_string()
+---
+Validation error: source directory does not exist

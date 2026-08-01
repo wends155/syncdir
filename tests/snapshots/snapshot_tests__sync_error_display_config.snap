@@ -1,0 +1,5 @@
+---
+source: tests/snapshot_tests.rs
+expression: err.to_string()
+---
+Config error: invalid TOML: missing field 'source_dir'

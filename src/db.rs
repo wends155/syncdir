@@ -326,6 +326,7 @@ impl HashStore for MockHashStore {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
 

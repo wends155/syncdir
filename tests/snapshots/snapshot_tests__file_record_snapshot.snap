@@ -1,0 +1,12 @@
+---
+source: tests/snapshot_tests.rs
+expression: "format!(\"{:#?}\", record)"
+---
+FileRecord {
+    id: Some(
+        42,
+    ),
+    relative_path: "docs/readme.txt",
+    file_size: 8192,
+    last_modified: 1722470400,
+}

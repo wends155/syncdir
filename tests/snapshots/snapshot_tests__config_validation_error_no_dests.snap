@@ -1,0 +1,5 @@
+---
+source: tests/snapshot_tests.rs
+expression: err.to_string()
+---
+Validation error: At least one destination directory must be specified (via dest_dir or dest_dirs)

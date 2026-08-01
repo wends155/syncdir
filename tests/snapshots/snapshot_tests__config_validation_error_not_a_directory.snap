@@ -1,0 +1,5 @@
+---
+source: tests/snapshot_tests.rs
+expression: err.to_string()
+---
+Validation error: Source path is not a directory

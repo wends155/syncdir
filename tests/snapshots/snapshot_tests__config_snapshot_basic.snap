@@ -1,0 +1,17 @@
+---
+source: tests/snapshot_tests.rs
+expression: "format!(\"{:#?}\", config)"
+---
+Config {
+    source_dir: "C:\\source",
+    dest_dir: Some(
+        "D:\\dest",
+    ),
+    debounce_seconds: 1,
+    propagate_deletions: true,
+    block_sync_threshold_bytes: 10,
+    block_size_bytes: 4,
+    verify_writes: true,
+    retry_interval_seconds: 10,
+    dest_dirs: None,
+}
