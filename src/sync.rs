@@ -16,6 +16,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// Extract file modified time as milliseconds since UNIX epoch.
 ///
 /// Pre-1970 timestamps are clamped to 0 (epoch) with a warning log.
+///
+/// # Errors
+///
+/// Returns `SyncError::Io` if the file's modified time cannot be read.
 fn safe_modified_millis(metadata: &std::fs::Metadata) -> Result<i64, SyncError> {
     let modified = metadata.modified().map_err(SyncError::Io)?;
     match modified.duration_since(UNIX_EPOCH) {
@@ -95,6 +99,12 @@ impl<S: HashStore> LocalSyncEngine<S> {
         relative_path: &Path,
         timestamp: &str,
     ) -> Result<PathBuf, SyncError> {
+        let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
+            SyncError::Validation(
+                "Destination directory not configured for archive creation".to_string(),
+            )
+        })?;
+
         let mut components = relative_path.components();
         if let Some(first) = components.next() {
             let first_str = first.as_os_str().to_string_lossy();
@@ -103,18 +113,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
             for rest in components {
                 archive_rel.push(rest);
             }
-            let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
-                SyncError::Validation(
-                    "Destination directory not configured for archive creation".to_string(),
-                )
-            })?;
             Ok(dest_dir.join(".syncdir_archive").join(archive_rel))
         } else {
-            let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
-                SyncError::Validation(
-                    "Destination directory not configured for archive creation".to_string(),
-                )
-            })?;
             Ok(dest_dir.join(".syncdir_archive"))
         }
     }

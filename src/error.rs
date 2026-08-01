@@ -39,6 +39,9 @@ impl SyncError {
     ///
     /// Inspects the underlying Win32 error code from `std::io::Error::raw_os_error()`
     /// for known Windows network error codes.
+    ///
+    /// Returns `false` for non-`Io` variants or `Io` errors with unrecognized
+    /// error codes.
     pub fn is_network_offline(&self) -> bool {
         match self {
             SyncError::Io(io_err) => matches!(
@@ -46,7 +49,9 @@ impl SyncError {
                 Some(53)   // ERROR_BAD_NETPATH
                 | Some(59) // ERROR_UNEXP_NET_ERR
                 | Some(64) // ERROR_NETNAME_DELETED
+                | Some(65) // ERROR_NETWORK_ACCESS_DENIED (network busy)
                 | Some(67) // ERROR_BAD_NET_NAME
+                | Some(121) // ERROR_SEM_TIMEOUT
             ),
             _ => false,
         }
@@ -60,6 +65,18 @@ mod tests {
     #[test]
     fn test_is_network_offline_true() {
         let err = SyncError::Io(std::io::Error::from_raw_os_error(67));
+        assert!(err.is_network_offline());
+    }
+
+    #[test]
+    fn test_is_network_offline_network_busy() {
+        let err = SyncError::Io(std::io::Error::from_raw_os_error(65));
+        assert!(err.is_network_offline());
+    }
+
+    #[test]
+    fn test_is_network_offline_sem_timeout() {
+        let err = SyncError::Io(std::io::Error::from_raw_os_error(121));
         assert!(err.is_network_offline());
     }
 
