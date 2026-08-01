@@ -30,4 +30,6 @@ winreg = "0.56"
 tempfile = "3.8"
 pretty_assertions = "1"
 insta = "1"
+proptest = "1"
+
 
