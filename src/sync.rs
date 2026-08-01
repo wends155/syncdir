@@ -13,7 +13,27 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// Extract file modified time as milliseconds since UNIX epoch.
+///
+/// Pre-1970 timestamps are clamped to 0 (epoch) with a warning log.
+fn safe_modified_millis(metadata: &std::fs::Metadata) -> Result<i64, SyncError> {
+    let modified = metadata.modified().map_err(SyncError::Io)?;
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(dur) => Ok(dur.as_millis() as i64),
+        Err(_) => {
+            tracing::warn!("File has pre-1970 modified timestamp, clamping to epoch");
+            Ok(0)
+        }
+    }
+}
+
+/// Convert a millisecond timestamp to a `Duration`, clamping negative values to zero.
+fn safe_epoch_duration_millis(millis: i64) -> std::time::Duration {
+    std::time::Duration::from_millis(millis.max(0) as u64)
+}
+
 /// Commands sent from the file watcher or tray UI to the sync worker thread.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncCommand {
     /// A file was created or modified at the given relative path.
@@ -51,11 +71,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let mut file = File::open(file_path)?;
         let metadata = file.metadata()?;
         let file_size = metadata.len() as i64;
-        let last_modified = metadata
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| SyncError::Validation(e.to_string()))?
-            .as_millis() as i64;
+        let last_modified = safe_modified_millis(&metadata)?;
 
         let block_size = self.config.block_size_bytes as usize;
         let mut buffer = vec![0; block_size];
@@ -74,7 +90,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
     }
 
     /// Build the archive path: `<dest>/.syncdir_archive/<ts>_<relative_path>`.
-    fn get_archive_path(&self, relative_path: &Path, timestamp: &str) -> PathBuf {
+    fn get_archive_path(
+        &self,
+        relative_path: &Path,
+        timestamp: &str,
+    ) -> Result<PathBuf, SyncError> {
         let mut components = relative_path.components();
         if let Some(first) = components.next() {
             let first_str = first.as_os_str().to_string_lossy();
@@ -83,19 +103,19 @@ impl<S: HashStore> LocalSyncEngine<S> {
             for rest in components {
                 archive_rel.push(rest);
             }
-            let dest_dir = self
-                .config
-                .dest_dir
-                .as_ref()
-                .expect("dest_dir must be set for target worker");
-            dest_dir.join(".syncdir_archive").join(archive_rel)
+            let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
+                SyncError::Validation(
+                    "Destination directory not configured for archive creation".to_string(),
+                )
+            })?;
+            Ok(dest_dir.join(".syncdir_archive").join(archive_rel))
         } else {
-            let dest_dir = self
-                .config
-                .dest_dir
-                .as_ref()
-                .expect("dest_dir must be set for target worker");
-            dest_dir.join(".syncdir_archive")
+            let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
+                SyncError::Validation(
+                    "Destination directory not configured for archive creation".to_string(),
+                )
+            })?;
+            Ok(dest_dir.join(".syncdir_archive"))
         }
     }
 }
@@ -128,11 +148,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         if dest_path.exists() {
             let dest_meta = fs::metadata(&dest_path)?;
             let dest_size = dest_meta.len() as i64;
-            let dest_mod = dest_meta
-                .modified()?
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| SyncError::Validation(e.to_string()))?
-                .as_millis() as i64;
+            let dest_mod = safe_modified_millis(&dest_meta)?;
 
             if let Some(record) = self.db.get_file(path)?
                 && record.file_size == src_size
@@ -153,9 +169,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
             // Windows requires write access for set_times
             let dest_file = OpenOptions::new().write(true).open(&dest_path)?;
-            dest_file.set_times(fs::FileTimes::new().set_modified(
-                SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(src_mod as u64),
-            ))?;
+            dest_file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(src_mod)),
+            )?;
 
             let record = FileRecord {
                 id: None,
@@ -225,9 +242,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         // Truncate if file shrank
         dest_file.set_len(src_size as u64)?;
-        dest_file.set_times(fs::FileTimes::new().set_modified(
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(src_mod as u64),
-        ))?;
+        dest_file.set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(src_mod)),
+        )?;
 
         let record = FileRecord {
             id: file_record.and_then(|r| r.id),
@@ -261,10 +279,14 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         if dest_path.exists() && self.config.propagate_deletions {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| SyncError::Validation(e.to_string()))?
+                .map_err(|e| {
+                    SyncError::Io(std::io::Error::other(format!("System clock error: {e}")))
+                })?
                 .as_secs()
                 .to_string();
-            let archive_path = self.get_archive_path(&rel_path, &timestamp);
+
+            let archive_path = self.get_archive_path(&rel_path, &timestamp)?;
+
             if let Some(parent) = archive_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -934,5 +956,21 @@ mod tests {
 
         // Second sync: should fast-path return Ok(()) due to ±2000 ms tolerance
         engine.sync_file(file_name).unwrap();
+    }
+
+    #[test]
+    fn test_safe_epoch_duration_millis_positive() {
+        assert_eq!(
+            safe_epoch_duration_millis(1000),
+            std::time::Duration::from_millis(1000)
+        );
+    }
+
+    #[test]
+    fn test_safe_epoch_duration_millis_negative() {
+        assert_eq!(
+            safe_epoch_duration_millis(-500),
+            std::time::Duration::from_millis(0)
+        );
     }
 }

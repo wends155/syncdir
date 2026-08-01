@@ -465,7 +465,13 @@ fn main() {
                 drop(_mutex_guard);
                 if let Ok(exe) = std::env::current_exe() {
                     tracing::info!("Re-launching process: {}", exe.display());
-                    let _ = std::process::Command::new(exe).spawn();
+                    if let Err(e) = std::process::Command::new(&exe).spawn() {
+                        tracing::error!(
+                            error = %e,
+                            exe = %exe.display(),
+                            "Failed to re-launch syncdir process"
+                        );
+                    }
                 }
             }
         },
