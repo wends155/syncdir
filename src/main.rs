@@ -420,11 +420,11 @@ fn main() {
         .init();
 
     let sys_info = syncdir::startup::SystemDiagnosticInfo::collect();
+    let _host_span = tracing::info_span!("syncdir", host = %sys_info.hostname).entered();
     tracing::info!(
         version = %sys_info.app_version,
         os = %sys_info.os_version,
         arch = %sys_info.arch,
-        host = %sys_info.hostname,
         user = %sys_info.username,
         "System environment"
     );
