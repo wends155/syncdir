@@ -123,6 +123,10 @@ syncdir/
 * We use `thiserror` to define a single project-wide `SyncError` enum.
 * Swallowing errors is strictly prohibited. If a sync fails (e.g. network share disconnects), it logs the warning and schedules a retry.
 * Error propagation uses the standard `?` operator.
+* **Network Disconnect Classification**: `SyncError::is_network_offline()` inspects `std::io::Error::raw_os_error()` for Win32 SMB disconnect codes (53 `ERROR_BAD_NETPATH`, 59 `ERROR_UNEXP_NET_ERR`, 64 `ERROR_NETNAME_DELETED`, 67 `ERROR_BAD_NET_NAME`).
+* **Panic-Free Architecture**: Production code contains zero `.unwrap()` or `.expect()` calls. Methods like `get_archive_path()` return `Result<PathBuf, SyncError>` propagating `SyncError::Validation` when `dest_dir` is unconfigured.
+* **Timestamp Safety**: File modification timestamps are normalized via `safe_modified_millis()` (clamping pre-1970 timestamps to 0 with warning logs) and restored via `safe_epoch_duration_millis()` (preventing wrapping integer underflow on `src_mod as u64`).
+
 
 ## 9. Observability & Logging
 * **Framework**: `tracing` with `tracing-subscriber`.

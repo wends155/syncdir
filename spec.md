@@ -1,12 +1,13 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 204e4b9
+> Last verified against: fb752c5
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 0.1.10 |
 | **Last Updated** | 2026-08-01 |
+
 
 ---
 
@@ -182,6 +183,13 @@ AND the source directory is offline
 WHEN the command is processed
 THEN the full scan execution is skipped
 AND a warning is logged
+
+[HAPPY] Win32 SMB network error classification
+GIVEN a `SyncError::Io` error wrapping a Win32 OS error code (53, 59, 64, 67)
+WHEN `err.is_network_offline()` is called
+THEN it returns `true`
+AND for non-network I/O errors (e.g. NotFound) or non-I/O errors, it returns `false`
+
 
 [HAPPY] Empty source safety threshold check
 GIVEN a source directory that is empty (0 files)
