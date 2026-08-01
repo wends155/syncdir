@@ -87,7 +87,7 @@ syncdir/
 * **Does NOT own**: Filesystem watching, tray menu construction, or SQLite database operations.
 
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), and toggling Windows startup registration.
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), managing `TrayState` (pure state container tracking engine health status transitions, online destination counts, and tooltip text formatting without Win32/winit UI side-effects), and toggling Windows startup registration.
 * **Does NOT own**: Filesystem watching or database execution.
 
 ### `startup`
@@ -132,8 +132,11 @@ syncdir/
 * **Log Levels**: `INFO` for file copy telemetry and target reachability, `WARN` for recoverable errors/unreachable targets, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
-* **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs`, `src/db.rs`, `src/sync.rs`, and `src/startup.rs`.
+* **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs`, `src/db.rs`, `src/sync.rs`, `src/startup.rs`, and `src/tray.rs` (testing `TrayState` status transitions and tooltip text formatting).
 * **Integration Tests**: `tests/integration_tests.rs` simulating standard files, deletions, directory updates, and configuration reload validation using `tempfile`.
+* **Snapshot Tests**: `tests/snapshot_tests.rs` using `insta` (v1) for regression-guarding snapshot assertions on `Config` debug formatting, validation errors, `SyncError` display output, and `FileRecord` structures.
+* **Property-Based Tests**: `tests/property_tests.rs` using `proptest` (v1) for invariant validation (block boundary division, TOML round-tripping, SMB timestamp tolerance, path traversal safety, sync idempotency, and delta sync single-block isolation).
+* **Assertions & Structural Diffing**: `pretty_assertions` (v1) for colorized diff output on test failure assertions across all test modules.
 * **Shared Test Fixtures**: `Config::test_default()` helper for consistent test configuration across unit and integration tests.
 * **In-Memory Mocks**: `MockHashStore` (`src/db.rs`) and `MockStartupRegistry` (`src/startup.rs`) for isolated in-memory unit testing without disk or registry side-effects.
 
@@ -142,12 +145,18 @@ syncdir/
 * Module-level documentation must be present at the top of each file.
 
 ## 12. Dependencies & External Systems
-* `notify` (v6): Cross-platform file monitoring wrapping `ReadDirectoryChangesW` on Windows.
-* `rusqlite`: Connection to local embedded SQLite database.
-* `blake3`: Extremely fast cryptographic hashing.
-* `tray-icon` (v0.14) & `winit` (v0.29): For system tray creation and event loop.
-* `serde` & `toml`: Parsing `config.toml`.
-* `thiserror`: Unified error handling.
+* **Production Dependencies**:
+  * `notify` (v6): Cross-platform file monitoring wrapping `ReadDirectoryChangesW` on Windows.
+  * `rusqlite`: Connection to local embedded SQLite database.
+  * `blake3`: Extremely fast cryptographic hashing.
+  * `tray-icon` (v0.14) & `winit` (v0.29): For system tray creation and event loop.
+  * `serde` & `toml`: Parsing `config.toml`.
+  * `thiserror`: Unified error handling.
+* **Development & Testing Dependencies**:
+  * `tempfile` (v3): Temporary directory creation for integration tests.
+  * `pretty_assertions` (v1): Colorized structural diff assertions.
+  * `insta` (v1): Snapshot testing engine.
+  * `proptest` (v1): Generative property-based testing framework.
 
 ## 13. Architecture Diagrams
 
