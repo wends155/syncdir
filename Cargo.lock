@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "syncdir"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "blake3",
  "insta",

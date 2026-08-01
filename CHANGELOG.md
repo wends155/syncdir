@@ -5,6 +5,22 @@ All notable changes to the `syncdir` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.10] - 2026-08-01
+
+### Added
+- **Multi-Layered Testing Infrastructure Uplift**:
+  - **Snapshot Testing (`insta`)**: Added `tests/snapshot_tests.rs` with 10 regression-guarding snapshot tests covering `Config` debug formatting, validation errors, `SyncError` display output, and `FileRecord` debug structures.
+  - **Generative Property-Based Testing (`proptest`)**: Added `tests/property_tests.rs` with 6 property-based test suites validating block boundary division, Config TOML round-tripping, SMB timestamp tolerance, path traversal safety, sync idempotency, and delta sync isolation.
+  - **Pure TrayState Container & Tray Unit Tests**: Extracted `pub struct TrayState` in `src/tray.rs` encapsulating pure status calculations and tooltip formatting, with 8 unit tests validating all `EngineStatus` state transitions.
+  - **Enhanced Diff Assertions**: Integrated `pretty_assertions` across all unit and integration test modules for colorized diff output on test failures.
+- **Global Host Log Context**: Added root `tracing` span `info_span!("syncdir", host = %sys_info.hostname)` in `src/main.rs` to propagate machine hostname across all structured log lines.
+
+### Improved
+- **Test Suite Scale**: Expanded automated test suite from 44 to 68 passing tests (43 unit, 8 integration, 10 snapshot, 6 property, 1 doctest).
+- **Documentation & Behavioral Specifications**: Synchronized `spec.md` behavioral contracts, verification metadata hash (`204e4b9`), and `architecture.md` (Sections 5, 10, and 12) with the testing uplift and `TrayState` component additions.
+
+---
+
 ## [v0.1.9] - 2026-07-30
 
 ### Added
