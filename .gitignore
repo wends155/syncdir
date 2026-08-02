@@ -12,3 +12,5 @@ implementation_plan.md
 logs/
 *.log
 
+# Distribution Artifacts
+dist/
