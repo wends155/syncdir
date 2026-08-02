@@ -347,10 +347,11 @@ Represents a file tracked in the signature database.
 
 ### EngineStatus
 Represents the online/offline presence state of sync directories.
-- `Healthy` (both source and destination are online)
+- `Healthy` (source and all destination directories are online)
+- `Degraded` (source online, but some destination directories are offline)
 - `SourceOffline` (source directory offline)
-- `DestinationOffline` (destination directory offline)
-- `BothOffline` (both directories offline)
+- `DestinationOffline` (all destination directories offline)
+- `BothOffline` (source and all destination directories offline)
 
 ### TargetStatusUpdate
 Per-target status report sent from worker threads.

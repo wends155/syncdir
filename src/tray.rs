@@ -18,6 +18,8 @@ use winit::event_loop::ControlFlow;
 pub enum EngineStatus {
     /// Both source and destination directories are online and accessible.
     Healthy,
+    /// Some (but not all) destination directories are offline.
+    Degraded,
     /// The source directory is missing or unmounted.
     SourceOffline,
     /// The destination directory is missing or unmounted.
@@ -113,6 +115,8 @@ impl TrayState {
             }
         } else if all_dest_online || self.dest_online.is_empty() {
             EngineStatus::Healthy
+        } else if any_dest_online {
+            EngineStatus::Degraded
         } else {
             EngineStatus::DestinationOffline
         }
@@ -149,6 +153,7 @@ fn generate_status_icon(status: EngineStatus) -> Result<Icon, SyncError> {
     // Color mappings based on status
     let (border_r, border_g, border_b) = match status {
         EngineStatus::Healthy => (66, 133, 244),           // Blue
+        EngineStatus::Degraded => (255, 140, 0),           // Orange
         EngineStatus::SourceOffline => (219, 68, 85),      // Red
         EngineStatus::DestinationOffline => (244, 180, 0), // Yellow
         EngineStatus::BothOffline => (180, 180, 180),      // Gray
@@ -531,13 +536,24 @@ mod tests {
     }
 
     #[test]
+    fn test_tray_state_degraded() {
+        let mut state = TrayState::new(vec![true, true, false]);
+        state.update_watcher_status(true, true);
+        assert_eq!(state.overall_status(), EngineStatus::Degraded);
+        assert_eq!(
+            state.tooltip_text(),
+            "syncdir — Src: Online | Dests: 2/3 Online"
+        );
+    }
+
+    #[test]
     fn test_tray_state_destination_offline() {
-        let mut state = TrayState::new(vec![true, false]);
+        let mut state = TrayState::new(vec![false, false]);
         state.update_watcher_status(true, true);
         assert_eq!(state.overall_status(), EngineStatus::DestinationOffline);
         assert_eq!(
             state.tooltip_text(),
-            "syncdir — Src: Online | Dests: 1/2 Online"
+            "syncdir — Src: Online | Dests: 0/2 Online"
         );
     }
 
