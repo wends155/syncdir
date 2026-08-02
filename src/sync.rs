@@ -303,6 +303,16 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             ));
         }
 
+        if let Some(ref dest) = self.config.dest_dir
+            && (!dest.exists() || !dest.is_dir())
+        {
+            tracing::warn!(
+                target = %dest.display(),
+                "Target destination directory does not exist or is unreachable. Skipping full scan."
+            );
+            return Ok(false);
+        }
+
         let mut source_files = HashSet::new();
 
         fn scan_dir(
@@ -997,6 +1007,23 @@ mod tests {
 
         // Run full scan: 100% of files fail (1/1 file failed), so run_full_scan returns Ok(false)
         assert!(!engine.run_full_scan().unwrap());
+    }
+
+    #[test]
+    fn test_full_scan_dest_missing_skips_early() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("nonexistent_dest_dir");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file1.txt"), b"content").unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // When dest_dir is missing, run_full_scan returns Ok(false) immediately
+        let result = engine.run_full_scan().unwrap();
+        assert!(!result);
     }
 
     #[test]

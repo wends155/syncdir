@@ -46,7 +46,9 @@ impl SyncError {
         match self {
             SyncError::Io(io_err) => matches!(
                 io_err.raw_os_error(),
-                Some(53)   // ERROR_BAD_NETPATH
+                Some(3)   // ERROR_PATH_NOT_FOUND
+                | Some(15) // ERROR_INVALID_DRIVE
+                | Some(53) // ERROR_BAD_NETPATH
                 | Some(59) // ERROR_UNEXP_NET_ERR
                 | Some(64) // ERROR_NETNAME_DELETED
                 | Some(65) // ERROR_NETWORK_ACCESS_DENIED (network busy)
@@ -99,6 +101,18 @@ mod tests {
     #[test]
     fn test_is_network_offline_logon_failure() {
         let err = SyncError::Io(std::io::Error::from_raw_os_error(1326));
+        assert!(err.is_network_offline());
+    }
+
+    #[test]
+    fn test_is_network_offline_path_not_found() {
+        let err = SyncError::Io(std::io::Error::from_raw_os_error(3));
+        assert!(err.is_network_offline());
+    }
+
+    #[test]
+    fn test_is_network_offline_invalid_drive() {
+        let err = SyncError::Io(std::io::Error::from_raw_os_error(15));
         assert!(err.is_network_offline());
     }
 }

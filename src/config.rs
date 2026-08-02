@@ -34,6 +34,11 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     // Convert forward slashes to backslashes
     s = s.replace('/', "\\");
 
+    // Ensure Windows drive letter root paths (e.g. "R:" or "X:") have a trailing backslash ("R:\")
+    if s.len() == 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
+        s.push('\\');
+    }
+
     // Repair single-backslash UNC network paths (\172... -> \\172...)
     if s.starts_with('\\') && !s.starts_with("\\\\") {
         let repaired = format!("\\{}", s);
@@ -568,6 +573,13 @@ mod tests {
             r"\\172.16.0.193\share"
         );
         assert_eq!(normalize_path(Path::new("C:\\")).to_string_lossy(), r"C:\");
+    }
+
+    #[test]
+    fn test_normalize_drive_root_without_backslash() {
+        assert_eq!(normalize_path(Path::new("R:")).to_string_lossy(), r"R:\");
+        assert_eq!(normalize_path(Path::new("R:\\")).to_string_lossy(), r"R:\");
+        assert_eq!(normalize_path(Path::new("R:/")).to_string_lossy(), r"R:\");
     }
 
     #[test]
