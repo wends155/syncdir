@@ -121,13 +121,25 @@ retry_interval_seconds = 10
                 );
             }
             Err(e) => {
-                tracing::warn!(
-                    target_index = idx + 1,
-                    target_path = %dest.display(),
-                    error = %e,
-                    os_error = ?e.raw_os_error(),
-                    "Target destination is currently offline or unreachable."
-                );
+                let alt_path = syncdir::config::try_resolve_alternate_path(dest);
+                if alt_path != *dest && matches!(std::fs::metadata(&alt_path), Ok(m) if m.is_dir())
+                {
+                    tracing::info!(
+                        target_index = idx + 1,
+                        target_path = %dest.display(),
+                        resolved_path = %alt_path.display(),
+                        "Target destination resolved alternate mapped drive/UNC SMB path."
+                    );
+                } else {
+                    tracing::warn!(
+                        target_index = idx + 1,
+                        target_path = %dest.display(),
+                        resolved_path = %alt_path.display(),
+                        error = %e,
+                        os_error = ?e.raw_os_error(),
+                        "Target destination is currently offline or unreachable."
+                    );
+                }
             }
         }
 

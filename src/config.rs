@@ -66,6 +66,210 @@ fn normalize_dest_path(path: &Path) -> PathBuf {
     normalize_path(path)
 }
 
+/// Query Windows Win32 API `WNetGetConnectionW` to resolve a local drive letter (e.g. "R:")
+/// to its underlying remote UNC share path (e.g. "\\172.16.0.193\share").
+/// Returns `None` on non-Windows platforms, unmapped drives, or API errors.
+#[cfg(target_os = "windows")]
+pub fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    let local_name: Vec<u16> = std::ffi::OsStr::new(drive_prefix)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = vec![0u16; 512];
+    let mut len = buf.len() as u32;
+
+    #[link(name = "mpr")]
+    unsafe extern "system" {
+        fn WNetGetConnectionW(
+            lpLocalName: *const u16,
+            lpRemoteName: *mut u16,
+            lpnLength: *mut u32,
+        ) -> u32;
+    }
+
+    let ret = unsafe { WNetGetConnectionW(local_name.as_ptr(), buf.as_mut_ptr(), &mut len) };
+    if ret == 0 {
+        let unc_str = String::from_utf16_lossy(&buf[..len as usize])
+            .trim_matches('\0')
+            .to_string();
+        if !unc_str.is_empty() {
+            return Some(unc_str);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn resolve_mapped_drive_unc(_drive_prefix: &str) -> Option<String> {
+    None
+}
+
+/// Attempt to convert a path starting with a Windows drive letter into a full UNC network path.
+/// If the path starts with a drive letter and `WNetGetConnectionW` succeeds, returns the combined UNC path.
+/// Otherwise, returns the original normalized path unchanged.
+pub fn try_resolve_unc_path(path: &Path) -> PathBuf {
+    let normalized = normalize_path(path);
+    let s = normalized.to_string_lossy();
+
+    // Check if path starts with a drive letter e.g. "R:\" or "R:foo"
+    if s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
+        let drive_letter = &s[..2]; // e.g. "R:"
+        if let Some(unc_base) = resolve_mapped_drive_unc(drive_letter) {
+            let relative = s[2..].trim_start_matches('\\');
+            if relative.is_empty() {
+                return PathBuf::from(unc_base);
+            } else {
+                return PathBuf::from(format!("{}\\{}", unc_base.trim_end_matches('\\'), relative));
+            }
+        }
+    }
+
+    normalized
+}
+
+/// Establish or refresh a Win32 SMB network connection for a UNC path using `WNetAddConnection2W`.
+/// Leverages stored credentials in Windows Credential Manager or session tokens.
+/// Returns `true` if `WNetAddConnection2W` succeeded or connection already exists.
+#[cfg(target_os = "windows")]
+pub fn establish_smb_connection(unc_path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let s = unc_path.to_string_lossy();
+    if !s.starts_with(r"\\") {
+        return false;
+    }
+
+    // Extract root share e.g. "\\172.16.0.193\Files" or "\\172.16.0.193\ABB Industrial IT Data"
+    let parts: Vec<&str> = s[2..].split('\\').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let unc_share = format!(r"\\{}\{}", parts[0], parts[1]);
+
+    let unc_share_w: Vec<u16> = std::ffi::OsStr::new(&unc_share)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
+    #[repr(C)]
+    struct NETRESOURCEW {
+        dwScope: u32,
+        dwType: u32,
+        dwDisplayType: u32,
+        dwUsage: u32,
+        lpLocalName: *const u16,
+        lpRemoteName: *const u16,
+        lpComment: *const u16,
+        lpProvider: *const u16,
+    }
+
+    #[link(name = "mpr")]
+    unsafe extern "system" {
+        fn WNetAddConnection2W(
+            lpNetResource: *const NETRESOURCEW,
+            lpPassword: *const u16,
+            lpUserName: *const u16,
+            dwFlags: u32,
+        ) -> u32;
+    }
+
+    let nr = NETRESOURCEW {
+        dwScope: 0,
+        dwType: 1, // RESOURCETYPE_DISK
+        dwDisplayType: 0,
+        dwUsage: 0,
+        lpLocalName: std::ptr::null(),
+        lpRemoteName: unc_share_w.as_ptr(),
+        lpComment: std::ptr::null(),
+        lpProvider: std::ptr::null(),
+    };
+
+    let ret = unsafe { WNetAddConnection2W(&nr, std::ptr::null(), std::ptr::null(), 0) };
+
+    // 0 = NO_ERROR, 85 = ERROR_ALREADY_ASSIGNED, 1219 = ERROR_SESSION_CREDENTIAL_CONFLICT
+    ret == 0 || ret == 85 || ret == 1219
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn establish_smb_connection(_unc_path: &Path) -> bool {
+    false
+}
+
+/// Reverse-lookup active Win32 mapped drive letters ('A'..='Z') to find a drive letter
+/// mapped to a prefix of the given UNC path.
+pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
+    let normalized = normalize_path(unc_path);
+    let unc_str = normalized.to_string_lossy().to_lowercase();
+    if !unc_str.starts_with(r"\\") {
+        return None;
+    }
+
+    for letter in (b'A'..=b'Z').map(|b| b as char) {
+        let drive_prefix = format!("{}:", letter);
+        if let Some(mapped_unc) = resolve_mapped_drive_unc(&drive_prefix) {
+            let mapped_lower = mapped_unc.trim_end_matches('\\').to_lowercase();
+            if !mapped_lower.is_empty() && unc_str.starts_with(&mapped_lower) {
+                let relative = unc_str[mapped_lower.len()..].trim_start_matches('\\');
+                if relative.is_empty() {
+                    return Some(PathBuf::from(format!(r"{}\", drive_prefix)));
+                } else {
+                    return Some(PathBuf::from(format!(r"{}\{}", drive_prefix, relative)));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Attempt bidirectional resolution of a destination path:
+///
+/// 1. If path is a drive letter (e.g. `R:\...`), attempts `try_resolve_unc_path`.
+/// 2. If path is a UNC share (e.g. `\\172.16.0.193\...`), attempts `establish_smb_connection`
+///    and `find_mapped_drive_for_unc`.
+///
+/// Returns the resolved alternate path if accessible, or original normalized path.
+pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
+    let normalized = normalize_path(path);
+
+    // If path is accessible directly, return normalized
+    if matches!(std::fs::metadata(&normalized), Ok(m) if m.is_dir()) {
+        return normalized;
+    }
+
+    let s = normalized.to_string_lossy();
+
+    // Case 1: Drive letter path (e.g. "R:\...")
+    if s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
+        let unc_path = try_resolve_unc_path(&normalized);
+        if unc_path != normalized {
+            // Attempt establishing SMB session on resolved UNC share
+            establish_smb_connection(&unc_path);
+            if matches!(std::fs::metadata(&unc_path), Ok(m) if m.is_dir()) {
+                return unc_path;
+            }
+        }
+    }
+
+    // Case 2: UNC path (e.g. "\\172.16.0.193\Files")
+    if s.starts_with(r"\\") {
+        // Attempt SMB session establishment on UNC path
+        establish_smb_connection(&normalized);
+        if matches!(std::fs::metadata(&normalized), Ok(m) if m.is_dir()) {
+            return normalized;
+        }
+
+        // Try mapped drive reverse resolution
+        if let Some(mapped_drive_path) = find_mapped_drive_for_unc(&normalized)
+            && matches!(std::fs::metadata(&mapped_drive_path), Ok(m) if m.is_dir())
+        {
+            return mapped_drive_path;
+        }
+    }
+
+    normalized
+}
+
 impl Config {
     /// Return a merged, deduplicated list of all configured destination directories.
     /// Includes `dest_dir` first (if set), then appends any unique entries from `dest_dirs`.
@@ -580,6 +784,52 @@ mod tests {
         assert_eq!(normalize_path(Path::new("R:")).to_string_lossy(), r"R:\");
         assert_eq!(normalize_path(Path::new("R:\\")).to_string_lossy(), r"R:\");
         assert_eq!(normalize_path(Path::new("R:/")).to_string_lossy(), r"R:\");
+    }
+
+    #[test]
+    fn test_try_resolve_unc_path_unc_unchanged() {
+        let unc_path = Path::new(r"\\172.16.0.60\share\folder");
+        assert_eq!(try_resolve_unc_path(unc_path), unc_path);
+    }
+
+    #[test]
+    fn test_try_resolve_unc_path_mapped_or_unmapped_drive() {
+        let drive_path = Path::new(r"Z:\nonexistent_folder\subfolder");
+        let resolved = try_resolve_unc_path(drive_path);
+        if let Some(unc_base) = resolve_mapped_drive_unc("Z:") {
+            let expected = format!(
+                "{}\\{}",
+                unc_base.trim_end_matches('\\'),
+                r"nonexistent_folder\subfolder"
+            );
+            assert_eq!(resolved, PathBuf::from(expected));
+        } else {
+            assert_eq!(resolved, PathBuf::from(r"Z:\nonexistent_folder\subfolder"));
+        }
+
+        // Unmapped drive letter should return original normalized path
+        let unmapped_path = Path::new(r"Q:\test_folder\subfolder");
+        if resolve_mapped_drive_unc("Q:").is_none() {
+            assert_eq!(
+                try_resolve_unc_path(unmapped_path),
+                PathBuf::from(r"Q:\test_folder\subfolder")
+            );
+        }
+    }
+
+    #[test]
+    fn test_establish_smb_connection_non_unc() {
+        // Non-UNC path should safely return false without crashing
+        assert!(!establish_smb_connection(Path::new(r"C:\LocalFolder")));
+    }
+
+    #[test]
+    fn test_try_resolve_alternate_path_local_unchanged() {
+        let local_path = Path::new(r"C:\Users\CITECT\Documents");
+        assert_eq!(
+            try_resolve_alternate_path(local_path),
+            normalize_path(local_path)
+        );
     }
 
     #[test]

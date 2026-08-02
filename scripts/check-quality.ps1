@@ -23,6 +23,9 @@ if (-not $RepoRoot) {
 }
 $RepoRoot = $RepoRoot.Trim()
 
+$Results = @{}
+$Failed = $false
+
 Push-Location $RepoRoot
 try {
     $Date = Get-Date -Format 'yyyy-MM-dd HH:mm'
@@ -31,9 +34,6 @@ try {
     Write-Output "Repo: '$RepoRoot'"
 
     Write-Output ""
-
-    $Results = @{}
-    $Failed = $false
 
     # Gate 1: Formatter
     Write-Output "## Gate 1: Formatter (cargo fmt)"

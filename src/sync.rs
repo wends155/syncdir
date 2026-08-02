@@ -303,14 +303,33 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             ));
         }
 
-        if let Some(ref dest) = self.config.dest_dir
-            && (!dest.exists() || !dest.is_dir())
-        {
-            tracing::warn!(
-                target = %dest.display(),
-                "Target destination directory does not exist or is unreachable. Skipping full scan."
-            );
-            return Ok(false);
+        if let Some(ref dest) = self.config.dest_dir {
+            let dest_reachable = dest.exists() && dest.is_dir();
+            let is_reachable = if !dest_reachable {
+                let alt_path = crate::config::try_resolve_alternate_path(dest);
+                if alt_path.exists() && alt_path.is_dir() {
+                    if alt_path != *dest {
+                        tracing::info!(
+                            target = %dest.display(),
+                            resolved_path = %alt_path.display(),
+                            "Target destination resolved alternate mapped drive/UNC SMB path for full scan."
+                        );
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+
+            if !is_reachable {
+                tracing::warn!(
+                    target = %dest.display(),
+                    "Target destination directory does not exist or is unreachable. Skipping full scan."
+                );
+                return Ok(false);
+            }
         }
 
         let mut source_files = HashSet::new();
