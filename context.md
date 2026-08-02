@@ -122,6 +122,7 @@ This file documents the chronological history, design decisions, and rules conte
 
 
 
+* **2026-08-02**: Implemented `EngineStatus::Degraded` in `src/tray.rs` for partial destination failures. When some (but not all) targets are offline, `overall_status()` returns `Degraded`, painting an orange tray icon border `(255, 140, 0)` while active synchronization continues for online targets (77/77 passing tests).
 * **New Constraints:** 
   - Raw `.unwrap()` / `panic!()` / `todo!()` are banned in production code (triggers `unwrap-in-production`).
   - Dynamic string formatting inside database executions is banned (triggers `sql-injection`).
@@ -136,4 +137,5 @@ This file documents the chronological history, design decisions, and rules conte
   - "Reload Config" validates configuration and returns `TrayExitReason::Restart` to exit winit event loop cleanly before process respawn.
   - `SingleInstanceGuard` enforces single-instance process execution using Win32 named mutex `Local\syncdir_single_instance`.
   - `run_tray` receives `initial_dest_online: Vec<bool>` from `main.rs` reachability checks to populate context menu items and avoid initial `DestinationOffline` status flicker.
-* **Pruned:** Manual checks for unwraps, env variables, filesystem operations, release packaging, mock testing structures, LaTeX rendering defects, single-destination configuration constraints, startup scan timing race conditions, startup tray status flicker, process restart ghost tray icons, duplicate process launches, and architecture module boundary status drift are now automated.
+  - `TrayState::overall_status()` distinguishes `Degraded` (some destinations offline, orange icon) from `DestinationOffline` (all destinations offline, yellow icon).
+* **Pruned:** Manual checks for unwraps, env variables, filesystem operations, release packaging, mock testing structures, LaTeX rendering defects, single-destination configuration constraints, startup scan timing race conditions, startup tray status flicker, process restart ghost tray icons, duplicate process launches, architecture module boundary status drift, and all-or-nothing destination offline status misrepresentation are now automated.
