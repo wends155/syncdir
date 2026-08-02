@@ -978,4 +978,83 @@ mod tests {
         let config = Config::test_default(source_path.clone(), temp.path().join("dest"));
         assert_eq!(config.resolved_source_dir(), source_path);
     }
+
+    #[test]
+    fn test_preprocess_dest_dirs_multiline_array() {
+        let input = r#"
+            source_dir = "C:\source"
+            dest_dirs = [
+                "Y:\Mill Processing\COMMON",
+                "Z:\Archive\Folder",
+                "X:\Backup\Files",
+            ]
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 10
+            block_size_bytes = 4
+            verify_writes = true
+        "#;
+        let processed = preprocess_config_toml(input);
+        let config: Config = toml::from_str(&processed).unwrap();
+        let extras = config.dest_dirs.unwrap();
+        assert_eq!(extras.len(), 3);
+        assert_eq!(extras[0].to_string_lossy(), r"Y:\Mill Processing\COMMON");
+        assert_eq!(extras[1].to_string_lossy(), r"Z:\Archive\Folder");
+        assert_eq!(extras[2].to_string_lossy(), r"X:\Backup\Files");
+    }
+
+    #[test]
+    fn test_preprocess_dest_dirs_mixed_quotes_and_commas() {
+        let input = r#"
+            source_dir = "C:/source"
+            dest_dirs = [
+                'Y:/backup_folder_1',
+                "Z:\backup_folder_2",
+                "X:/backup_folder_3",
+            ]
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 10
+            block_size_bytes = 4
+            verify_writes = true
+        "#;
+        let processed = preprocess_config_toml(input);
+        let mut config: Config = toml::from_str(&processed).unwrap();
+        config.normalize_paths();
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].to_string_lossy(), r"Y:\backup_folder_1");
+        assert_eq!(resolved[1].to_string_lossy(), r"Z:\backup_folder_2");
+        assert_eq!(resolved[2].to_string_lossy(), r"X:\backup_folder_3");
+    }
+
+    #[test]
+    fn test_config_load_invalid_missing_comma_in_dest_dirs() {
+        let input = r#"
+            source_dir = "C:\source"
+            dest_dirs = [
+                "Y:\backup_folder_1"
+                "X:\backup_folder_2"
+            ]
+            debounce_seconds = 3
+            propagate_deletions = true
+            block_sync_threshold_bytes = 10
+            block_size_bytes = 4
+            verify_writes = true
+        "#;
+        let processed = preprocess_config_toml(input);
+        let res: Result<Config, _> = toml::from_str(&processed);
+        assert!(
+            res.is_err(),
+            "Missing comma in dest_dirs array must return syntax error"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("comma")
+                || err_msg.contains("expected")
+                || err_msg.contains("invalid"),
+            "Error message should mention parsing failure: {}",
+            err_msg
+        );
+    }
 }
