@@ -105,18 +105,30 @@ retry_interval_seconds = 10
         );
         let store = SqliteHashStore::new(&db_path, &target_config)?;
 
-        if dest.exists() && dest.is_dir() {
-            tracing::info!(
-                target_index = idx + 1,
-                target_path = %dest.display(),
-                "Target destination is online and reachable."
-            );
-        } else {
-            tracing::warn!(
-                target_index = idx + 1,
-                target_path = %dest.display(),
-                "Target destination is currently offline or unreachable."
-            );
+        match std::fs::metadata(dest) {
+            Ok(meta) if meta.is_dir() => {
+                tracing::info!(
+                    target_index = idx + 1,
+                    target_path = %dest.display(),
+                    "Target destination is online and reachable."
+                );
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    target_index = idx + 1,
+                    target_path = %dest.display(),
+                    "Target destination exists but is not a directory."
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target_index = idx + 1,
+                    target_path = %dest.display(),
+                    error = %e,
+                    os_error = ?e.raw_os_error(),
+                    "Target destination is currently offline or unreachable."
+                );
+            }
         }
 
         // Wire per-worker channel

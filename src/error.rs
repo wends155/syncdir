@@ -52,6 +52,7 @@ impl SyncError {
                 | Some(65) // ERROR_NETWORK_ACCESS_DENIED (network busy)
                 | Some(67) // ERROR_BAD_NET_NAME
                 | Some(121) // ERROR_SEM_TIMEOUT
+                | Some(1326) // ERROR_LOGON_FAILURE
             ),
             _ => false,
         }
@@ -93,5 +94,11 @@ mod tests {
     fn test_is_network_offline_false_for_non_io() {
         let err = SyncError::Validation("some error".to_string());
         assert!(!err.is_network_offline());
+    }
+
+    #[test]
+    fn test_is_network_offline_logon_failure() {
+        let err = SyncError::Io(std::io::Error::from_raw_os_error(1326));
+        assert!(err.is_network_offline());
     }
 }

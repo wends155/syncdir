@@ -334,7 +334,17 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let mut sync_skip_count = 0usize;
         for rel_path in &source_files {
             if let Err(e) = self.sync_file(rel_path) {
-                tracing::warn!(path = %rel_path, error = %e, "Skipped file during full scan");
+                let os_code = match &e {
+                    SyncError::Io(io_err) => io_err.raw_os_error(),
+                    _ => None,
+                };
+                tracing::warn!(
+                    path = %rel_path,
+                    target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                    error = %e,
+                    os_error = ?os_code,
+                    "Skipped file during full scan"
+                );
                 sync_skip_count += 1;
             }
         }
@@ -342,6 +352,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             tracing::warn!(
                 skipped = sync_skip_count,
                 total = source_files.len(),
+                target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
                 "Full scan completed with sync errors"
             );
         }
@@ -369,13 +380,24 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 if !source_files.contains(&tracked_path)
                     && let Err(e) = self.delete_file(&tracked_path)
                 {
-                    tracing::warn!(path = %tracked_path, error = %e, "Skipped deletion during full scan");
+                    let os_code = match &e {
+                        SyncError::Io(io_err) => io_err.raw_os_error(),
+                        _ => None,
+                    };
+                    tracing::warn!(
+                        path = %tracked_path,
+                        target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                        error = %e,
+                        os_error = ?os_code,
+                        "Skipped deletion during full scan"
+                    );
                     delete_skip_count += 1;
                 }
             }
             if delete_skip_count > 0 {
                 tracing::warn!(
                     skipped = delete_skip_count,
+                    target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
                     "Full scan completed with deletion errors"
                 );
             }
@@ -458,13 +480,34 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 let current_dest_online = config
                     .dest_dir
                     .as_ref()
-                    .map(|d| d.exists() && d.is_dir())
+                    .map(|d| match std::fs::metadata(d) {
+                        Ok(meta) => meta.is_dir(),
+                        Err(ref e) => {
+                            if dest_online {
+                                tracing::warn!(
+                                    target_index = target_index + 1,
+                                    target_path = %d.display(),
+                                    error = %e,
+                                    os_error = ?e.raw_os_error(),
+                                    "Target destination went offline."
+                                );
+                            }
+                            false
+                        }
+                    })
                     .unwrap_or(false);
 
                 source_online = current_source_online;
                 dest_online = current_dest_online;
 
                 if last_sent_dest_online != Some(current_dest_online) {
+                    if current_dest_online && last_sent_dest_online == Some(false) {
+                        tracing::info!(
+                            target_index = target_index + 1,
+                            target_path = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                            "Target destination is back online."
+                        );
+                    }
                     last_sent_dest_online = Some(current_dest_online);
 
                     if let Some(ref proxy) = event_proxy {
@@ -497,6 +540,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                             Ok(true) => {}
                             Ok(false) => {
                                 tracing::warn!(
+                                    target_path = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
                                     "Full scan failed all destination file writes. Setting destination status to offline."
                                 );
                                 dest_online = false;
@@ -533,7 +577,17 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 pending_syncs.remove(&path);
                 if source_online && dest_online {
                     if let Err(e) = engine.sync_file(&path.to_string_lossy()) {
-                        tracing::warn!(path = %path.display(), error = %e, "Sync failed");
+                        let os_code = match &e {
+                            SyncError::Io(io_err) => io_err.raw_os_error(),
+                            _ => None,
+                        };
+                        tracing::warn!(
+                            path = %path.display(),
+                            target = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                            error = %e,
+                            os_error = ?os_code,
+                            "Sync failed"
+                        );
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "Skipped syncing file: source or destination offline");
@@ -552,7 +606,17 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 pending_deletes.remove(&path);
                 if dest_online {
                     if let Err(e) = engine.delete_file(&path.to_string_lossy()) {
-                        tracing::warn!(path = %path.display(), error = %e, "Delete failed");
+                        let os_code = match &e {
+                            SyncError::Io(io_err) => io_err.raw_os_error(),
+                            _ => None,
+                        };
+                        tracing::warn!(
+                            path = %path.display(),
+                            target = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                            error = %e,
+                            os_error = ?os_code,
+                            "Delete failed"
+                        );
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "Skipped deleting file: destination offline");
