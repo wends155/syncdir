@@ -70,7 +70,13 @@ verify_writes = true
 
 ### Windows & Network Share (UNC) Path Formatting Gotchas
 
-When configuring Windows paths in `config.toml`, pay attention to backslashes:
+When configuring Windows paths in `config.toml`, choose one of the three supported path styles:
+
+| Style | Example in `config.toml` | Notes |
+|:---|:---|:---|
+| **Forward Slashes (Recommended)** | `source_dir = "C:/Users/WSALIGAN/source"` | 🟢 Cleanest in TOML double-quoted strings. `syncdir` automatically normalizes `/` to `\` at runtime. |
+| **Single-Quoted Literal** | `source_dir = 'C:\Users\WSALIGAN\source'` | 🟢 Preserves standard Windows backslashes without escaping. Single quotes tell TOML to treat `\` literally. |
+| **Double-Escaped** | `source_dir = "C:\\Users\\WSALIGAN\\source"` | 🟡 Standard double-quoted TOML, requiring double backslashes `\\`. |
 
 1. **UNC Network Paths (`\\server\share` or `\\172.16.0.60\share`)**:
    - In TOML, double-quoted strings (`"..."`) interpret `\` as an escape character. Writing `"\\172.16.0.60\share"` in double quotes causes TOML to unescape `\\` to a single `\`.
@@ -78,7 +84,7 @@ When configuring Windows paths in `config.toml`, pay attention to backslashes:
    - **Automatic Safeguard**: `syncdir` automatically pre-processes configuration files to escape double backslashes in quoted TOML strings and defensively normalizes single-leading-backslash UNC paths (`\172.16...` -> `\\172.16...`) at runtime.
 
 2. **Absolute Path Requirement**:
-   - All destination paths must be absolute (starting with a drive letter like `C:\`, `Z:\` or a UNC network prefix `\\`). Relative paths (e.g. `backup/folder`) are rejected during startup validation.
+   - All source and destination paths must be absolute (starting with a drive letter like `C:\`, `Z:\`, `X:\` or a UNC network prefix `\\`). Relative paths (e.g. `backup/folder`) are rejected during startup validation.
 
 ### CLI Options
 
