@@ -338,6 +338,18 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                     SyncError::Io(io_err) => io_err.raw_os_error(),
                     _ => None,
                 };
+                if e.is_network_offline() {
+                    tracing::warn!(
+                        path = %rel_path,
+                        target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                        error = %e,
+                        os_error = ?os_code,
+                        remaining = source_files.len() - sync_skip_count - 1,
+                        "Target unreachable during full scan, skipping remaining files"
+                    );
+                    sync_skip_count = source_files.len();
+                    break;
+                }
                 tracing::warn!(
                     path = %rel_path,
                     target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
