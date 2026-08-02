@@ -12,7 +12,8 @@ use syncdir::error::SyncError;
 use syncdir::sync::{SyncCommand, start_sync_worker};
 use syncdir::tray::{TrayExitReason, run_tray};
 use tracing_appender::rolling::{Builder, Rotation};
-use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 fn try_main(app_dir: PathBuf) -> Result<TrayExitReason, SyncError> {
     let log_dir = app_dir.join("logs");
@@ -434,14 +435,22 @@ fn main() {
     };
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    let dual_writer = std::io::stdout.and(non_blocking);
 
-    tracing_subscriber::fmt()
-        .with_writer(dual_writer)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_ansi(false);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
         .init();
 
     let sys_info = syncdir::startup::SystemDiagnosticInfo::collect();

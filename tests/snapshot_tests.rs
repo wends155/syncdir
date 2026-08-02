@@ -102,3 +102,44 @@ fn test_file_record_snapshot() {
     };
     assert_snapshot!(format!("{:#?}", record));
 }
+
+// --- Log Formatting ANSI Suppression Test ---
+
+#[test]
+fn test_log_formatter_ansi_suppression() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let buffer = SharedBuffer::default();
+    let writer_buffer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer_buffer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(test_key = "test_val", "ANSI suppression verification");
+    });
+
+    let bytes = buffer.0.lock().unwrap().clone();
+    let log_str = String::from_utf8_lossy(&bytes);
+
+    assert!(log_str.contains("ANSI suppression verification"));
+    assert!(
+        !log_str.contains('\x1b'),
+        "Log string contained ANSI escape character: {}",
+        log_str
+    );
+}
