@@ -431,7 +431,6 @@ pub fn run_tray(
                         show_about_dialog();
                     }
                 }
-                #[allow(unused_assignments)]
                 Event::UserEvent(UserEvent::StatusUpdate(update)) => {
                     if state.update_target_status(update.target_index, update.dest_online) {
                         if update.target_index < dests.len() {

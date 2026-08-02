@@ -1,0 +1,26 @@
+id: lint-suppression-audit
+message: "Lint suppression detected. Verify this is intentional and documented, not masking a bug."
+note: >-
+  Legitimate: platform-conditional stubs (#[allow(dead_code)]),
+  FFI bindings (#[allow(non_snake_case)]).
+  Suspicious: #[allow(unused_assignments)], #[allow(unused_variables)],
+  #[allow(unreachable_code)]. All suppressions should have a
+  comment explaining why the warning cannot be fixed at source.
+severity: hint
+language: rust
+rule:
+  any:
+    - kind: attribute_item
+      has:
+        kind: attribute
+        has:
+          kind: identifier
+          regex: "^(allow|expect)$"
+    - kind: inner_attribute_item
+      has:
+        kind: attribute
+        has:
+          kind: identifier
+          regex: "^(allow|expect)$"
+ignores:
+  - "tests/**"
