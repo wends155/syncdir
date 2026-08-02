@@ -21,9 +21,13 @@ cd syncdir
 
 # Build the release binary
 cargo build --release
+
+# Alternatively, run full quality pipeline and package release ZIP:
+.\scripts\check-quality.ps1
+.\scripts\build-release.ps1
 ```
 
-The compiled binary will be located at `target/release/syncdir.exe`.
+The compiled binary will be located at `target/release/syncdir.exe` (or in `dist/` when using `scripts/build-release.ps1`).
 
 ## Usage / Quick Start
 

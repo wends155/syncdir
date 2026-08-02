@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: fb752c5
+> Last verified against: 571f481
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 0.1.10 |
-| **Last Updated** | 2026-08-01 |
+| **Last Updated** | 2026-08-02 |
 
 
 ---
@@ -185,10 +185,17 @@ THEN the full scan execution is skipped
 AND a warning is logged
 
 [HAPPY] Win32 SMB network error classification
-GIVEN a `SyncError::Io` error wrapping a Win32 OS error code (53, 59, 64, 67)
+GIVEN a `SyncError::Io` error wrapping a Win32 OS error code (53, 59, 64, 65, 67, 121, 1326)
 WHEN `err.is_network_offline()` is called
 THEN it returns `true`
 AND for non-network I/O errors (e.g. NotFound) or non-I/O errors, it returns `false`
+
+[HAPPY] Early exit full scan on first network or authentication error
+GIVEN a full scan is executing across source files
+WHEN a target destination returns a network or authentication error matching `is_network_offline()`
+THEN a single structured warning is logged ("Target unreachable during full scan, skipping remaining files")
+AND `sync_skip_count` is set to the total source file count
+AND the full scan loop breaks immediately to prevent log bloat
 
 
 [HAPPY] Empty source safety threshold check
@@ -459,3 +466,8 @@ User interface tray-icon utilizing the `tray-icon` and `winit` crates for contro
 
 ### 4. Testing Frameworks & Verification Infrastructure
 Multi-layered testing infrastructure combining colorized failure diffs (`pretty_assertions`), regression-guarding snapshot testing (`insta` for `Config`, `SyncError`, `FileRecord`), generative property-based invariant testing (`proptest` for block boundary division, TOML round-tripping, SMB timestamp tolerance, path traversal safety, sync idempotency, and delta sync isolation), and pure struct unit testing (`TrayState`).
+
+### 5. Development & Release Automation Scripts (`scripts/`)
+Top-level, git-tracked PowerShell automation scripts:
+* `scripts/check-quality.ps1`: 4-gate code quality pipeline executing `cargo fmt`, `cargo clippy`, `cargo test`, and `sg scan` unconditionally with structured Markdown summary reporting.
+* `scripts/build-release.ps1`: Automated distribution builder that executes the quality gate pipeline, compiles release binaries (`cargo build --release` with MSVC `+crt-static` CRT linking), verifies zero dynamic CRT dependencies via `dumpbin`, stages `dist/syncdir.exe`, packages versioned ZIP archives (`syncdir-v{version}-x86_64-windows.zip`), and generates SHA256 checksums.
