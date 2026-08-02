@@ -278,7 +278,6 @@ fn show_error_dialog(_title_str: &str, _msg_str: &str) {}
 /// # Errors
 ///
 /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
-#[allow(unused_assignments)]
 pub fn run_tray(
     event_loop: winit::event_loop::EventLoop<UserEvent>,
     config_path: PathBuf,
@@ -362,7 +361,8 @@ pub fn run_tray(
 
     let mut state = TrayState::new(initial_dest_online);
     let mut needs_repaint = true;
-    let mut exit_reason = TrayExitReason::UserExit;
+    let exit_reason = std::rc::Rc::new(std::cell::Cell::new(TrayExitReason::UserExit));
+    let exit_reason_closure = exit_reason.clone();
 
     event_loop
         .run(move |event, elwt| {
@@ -392,7 +392,7 @@ pub fn run_tray(
                                         "Configuration validated successfully. Restarting daemon..."
                                     );
                                     MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
-                                    exit_reason = TrayExitReason::Restart;
+                                    exit_reason_closure.set(TrayExitReason::Restart);
                                     elwt.exit();
                                 }
                             }
@@ -479,7 +479,7 @@ pub fn run_tray(
         })
         .map_err(|e| SyncError::Tray(format!("Event loop error: {e}")))?;
 
-    Ok(exit_reason)
+    Ok(exit_reason.get())
 }
 
 #[cfg(test)]
