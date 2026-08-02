@@ -60,7 +60,7 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), defensive single-to-double backslash normalization (`\172...` -> `\\172...`), strict path format validation (`Config::validate()` enforcing drive letters `C:\` or `\\` UNC prefix), optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, and runtime settings.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), path compatibility filtering (`normalize_path` converting forward slashes `/` -> `\`, trimming quotes/whitespace/trailing slashes), defensive single-to-double backslash normalization (`\172...` -> `\\172...`), strict path format validation (`Config::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\` supporting mapped Windows drives), optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, and runtime settings.
 * **Does NOT own**: Filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 

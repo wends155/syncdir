@@ -28,19 +28,37 @@ pub struct Config {
     pub dest_dirs: Option<Vec<PathBuf>>,
 }
 
-fn normalize_dest_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    let mut s = path.to_string_lossy().trim().trim_matches('"').to_string();
+
+    // Convert forward slashes to backslashes
+    s = s.replace('/', "\\");
+
+    // Repair single-backslash UNC network paths (\172... -> \\172...)
     if s.starts_with('\\') && !s.starts_with("\\\\") {
-        let normalized = format!("\\{}", s);
+        let repaired = format!("\\{}", s);
         tracing::warn!(
             raw = %s,
-            normalized = %normalized,
+            normalized = %repaired,
             "Normalized single-backslash path to UNC network path"
         );
-        PathBuf::from(normalized)
-    } else {
-        path.to_path_buf()
+        s = repaired;
     }
+
+    // Trim redundant trailing backslashes while preserving root drive paths like C:\ or X:\
+    while s.ends_with('\\') && s.len() > 3 {
+        let is_root_drive = s.len() == 3 && s.as_bytes()[1] == b':';
+        if is_root_drive {
+            break;
+        }
+        s.pop();
+    }
+
+    PathBuf::from(s)
+}
+
+fn normalize_dest_path(path: &Path) -> PathBuf {
+    normalize_path(path)
 }
 
 impl Config {
@@ -109,9 +127,16 @@ impl Config {
                 s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic();
             let is_unix_abs = s.starts_with('/');
 
+            if is_drive {
+                tracing::debug!(
+                    target_path = %s,
+                    "Validated Windows drive path target (local or mapped drive)"
+                );
+            }
+
             if !is_unc && !is_drive && !is_unix_abs {
                 return Err(SyncError::Validation(format!(
-                    "Invalid destination path '{}': must start with a drive letter (e.g. C:\\) or UNC network prefix (e.g. \\\\server\\share)",
+                    "Invalid destination path '{}': must start with a drive letter (e.g. C:\\, X:\\) or UNC network prefix (e.g. \\\\server\\share)",
                     s
                 )));
             }
@@ -526,5 +551,47 @@ mod tests {
             dest_dirs: None,
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_normalize_path_filtering() {
+        assert_eq!(
+            normalize_path(Path::new("X:/folder/subfolder/")).to_string_lossy(),
+            r"X:\folder\subfolder"
+        );
+        assert_eq!(
+            normalize_path(Path::new("\"Z:\\data\\files\\\"")).to_string_lossy(),
+            r"Z:\data\files"
+        );
+        assert_eq!(
+            normalize_path(Path::new(r"\172.16.0.193\share\")).to_string_lossy(),
+            r"\\172.16.0.193\share"
+        );
+        assert_eq!(normalize_path(Path::new("C:\\")).to_string_lossy(), r"C:\");
+    }
+
+    #[test]
+    fn test_config_validate_mapped_drive() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+
+        let config = Config {
+            source_dir: source,
+            dest_dir: Some(PathBuf::from("X:/Control IT Data/Files/")),
+            dest_dirs: Some(vec![PathBuf::from(r"Z:\Backup\OPC\")]),
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 1024,
+            block_size_bytes: 512,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+        };
+
+        assert!(config.validate().is_ok());
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].to_string_lossy(), r"X:\Control IT Data\Files");
+        assert_eq!(resolved[1].to_string_lossy(), r"Z:\Backup\OPC");
     }
 }
