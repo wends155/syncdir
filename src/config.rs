@@ -271,9 +271,29 @@ pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
 }
 
 impl Config {
+    /// Mutate and normalize all path fields (`source_dir`, `dest_dir`, `dest_dirs`) in-place.
+    pub fn normalize_paths(&mut self) {
+        self.source_dir = normalize_path(&self.source_dir);
+        if let Some(ref mut d) = self.dest_dir {
+            *d = normalize_path(d);
+        }
+        if let Some(ref mut dirs) = self.dest_dirs {
+            for d in dirs.iter_mut() {
+                *d = normalize_path(d);
+            }
+        }
+    }
+
+    /// Return the resolved, normalized source directory path, attempting `try_resolve_alternate_path`
+    /// if the raw path is unreachable or on a mapped drive / network share.
+    pub fn resolved_source_dir(&self) -> PathBuf {
+        try_resolve_alternate_path(&self.source_dir)
+    }
+
     /// Return a merged, deduplicated list of all configured destination directories.
     /// Includes `dest_dir` first (if set), then appends any unique entries from `dest_dirs`.
-    /// Automatically normalizes single-backslash UNC network paths (`\172...` -> `\\172...`).
+    /// Automatically normalizes single-backslash UNC network paths (`\172...` -> `\\172...`)
+    /// and performs case-insensitive path deduplication on Windows.
     pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(ref primary) = self.dest_dir {
@@ -283,7 +303,11 @@ impl Config {
         if let Some(ref list) = self.dest_dirs {
             for d in list {
                 let normalized = normalize_dest_path(d);
-                if !dirs.contains(&normalized) {
+                let norm_lower = normalized.to_string_lossy().to_lowercase();
+                if !dirs
+                    .iter()
+                    .any(|existing| existing.to_string_lossy().to_lowercase() == norm_lower)
+                {
                     dirs.push(normalized);
                 }
             }
@@ -292,6 +316,7 @@ impl Config {
     }
 
     /// Load configuration from a TOML file at the given path.
+    /// Automatically normalizes all configured directory paths upon loading.
     ///
     /// # Errors
     /// Returns `SyncError::Io` if the file cannot be read, or
@@ -299,17 +324,32 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, SyncError> {
         let content = std::fs::read_to_string(path)?;
         let processed = preprocess_config_toml(&content);
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&processed).map_err(|e| SyncError::Config(e.to_string()))?;
+        config.normalize_paths();
         Ok(config)
     }
 
     /// Validate that configured directories exist and parameters are valid.
-    /// Enforces that destination paths are valid drive paths (`C:\`) or UNC network paths (`\\`).
+    /// Enforces that source and destination paths are valid drive paths (`C:\`) or UNC network paths (`\\`).
     ///
     /// # Errors
     /// Returns `SyncError::Validation` if parameters are invalid.
     pub fn validate(&self) -> Result<(), SyncError> {
+        let src_str = self.source_dir.to_string_lossy();
+        let src_unc = src_str.starts_with("\\\\");
+        let src_drive = src_str.len() >= 2
+            && src_str.as_bytes()[1] == b':'
+            && src_str.as_bytes()[0].is_ascii_alphabetic();
+        let src_unix = src_str.starts_with('/');
+
+        if !src_unc && !src_drive && !src_unix {
+            return Err(SyncError::Validation(format!(
+                "Invalid source path '{}': must start with a drive letter (e.g. C:\\, R:\\) or UNC network prefix (e.g. \\\\server\\share)",
+                src_str
+            )));
+        }
+
         if !self.source_dir.exists() {
             tracing::warn!(
                 path = %self.source_dir.display(),
@@ -448,7 +488,7 @@ impl Config {
     /// Create a Config with sensible test defaults for the given source and dest.
     #[doc(hidden)]
     pub fn test_default(source: PathBuf, dest: PathBuf) -> Self {
-        Self {
+        let mut cfg = Self {
             source_dir: source,
             dest_dir: Some(dest),
             debounce_seconds: 1,
@@ -458,7 +498,9 @@ impl Config {
             verify_writes: true,
             retry_interval_seconds: 10,
             dest_dirs: None,
-        }
+        };
+        cfg.normalize_paths();
+        cfg
     }
 }
 
@@ -855,5 +897,85 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].to_string_lossy(), r"X:\Control IT Data\Files");
         assert_eq!(resolved[1].to_string_lossy(), r"Z:\Backup\OPC");
+    }
+
+    #[test]
+    fn test_config_validation_invalid_source_relative() {
+        let config = Config {
+            source_dir: PathBuf::from("relative/path/source"),
+            dest_dir: Some(PathBuf::from(r"C:\Backup")),
+            dest_dirs: None,
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 1024,
+            block_size_bytes: 512,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, SyncError::Validation(ref msg) if msg.contains("Invalid source path"))
+        );
+    }
+
+    #[test]
+    fn test_normalize_paths_source_and_dest() {
+        let mut config = Config {
+            source_dir: PathBuf::from("C:/Source/Folder/"),
+            dest_dir: Some(PathBuf::from("D:/Dest/Folder/")),
+            dest_dirs: Some(vec![PathBuf::from("E:/Backup/Folder/")]),
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 1024,
+            block_size_bytes: 512,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+        };
+
+        config.normalize_paths();
+        assert_eq!(config.source_dir.to_string_lossy(), r"C:\Source\Folder");
+        assert_eq!(
+            config.dest_dir.unwrap().to_string_lossy(),
+            r"D:\Dest\Folder"
+        );
+        assert_eq!(
+            config.dest_dirs.unwrap()[0].to_string_lossy(),
+            r"E:\Backup\Folder"
+        );
+    }
+
+    #[test]
+    fn test_resolved_dest_dirs_case_insensitive_dedup() {
+        let config = Config {
+            source_dir: PathBuf::from(r"C:\Source"),
+            dest_dir: Some(PathBuf::from(r"Z:\Backup\OPC")),
+            dest_dirs: Some(vec![
+                PathBuf::from(r"z:\backup\opc"),
+                PathBuf::from(r"Z:\BACKUP\OPC\"),
+                PathBuf::from(r"Y:\Different\Backup"),
+            ]),
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 1024,
+            block_size_bytes: 512,
+            verify_writes: true,
+            retry_interval_seconds: 10,
+        };
+
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].to_string_lossy(), r"Z:\Backup\OPC");
+        assert_eq!(resolved[1].to_string_lossy(), r"Y:\Different\Backup");
+    }
+
+    #[test]
+    fn test_resolved_source_dir_alternate_resolution() {
+        let temp = tempdir().unwrap();
+        let source_path = temp.path().join("source");
+        std::fs::create_dir(&source_path).unwrap();
+
+        let config = Config::test_default(source_path.clone(), temp.path().join("dest"));
+        assert_eq!(config.resolved_source_dir(), source_path);
     }
 }

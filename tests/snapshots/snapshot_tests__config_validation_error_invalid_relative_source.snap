@@ -1,0 +1,5 @@
+---
+source: tests/snapshot_tests.rs
+expression: err.to_string()
+---
+Validation error: Invalid source path 'relative/source': must start with a drive letter (e.g. C:\, R:\) or UNC network prefix (e.g. \\server\share)

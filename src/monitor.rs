@@ -58,7 +58,8 @@ impl DirectoryWatcher {
     /// # Ok::<(), syncdir::error::SyncError>(())
     /// ```
     pub fn start(config: &Config, tx: Sender<SyncCommand>) -> Result<Self, SyncError> {
-        let source = config.source_dir.clone();
+        let source = config.resolved_source_dir();
+        let source_root = source.clone();
 
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
@@ -68,14 +69,14 @@ impl DirectoryWatcher {
                     | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
                     | EventKind::Modify(notify::event::ModifyKind::Any) => {
                         for path in event.paths {
-                            if let Ok(rel_path) = path.strip_prefix(&source) {
+                            if let Ok(rel_path) = path.strip_prefix(&source_root) {
                                 let _ = tx.send(SyncCommand::FileModified(rel_path.to_path_buf()));
                             }
                         }
                     }
                     EventKind::Remove(_) => {
                         for path in event.paths {
-                            if let Ok(rel_path) = path.strip_prefix(&source) {
+                            if let Ok(rel_path) = path.strip_prefix(&source_root) {
                                 let _ = tx.send(SyncCommand::FileDeleted(rel_path.to_path_buf()));
                             }
                         }
@@ -84,17 +85,18 @@ impl DirectoryWatcher {
                         match rename_mode {
                             notify::event::RenameMode::Both => {
                                 if event.paths.len() == 2 {
-                                    if let Ok(from_rel) = event.paths[0].strip_prefix(&source) {
+                                    if let Ok(from_rel) = event.paths[0].strip_prefix(&source_root)
+                                    {
                                         let _ = tx
                                             .send(SyncCommand::FileDeleted(from_rel.to_path_buf()));
                                     }
-                                    if let Ok(to_rel) = event.paths[1].strip_prefix(&source) {
+                                    if let Ok(to_rel) = event.paths[1].strip_prefix(&source_root) {
                                         let _ = tx
                                             .send(SyncCommand::FileModified(to_rel.to_path_buf()));
                                     }
                                 } else {
                                     for path in event.paths {
-                                        if let Ok(rel_path) = path.strip_prefix(&source) {
+                                        if let Ok(rel_path) = path.strip_prefix(&source_root) {
                                             let _ = tx.send(SyncCommand::FileModified(
                                                 rel_path.to_path_buf(),
                                             ));
@@ -104,7 +106,7 @@ impl DirectoryWatcher {
                             }
                             notify::event::RenameMode::From => {
                                 for path in event.paths {
-                                    if let Ok(rel_path) = path.strip_prefix(&source) {
+                                    if let Ok(rel_path) = path.strip_prefix(&source_root) {
                                         let _ = tx
                                             .send(SyncCommand::FileDeleted(rel_path.to_path_buf()));
                                     }
@@ -112,7 +114,7 @@ impl DirectoryWatcher {
                             }
                             notify::event::RenameMode::To => {
                                 for path in event.paths {
-                                    if let Ok(rel_path) = path.strip_prefix(&source) {
+                                    if let Ok(rel_path) = path.strip_prefix(&source_root) {
                                         let _ = tx.send(SyncCommand::FileModified(
                                             rel_path.to_path_buf(),
                                         ));
@@ -121,17 +123,18 @@ impl DirectoryWatcher {
                             }
                             _ => {
                                 if event.paths.len() == 2 {
-                                    if let Ok(from_rel) = event.paths[0].strip_prefix(&source) {
+                                    if let Ok(from_rel) = event.paths[0].strip_prefix(&source_root)
+                                    {
                                         let _ = tx
                                             .send(SyncCommand::FileDeleted(from_rel.to_path_buf()));
                                     }
-                                    if let Ok(to_rel) = event.paths[1].strip_prefix(&source) {
+                                    if let Ok(to_rel) = event.paths[1].strip_prefix(&source_root) {
                                         let _ = tx
                                             .send(SyncCommand::FileModified(to_rel.to_path_buf()));
                                     }
                                 } else {
                                     for path in event.paths {
-                                        if let Ok(rel_path) = path.strip_prefix(&source) {
+                                        if let Ok(rel_path) = path.strip_prefix(&source_root) {
                                             let _ = tx.send(SyncCommand::FileModified(
                                                 rel_path.to_path_buf(),
                                             ));
@@ -148,7 +151,7 @@ impl DirectoryWatcher {
                 }
             })?;
 
-        watcher.watch(&config.source_dir, RecursiveMode::Recursive)?;
+        watcher.watch(&source, RecursiveMode::Recursive)?;
         Ok(DirectoryWatcher { _watcher: watcher })
     }
 }

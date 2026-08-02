@@ -83,7 +83,8 @@ retry_interval_seconds = 10
 
     let dests = config.resolved_dest_dirs();
     let mut worker_txs = Vec::new();
-    let initial_source_online = config.source_dir.exists() && config.source_dir.is_dir();
+    let resolved_source = config.resolved_source_dir();
+    let initial_source_online = resolved_source.exists() && resolved_source.is_dir();
     let source_online =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(initial_source_online));
 
@@ -171,7 +172,6 @@ retry_interval_seconds = 10
     let watcher_event_proxy = event_proxy.clone();
     std::thread::spawn(move || {
         let mut watcher: Option<syncdir::monitor::DirectoryWatcher> = None;
-        let source_dir = watcher_config.source_dir.clone();
         let retry_interval = std::time::Duration::from_secs(watcher_config.retry_interval_seconds);
         let mut last_status_check = std::time::Instant::now()
             .checked_sub(retry_interval)
@@ -185,7 +185,8 @@ retry_interval_seconds = 10
 
             if now.duration_since(last_status_check) >= retry_interval {
                 last_status_check = now;
-                let is_online = source_dir.exists() && source_dir.is_dir();
+                let current_source = watcher_config.resolved_source_dir();
+                let is_online = current_source.exists() && current_source.is_dir();
                 watcher_source_online.store(is_online, std::sync::atomic::Ordering::Relaxed);
 
                 let mut watcher_active = false;

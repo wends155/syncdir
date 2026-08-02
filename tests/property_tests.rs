@@ -76,6 +76,19 @@ proptest! {
         let malicious_path = format!("../{}/../{}", segment1, segment2);
         prop_assert!(malicious_path.contains(".."));
     }
+
+    // 5. Source Path Validation Rejection Invariant
+    #[test]
+    fn prop_source_path_validation_rejection(
+        rel_path in "[a-zA-Z0-9_]{1,10}/[a-zA-Z0-9_]{1,10}",
+    ) {
+        let mut config = Config::test_default(
+            PathBuf::from(r"C:\Source"),
+            PathBuf::from(r"D:\Dest"),
+        );
+        config.source_dir = PathBuf::from(rel_path);
+        prop_assert!(config.validate().is_err());
+    }
 }
 
 // 5. Idempotent Sync & 6. Delta Sync Precision (I/O Property Tests)

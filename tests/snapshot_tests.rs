@@ -53,6 +53,14 @@ fn test_config_validation_error_zero_debounce() {
     assert_snapshot!(err.to_string());
 }
 
+#[test]
+fn test_config_validation_error_invalid_relative_source() {
+    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
+    config.source_dir = PathBuf::from("relative/source");
+    let err = config.validate().unwrap_err();
+    assert_snapshot!(err.to_string());
+}
+
 // --- SyncError Display Snapshots ---
 
 #[test]

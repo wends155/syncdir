@@ -129,7 +129,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 path
             )));
         }
-        let src_path = self.config.source_dir.join(&rel_path);
+        let src_path = self.config.resolved_source_dir().join(&rel_path);
         let dest_dir = self.config.dest_dir.as_ref().ok_or_else(|| {
             SyncError::Validation("Destination directory not configured".to_string())
         })?;
@@ -297,7 +297,8 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     }
 
     fn run_full_scan(&self) -> Result<bool, SyncError> {
-        if !self.config.source_dir.exists() {
+        let resolved_source = self.config.resolved_source_dir();
+        if !resolved_source.exists() {
             return Err(SyncError::Validation(
                 "Source directory does not exist".to_string(),
             ));
@@ -353,11 +354,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             Ok(())
         }
 
-        scan_dir(
-            &self.config.source_dir,
-            &self.config.source_dir,
-            &mut source_files,
-        )?;
+        scan_dir(&resolved_source, &resolved_source, &mut source_files)?;
 
         // Sync all source files
         let mut sync_skip_count = 0usize;
