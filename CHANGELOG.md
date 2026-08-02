@@ -5,6 +5,23 @@ All notable changes to the `syncdir` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.12] - 2026-08-02
+
+### Added
+- **Windows Mapped Drive Support (`X:\...`)**:
+  - `Config::validate()` explicitly validates and logs Windows mapped drive target paths (`X:\...`, `Z:\...`).
+  - Added unit test `test_config_validate_mapped_drive` asserting mapped drive configuration validation.
+
+### Improved
+- **Path Compatibility Filtering (`normalize_path`)**:
+  - Automatically converts forward slashes `/` -> `\` (e.g. `X:/folder/path` -> `X:\folder\path`).
+  - Trims surrounding quotes and whitespace (`"Z:\folder\"` -> `Z:\folder`).
+  - Repaired single-backslash UNC network prefixes (`\172...` -> `\\172...`).
+  - Trims redundant trailing backslashes while preserving root drive paths (`C:\`, `X:\`).
+  - Added unit test `test_normalize_path_filtering` covering forward slashes, trailing slashes, quotes, single-backslash UNC, and root drive paths.
+
+---
+
 ## [v0.1.11] - 2026-08-02
 
 ### Added

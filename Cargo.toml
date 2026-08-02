@@ -1,6 +1,6 @@
 [package]
 name = "syncdir"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "A lightweight Windows user-session background sync utility with block-level delta synchronization."
 authors = ["Wendell Saligan"]
