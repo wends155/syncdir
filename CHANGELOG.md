@@ -5,6 +5,26 @@ All notable changes to the `syncdir` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.13] - 2026-08-02
+
+### Added
+- **Plain-Text Logging & ANSI Escape Code Suppression**:
+  - Configured `tracing_subscriber::registry()` in `src/main.rs` with separate stdout and file appender layers (`.with_ansi(false)`).
+  - Suppressed raw ANSI control code byte corruption (`\x1b[2m...`) in disk log files (`logs/syncdir.log.*`) and Windows command prompt streams.
+  - Added snapshot unit test `test_log_formatter_ansi_suppression()` in `tests/snapshot_tests.rs`.
+- **Win32 Mapped Drive UNC Resolution & SMB Authentication**:
+  - Added `resolve_mapped_drive_unc(drive_letter)` utilizing Win32 `WNetGetConnectionW` FFI (`mpr.dll`) in `src/config.rs` to resolve local drive letters (`R:`) to their underlying remote UNC network paths (`\\172.16.0.193\share`).
+  - Added `establish_smb_connection(unc_path)` utilizing `WNetAddConnection2W` to automatically establish network sessions using Windows Credential Manager entries when encountering logon errors (`os error 1326`).
+  - Integrated reachability fallbacks into `src/main.rs` (initial startup check) and `src/sync.rs` (`run_full_scan`).
+
+### Improved
+- **Config Path Resilience & Defensive Normalization**:
+  - Added `normalize_paths(&mut self)` in `src/config.rs` auto-normalizing `source_dir`, `dest_dir`, and `dest_dirs` upon `Config::load()`.
+  - Added `resolved_source_dir(&self) -> PathBuf` for SMB connection & mapped drive reachability fallback.
+  - Enhanced `resolved_dest_dirs()` with case-insensitive Windows path comparison.
+
+---
+
 ## [v0.1.12] - 2026-08-02
 
 ### Added

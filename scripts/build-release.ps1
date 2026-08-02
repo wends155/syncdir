@@ -28,7 +28,7 @@ $RepoRoot = $RepoRoot.Trim()
 Push-Location $RepoRoot
 try {
     $Date = Get-Date -Format 'yyyy-MM-dd HH:mm'
-    Write-Output "# 📦 Release Build & Distribution"
+    Write-Output '# 📦 Release Build & Distribution'
     Write-Output "Started: $Date"
     Write-Output "Repo: '$RepoRoot'"
     Write-Output ""
@@ -51,9 +51,8 @@ try {
     # Phase 2: Cargo Release Build
     Write-Output "## Phase 2: Building Release Binary"
     Write-Output "Executing `cargo build --release`..."
-    $buildOutput = & cargo build --release 2>&1
+    & cargo build --release
     if ($LASTEXITCODE -ne 0) {
-        $buildOutput | ForEach-Object { Write-Error $_ }
         throw "Cargo release build failed with exit code $LASTEXITCODE."
     }
     Write-Output "> ✅ Cargo release build complete."
