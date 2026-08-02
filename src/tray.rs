@@ -1,7 +1,9 @@
 use crate::error::SyncError;
 use crate::startup::StartupRegistry;
 use crate::sync::SyncCommand;
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
@@ -361,7 +363,7 @@ pub fn run_tray(
 
     let mut state = TrayState::new(initial_dest_online);
     let mut needs_repaint = true;
-    let exit_reason = std::rc::Rc::new(std::cell::Cell::new(TrayExitReason::UserExit));
+    let exit_reason = Rc::new(Cell::new(TrayExitReason::UserExit));
     let exit_reason_closure = exit_reason.clone();
 
     event_loop
