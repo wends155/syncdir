@@ -3,7 +3,7 @@
     Produces a portable, statically-linked Windows release build.
 
 .DESCRIPTION
-    1. Runs mandatory quality gate script (.agents/scripts/check-quality.ps1).
+    1. Runs mandatory quality gate script (scripts/check-quality.ps1).
     2. Runs `cargo build --release`.
     3. Stages `syncdir.exe` into `dist/`.
     4. Performs hard dumpbin check to verify no CRT DLLs (VCRUNTIME140.dll, api-ms-win-crt-*) are dynamically linked.
@@ -11,7 +11,7 @@
     6. Generates SHA256 checksum file alongside the ZIP archive.
 
 .EXAMPLE
-    .\.agents\scripts\build-release.ps1
+    .\scripts\build-release.ps1
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -35,7 +35,7 @@ try {
 
     # Phase 1: Quality Gate Execution (Mandatory)
     Write-Output "## Phase 1: Quality Gate Verification"
-    $QualityScript = Join-Path $RepoRoot ".agents\scripts\check-quality.ps1"
+    $QualityScript = Join-Path $RepoRoot "scripts\check-quality.ps1"
     if (-not (Test-Path $QualityScript)) {
         throw "Quality script not found at '$QualityScript'."
     }
