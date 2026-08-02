@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
-| **Version** | 0.1.10 |
+| **Version** | 0.1.11 |
 | **Last Updated** | 2026-08-02 |
 
 

@@ -5,6 +5,21 @@ All notable changes to the `syncdir` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.11] - 2026-08-02
+
+### Added
+- **Developer & Release Automation (`scripts/`)**:
+  - Relocated `check-quality.ps1` and `build-release.ps1` to a git-tracked top-level `scripts/` directory.
+  - Portable MSVC static CRT release packaging with automated `dumpbin` linkage check, staging to `dist/`, versioned ZIP archive creation (`syncdir-v0.1.11-x86_64-windows.zip`), and SHA256 checksum generation.
+- **Ast-Grep Security Rule**: Added `.ast-grep/rules/lint-suppression-audit.yml` to audit all forms of Rust lint suppressions (`#[allow]`, `#[expect]`, `#![allow]`, `#![expect]`) during `sg scan`.
+
+### Improved
+- **Win32 SMB Network Error Classification**: Extended `SyncError::is_network_offline()` with Win32 codes `65` (`ERROR_NETWORK_BUSY`), `121` (`ERROR_SEM_TIMEOUT`), and `1326` (`ERROR_LOGON_FAILURE`).
+- **Full Scan Network Resilience**: Integrated early exit in `run_full_scan` loop when encountering network/auth errors, emitting a single structured warning and skipping remaining targets to prevent log spam.
+- **Tray UI Clean Event Loop Exit**: Wrapped `exit_reason` state in `Rc<Cell<TrayExitReason>>` in `src/tray.rs` to allow clean Reload Config restarts without compiler suppression warnings.
+
+---
+
 ## [v0.1.10] - 2026-08-01
 
 ### Added
