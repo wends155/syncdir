@@ -2,11 +2,18 @@
 target/
 
 # AI and Agent-related context
-.agents/
-.gemini/
+.agents/*
+!.agents/scripts/
+.gemini/*
+!.gemini/skills/
 GEMINI.md
 task.md
 implementation_plan.md
+
+# Knowledge-RAG Runtime Data & Model Cache
+data/
+documents/
+models_cache/
 
 # Logs
 logs/
