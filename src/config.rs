@@ -52,7 +52,8 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
 
     // Trim redundant trailing backslashes while preserving root drive paths like C:\ or X:\
     while s.ends_with('\\') && s.len() > 3 {
-        let is_root_drive = s.len() == 3 && s.as_bytes()[1] == b':';
+        let is_root_drive =
+            s.len() == 3 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic();
         if is_root_drive {
             break;
         }
@@ -151,6 +152,7 @@ pub fn establish_smb_connection(unc_path: &Path) -> bool {
         .chain(std::iter::once(0))
         .collect();
 
+    // Win32 FFI: field names and struct name must match the Windows API naming convention (NETRESOURCEW).
     #[allow(non_snake_case, clippy::upper_case_acronyms)]
     #[repr(C)]
     struct NETRESOURCEW {
