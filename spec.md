@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 571f481
+> Last verified against: fac230b
  
 | Field | Value |
 |-------|-------|
