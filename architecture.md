@@ -60,7 +60,7 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), path compatibility filtering (`normalize_path` converting forward slashes `/` -> `\`, trimming quotes/whitespace/trailing slashes), defensive single-to-double backslash normalization (`\172...` -> `\\172...`), strict path format validation (`Config::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\` supporting mapped Windows drives), optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, and runtime settings.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), path compatibility filtering (`normalize_path` converting forward slashes `/` -> `\`, trimming quotes/whitespace/trailing slashes), defensive single-to-double backslash normalization (`\172...` -> `\\172...`), strict path format validation (`Config::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\` supporting mapped Windows drives), optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, Win32 mapped drive UNC resolution via `resolve_mapped_drive_unc` (queries `WNetGetConnectionW` to translate drive letters like `R:` to their underlying UNC network paths), mapped drive reachability fallback via `try_resolve_unc_path`, automatic SMB network session initialization via `establish_smb_connection` (`WNetAddConnection2W` FFI using cached Windows Credential Manager entries), automatic struct path normalization via `normalize_paths(&mut self)` applied at `Config::load()` and `Config::test_default()`, and runtime settings.
 * **Does NOT own**: Filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 
@@ -103,7 +103,7 @@ syncdir/
 
 | Module | May Import | Must NOT Import |
 |--------|-----------|-----------------|
-| `tray` | `sync`, `config`, `monitor`, `error` | `db` (direct) |
+| `tray` | `sync`, `config`, `monitor`, `error`, `startup` | `db` (direct) |
 | `monitor` | `sync`, `config`, `error` | `db`, `tray` |
 | `sync` | `db` (trait), `config`, `error` | `monitor`, `tray` |
 | `db` | `config`, `error` | `sync`, `monitor`, `tray` |
@@ -161,6 +161,11 @@ syncdir/
   * `pretty_assertions` (v1): Colorized structural diff assertions.
   * `insta` (v1): Snapshot testing engine.
   * `proptest` (v1): Generative property-based testing framework.
+* **Developer & Agent Tooling**:
+  * `Narsil MCP`: Code intelligence for blast radius analysis, import graph, symbol discovery, and security scanning.
+  * `Sequential Thinking MCP`: Structured multi-step reasoning for planning and audit phases.
+  * `Context7 MCP`: Upstream documentation lookup for external crate APIs.
+  * `Knowledge-RAG MCP` (`search_knowledge`): Local knowledge index for pre-ingested dependency API docs and TARS rule context. Query-first convention across `/toolcheck`, `/build`, `/plan-making`, `/feature`, `/issue`.
 
 ## 13. Architecture Diagrams
 
