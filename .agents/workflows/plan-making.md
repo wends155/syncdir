@@ -19,6 +19,7 @@ It enforces the Planning Gate and Think Phase of the TARS protocol.
 >    - `context.md` — historical decisions and prior context
 >    - `.agents/rules/coding-standard.md` — governance core rules. Next, check its Language Dispatch Table to determine which language skill files from `.gemini/skills/` to read based on the task's language.
 >    - `.agents/rules/ipr.md` — implementation plan format and handoff rules
+>    - `.gemini/skills/knowledge-rag-query/SKILL.md` — query-first dependency lookup convention (when Knowledge-RAG MCP is available)
 > 2. Run these auto-runnable commands:
 // turbo
 >    - `git log -n 20 --oneline`

@@ -8,10 +8,11 @@ description: >
 # Knowledge-RAG Query Convention
 
 ## When to Use
-Load this skill when the Builder needs information about:
+Load this skill when the **Builder or Architect** needs information about:
 - Dependency APIs, usage patterns, or common mistakes
 - Language-specific DOs/DON'Ts/gotchas (Rust, TypeScript)
 - TARS workflow or rule discovery
+- Best-practice validation during `/audit` compliance checks (§2f)
 
 ## Query-First Protocol
 

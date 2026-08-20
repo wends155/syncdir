@@ -30,6 +30,7 @@ Invoked by the `/build` workflow at each step of the Global Execution Order.
    Apply the change per the Action field.
    - For `[TEST]` steps: Write the test first (TDD Red). Sub-tag scope guards apply.
    - *MCP Guidance:* When modifying functions, use `get_callees` to verify downstream contracts aren't violated. For tests, ensure call path coverage.
+   - *Knowledge-RAG Guidance:* When the step involves a dependency API or pattern the Builder is unfamiliar with, query `search_knowledge` (per `knowledge-rag-query` skill) before writing code. Use retrieved examples and DOs/DON'Ts to guide the implementation.
 4. **POST-VERIFY (Self-Verification Loop)**
    - Re-read changed lines using `view_file` or `grep_search`.
    - Compare changes against the Action description and Interface Contract.
