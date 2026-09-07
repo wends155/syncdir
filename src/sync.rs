@@ -4,7 +4,7 @@
 //! send to the sync worker, and the trait contract for the sync engine.
 
 use crate::config::Config;
-use crate::db::{FileRecord, HashStore};
+use crate::db::{BlockHash, FileRecord, HashStore};
 use crate::error::SyncError;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -71,7 +71,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
     }
 
     /// Hash a file in block-sized chunks, returning (size, mtime, hashes).
-    fn calculate_hashes(&self, file_path: &Path) -> Result<(i64, i64, Vec<Vec<u8>>), SyncError> {
+    fn calculate_hashes(&self, file_path: &Path) -> Result<(i64, i64, Vec<BlockHash>), SyncError> {
         let mut file = File::open(file_path)?;
         let metadata = file.metadata()?;
         let file_size = metadata.len() as i64;
@@ -87,7 +87,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 break;
             }
             let hash = blake3::hash(&buffer[..bytes_read]);
-            hashes.push(hash.as_bytes().to_vec());
+            hashes.push(*hash.as_bytes());
         }
 
         Ok((file_size, last_modified, hashes))
@@ -230,7 +230,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                         let mut verify_buf = vec![0; bytes_read];
                         dest_file.read_exact(&mut verify_buf)?;
                         let verify_hash = blake3::hash(&verify_buf);
-                        if verify_hash.as_bytes() != hash.as_slice() {
+                        if verify_hash.as_bytes() != hash {
                             return Err(SyncError::Validation(
                                 "Write verification failed".to_string(),
                             ));

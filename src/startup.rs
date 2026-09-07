@@ -44,14 +44,14 @@ impl StartupRegistry {
     /// Registers the current exe path in HKCU run key with --autostart flag.
     ///
     /// # Errors
-    /// Returns `SyncError::Config` if registry write operations fail.
+    /// Returns `SyncError::Registry` if registry write operations fail.
     pub fn register() -> Result<(), SyncError> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = hkcu
             .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-            .map_err(|e| SyncError::Config(format!("Failed to open Run registry key: {e}")))?;
+            .map_err(|e| SyncError::Registry(format!("Failed to open Run registry key: {e}")))?;
         key.set_value("syncdir", &Self::registry_value()?)
-            .map_err(|e| SyncError::Config(format!("Failed to write registry value: {e}")))?;
+            .map_err(|e| SyncError::Registry(format!("Failed to write registry value: {e}")))?;
         Ok(())
     }
 

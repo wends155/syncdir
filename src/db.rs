@@ -19,11 +19,14 @@ pub struct FileRecord {
     pub last_modified: i64,
 }
 
+/// A Blake3 block hash: fixed 32-byte digest.
+pub type BlockHash = [u8; 32];
+
 /// Interface for persisting and querying file block signatures.
 pub trait HashStore {
     fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError>;
-    fn save_file(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError>;
-    fn get_block_hashes(&self, file_id: i64) -> Result<Vec<Vec<u8>>, SyncError>;
+    fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError>;
+    fn get_block_hashes(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError>;
     fn delete_file(&self, path: &str) -> Result<(), SyncError>;
     fn list_files(&self) -> Result<Vec<String>, SyncError>;
 }
@@ -44,7 +47,12 @@ impl SqliteHashStore {
     /// Returns `SyncError::Db` on any SQLite failure.
     pub fn new(db_path: &Path, config: &Config) -> Result<Self, SyncError> {
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA temp_store = MEMORY;",
+        )?;
         let store = SqliteHashStore {
             conn: Mutex::new(conn),
         };
@@ -75,6 +83,8 @@ impl SqliteHashStore {
                 hash BLOB NOT NULL,
                 FOREIGN KEY(file_id) REFERENCES file_metadata(id) ON DELETE CASCADE
             );
+            CREATE INDEX IF NOT EXISTS idx_block_hashes_file_block
+                ON block_hashes (file_id, block_index);
             CREATE TABLE IF NOT EXISTS db_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -90,7 +100,7 @@ impl SqliteHashStore {
 
         let current_block_size = config.block_size_bytes.to_string();
         let current_threshold = config.block_sync_threshold_bytes.to_string();
-        let current_version = "2";
+        let current_version = "3";
 
         // Treat any missing key or mismatch as requiring a full purge
         let needs_purge = match (cached_block_size, cached_threshold, cached_version) {
@@ -155,7 +165,7 @@ impl HashStore for SqliteHashStore {
         }
     }
 
-    fn save_file(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError> {
+    fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
@@ -181,18 +191,19 @@ impl HashStore for SqliteHashStore {
             "DELETE FROM block_hashes WHERE file_id = ?",
             params![file_id],
         )?;
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO block_hashes (file_id, block_index, hash) \
+             VALUES (?, ?, ?)",
+        )?;
         for (idx, hash) in hashes.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO block_hashes (file_id, block_index, hash) \
-                 VALUES (?, ?, ?)",
-                params![file_id, idx as i64, hash],
-            )?;
+            stmt.execute(params![file_id, idx as i64, hash.as_slice()])?;
         }
+        drop(stmt);
         tx.commit()?;
         Ok(())
     }
 
-    fn get_block_hashes(&self, file_id: i64) -> Result<Vec<Vec<u8>>, SyncError> {
+    fn get_block_hashes(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT hash FROM block_hashes WHERE file_id = ? \
@@ -201,7 +212,11 @@ impl HashStore for SqliteHashStore {
         let mut rows = stmt.query(params![file_id])?;
         let mut hashes = Vec::new();
         while let Some(row) = rows.next()? {
-            hashes.push(row.get(0)?);
+            let hash_blob: Vec<u8> = row.get(0)?;
+            let hash: BlockHash = hash_blob.try_into().map_err(|_| {
+                SyncError::Validation("Invalid block hash length in database".into())
+            })?;
+            hashes.push(hash);
         }
         Ok(hashes)
     }
@@ -232,7 +247,7 @@ impl HashStore for SqliteHashStore {
 #[derive(Debug, Default, Clone)]
 pub struct MockHashStore {
     records: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FileRecord>>>,
-    hashes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, Vec<Vec<u8>>>>>,
+    hashes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, Vec<BlockHash>>>>,
     next_id: std::sync::Arc<std::sync::Mutex<i64>>,
 }
 
@@ -256,7 +271,7 @@ impl HashStore for MockHashStore {
         Ok(records.get(path).cloned())
     }
 
-    fn save_file(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError> {
+    fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
         let mut records = self
             .records
             .lock()
@@ -285,7 +300,7 @@ impl HashStore for MockHashStore {
         Ok(())
     }
 
-    fn get_block_hashes(&self, file_id: i64) -> Result<Vec<Vec<u8>>, SyncError> {
+    fn get_block_hashes(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError> {
         let hashes = self
             .hashes
             .lock()
@@ -349,7 +364,7 @@ mod tests {
             file_size: 2048,
             last_modified: 1234567890,
         };
-        let hashes = vec![vec![1; 32], vec![2; 32]];
+        let hashes = vec![[1u8; 32], [2u8; 32]];
 
         store.save_file(&record, &hashes).unwrap();
 
@@ -360,8 +375,8 @@ mod tests {
 
         let fetched_hashes = store.get_block_hashes(file_id).unwrap();
         assert_eq!(fetched_hashes.len(), 2);
-        assert_eq!(fetched_hashes[0], vec![1; 32]);
-        assert_eq!(fetched_hashes[1], vec![2; 32]);
+        assert_eq!(fetched_hashes[0], [1u8; 32]);
+        assert_eq!(fetched_hashes[1], [2u8; 32]);
 
         // Verify foreign key cascade delete
         store.delete_file("docs/spec.txt").unwrap();
@@ -392,7 +407,7 @@ mod tests {
             file_size: 100,
             last_modified: 1000,
         };
-        store.save_file(&record, &[vec![1; 32]]).unwrap();
+        store.save_file(&record, &[[1u8; 32]]).unwrap();
         let id1 = store.get_file("test.bin").unwrap().unwrap().id.unwrap();
 
         // Update same file — rowid should be preserved
@@ -402,9 +417,7 @@ mod tests {
             file_size: 200,
             last_modified: 2000,
         };
-        store
-            .save_file(&updated, &[vec![2; 32], vec![3; 32]])
-            .unwrap();
+        store.save_file(&updated, &[[2u8; 32], [3u8; 32]]).unwrap();
         let fetched = store.get_file("test.bin").unwrap().unwrap();
         assert_eq!(fetched.id.unwrap(), id1); // Same rowid
         assert_eq!(fetched.file_size, 200);
@@ -427,7 +440,7 @@ mod tests {
                 file_size: 100,
                 last_modified: 9999,
             };
-            store.save_file(&record, &[vec![7; 32]]).unwrap();
+            store.save_file(&record, &[[7u8; 32]]).unwrap();
             assert!(store.get_file("test.bin").unwrap().is_some());
         }
 
@@ -461,8 +474,8 @@ mod tests {
             file_size: 200,
             last_modified: 2000,
         };
-        store.save_file(&r1, &[vec![1; 32]]).unwrap();
-        store.save_file(&r2, &[vec![2; 32]]).unwrap();
+        store.save_file(&r1, &[[1u8; 32]]).unwrap();
+        store.save_file(&r2, &[[2u8; 32]]).unwrap();
 
         let files = store.list_files().unwrap();
         assert_eq!(files, vec!["a_first.txt", "b_second.txt"]);
@@ -485,7 +498,7 @@ mod tests {
             file_size: 1024,
             last_modified: 999,
         };
-        let hashes = vec![vec![0xAA; 32]];
+        let hashes = vec![[0xAAu8; 32]];
         store.save_file(&record, &hashes).unwrap();
 
         let fetched = store.get_file("docs/readme.txt").unwrap().unwrap();
@@ -493,7 +506,7 @@ mod tests {
         let id = fetched.id.unwrap();
 
         let block_hashes = store.get_block_hashes(id).unwrap();
-        assert_eq!(block_hashes, vec![vec![0xAA; 32]]);
+        assert_eq!(block_hashes, vec![[0xAAu8; 32]]);
 
         assert_eq!(store.list_files().unwrap(), vec!["docs/readme.txt"]);
 

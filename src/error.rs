@@ -32,6 +32,10 @@ pub enum SyncError {
     /// System tray creation or event loop failure.
     #[error("Tray error: {0}")]
     Tray(String),
+
+    /// Windows startup registry operation failure.
+    #[error("Registry error: {0}")]
+    Registry(String),
 }
 
 impl SyncError {

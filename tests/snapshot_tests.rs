@@ -90,6 +90,12 @@ fn test_sync_error_display_tray() {
     assert_snapshot!(err.to_string());
 }
 
+#[test]
+fn test_sync_error_display_registry() {
+    let err = SyncError::Registry("Failed to open Run registry key".to_string());
+    assert_snapshot!(err.to_string());
+}
+
 // --- FileRecord Debug Snapshot ---
 
 #[test]

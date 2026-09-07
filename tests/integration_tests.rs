@@ -36,7 +36,7 @@ fn test_integration_config_db_sync_commands() {
         file_size: 4096,
         last_modified: 99999,
     };
-    let hashes = vec![vec![9; 32]; 4];
+    let hashes = vec![[9u8; 32]; 4];
 
     store.save_file(&record, &hashes).unwrap();
     let fetched = store.get_file("test_file.bin").unwrap().unwrap();
