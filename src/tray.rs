@@ -1,5 +1,5 @@
 use crate::error::SyncError;
-use crate::startup::StartupRegistry;
+use crate::startup::RegistryBackend;
 use crate::sync::SyncCommand;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use winit::event_loop::ControlFlow;
 ///
 /// Communicates the connectivity state of the source and destination directories
 /// to the tray interface for visual tray signaling and tooltips.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EngineStatus {
     /// Both source and destination directories are online and accessible.
     Healthy,
@@ -38,6 +38,13 @@ pub enum TrayExitReason {
     UserExit,
     /// User selected "Reload Config" — caller should re-spawn the process.
     Restart,
+}
+
+/// Initial state of a destination target for the system tray interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestinationState {
+    pub path: PathBuf,
+    pub is_online: bool,
 }
 
 /// Per-target status report sent from worker threads to the tray event loop.
@@ -184,13 +191,40 @@ fn generate_status_icon(status: EngineStatus) -> Result<Icon, SyncError> {
     Icon::from_rgba(rgba, size, size).map_err(|e| SyncError::Tray(e.to_string()))
 }
 
+static ICON_CACHE: std::sync::OnceLock<std::collections::HashMap<EngineStatus, Icon>> =
+    std::sync::OnceLock::new();
+
+fn get_cached_icon(status: EngineStatus) -> Result<Icon, SyncError> {
+    let cache = ICON_CACHE.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        for s in [
+            EngineStatus::Healthy,
+            EngineStatus::Degraded,
+            EngineStatus::SourceOffline,
+            EngineStatus::DestinationOffline,
+            EngineStatus::BothOffline,
+        ] {
+            if let Ok(icon) = generate_status_icon(s) {
+                m.insert(s, icon);
+            }
+        }
+        m
+    });
+    cache
+        .get(&status)
+        .cloned()
+        .ok_or_else(|| SyncError::Tray(format!("No icon cached for {:?}", status)))
+}
+
 fn generate_default_icon() -> Result<Icon, SyncError> {
-    generate_status_icon(EngineStatus::Healthy)
+    get_cached_icon(EngineStatus::Healthy)
 }
 
 /// Open a file or directory in the system default application.
 fn open_path(path: &std::path::Path) -> Result<(), SyncError> {
-    std::process::Command::new("explorer.exe")
+    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let explorer = PathBuf::from(sys_root).join("explorer.exe");
+    std::process::Command::new(explorer)
         .arg(path)
         .spawn()
         .map_err(SyncError::Io)?;
@@ -282,23 +316,42 @@ fn show_error_dialog(_title_str: &str, _msg_str: &str) {}
 ///
 /// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
 ///
+/// Creates a tray icon in the Windows notification area with a checkable
+/// context menu and listens for user mouse interactions and directory status updates.
+///
+/// # Arguments
+///
+/// * `event_loop` - The winit event loop initialized on the main UI thread.
+/// * `config_path` - The system path to the user's `config.toml`.
+/// * `log_dir` - The path to the active log directory for manual retrieval.
+/// * `tx` - Sender channel used to dispatch sync commands to the worker.
+/// * `destinations` - Initial destination states with reachability status.
+/// * `registry` - Startup registry backend implementation for managing Windows auto-start.
+///
+/// # Returns
+///
+/// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
+///
 /// # Errors
 ///
 /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
-pub fn run_tray(
+pub fn run_tray<R: RegistryBackend + 'static>(
     event_loop: winit::event_loop::EventLoop<UserEvent>,
     config_path: PathBuf,
     log_dir: PathBuf,
     tx: Sender<SyncCommand>,
-    dests: Vec<PathBuf>,
-    initial_dest_online: Vec<bool>,
+    destinations: Vec<DestinationState>,
+    registry: R,
 ) -> Result<TrayExitReason, SyncError> {
+    let dests: Vec<PathBuf> = destinations.iter().map(|d| d.path.clone()).collect();
+    let initial_dest_online: Vec<bool> = destinations.iter().map(|d| d.is_online).collect();
+
     let open_config = MenuItem::new("Open Config", true, None);
     let reload_config = MenuItem::new("Reload Config", true, None);
     let view_logs = MenuItem::new("View Logs", true, None);
     let sync_now = MenuItem::new("Sync Now", true, None);
 
-    let initially_checked = StartupRegistry::is_registered().unwrap_or(false);
+    let initially_checked = registry.is_registered().unwrap_or(false);
     let startup_toggle =
         CheckMenuItem::new("Start on System Startup", true, initially_checked, None);
 
@@ -414,7 +467,7 @@ pub fn run_tray(
                     } else if menu_event.id == startup_toggle_id {
                         let is_checked = startup_toggle.is_checked();
                         if is_checked {
-                            match StartupRegistry::register() {
+                            match registry.register() {
                                 Ok(()) => {
                                     tracing::info!("Startup auto-run registered via tray menu");
                                 }
@@ -424,7 +477,7 @@ pub fn run_tray(
                                 }
                             }
                         } else {
-                            match StartupRegistry::unregister() {
+                            match registry.unregister() {
                                 Ok(()) => {
                                     tracing::info!("Startup auto-run unregistered via tray menu");
                                 }
@@ -473,7 +526,7 @@ pub fn run_tray(
                 let new_tooltip = state.tooltip_text();
 
                 let _ = tray_icon.set_tooltip(Some(&new_tooltip));
-                if let Ok(new_icon) = generate_status_icon(status) {
+                if let Ok(new_icon) = get_cached_icon(status) {
                     let _ = tray_icon.set_icon(Some(new_icon));
                 }
                 tracing::info!(

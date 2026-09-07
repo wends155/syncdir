@@ -10,7 +10,7 @@ use syncdir::config::Config;
 use syncdir::db::SqliteHashStore;
 use syncdir::error::SyncError;
 use syncdir::sync::{SyncCommand, start_sync_worker};
-use syncdir::tray::{TrayExitReason, run_tray};
+use syncdir::tray::{DestinationState, TrayExitReason, run_tray};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -276,14 +276,20 @@ retry_interval_seconds = 10
 
     // 6. Run tray UI (blocks the main thread)
     tracing::info!("Starting system tray UI loop.");
-    let initial_dest_online = dests.iter().map(|d| d.exists() && d.is_dir()).collect();
+    let destinations: Vec<DestinationState> = dests
+        .into_iter()
+        .map(|d| {
+            let is_online = d.exists() && d.is_dir();
+            DestinationState { path: d, is_online }
+        })
+        .collect();
     let exit_reason = run_tray(
         event_loop,
         config_path,
         log_dir,
         tx,
-        dests,
-        initial_dest_online,
+        destinations,
+        syncdir::startup::StartupRegistry,
     )?;
 
     Ok(exit_reason)
