@@ -74,7 +74,9 @@ proptest! {
         segment2 in "[a-zA-Z0-9]{1,8}",
     ) {
         let malicious_path = format!("../{}/../{}", segment1, segment2);
-        prop_assert!(malicious_path.contains(".."));
+        prop_assert!(!syncdir::sync::is_safe_relative_path(std::path::Path::new(
+            &malicious_path
+        )));
     }
 
     // 5. Source Path Validation Rejection Invariant

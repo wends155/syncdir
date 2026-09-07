@@ -48,14 +48,44 @@ pub enum SyncCommand {
     TriggerFullScan,
 }
 
+/// Outcome of a full directory scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanOutcome {
+    /// All files synced successfully.
+    Success { synced: usize },
+    /// Some files failed to sync.
+    PartialFailure { synced: usize, failed: usize },
+    /// Destination is unreachable.
+    DestinationUnreachable,
+}
+
+/// Observer for sync worker status changes. Decouples sync from UI.
+pub trait SyncStatusObserver: Send + Sync + 'static {
+    fn on_target_status_change(&self, target_index: usize, online: bool);
+}
+
+/// Read exactly `buf.len()` bytes or until EOF, handling partial reads.
+fn read_block<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+    let mut total = 0;
+    while total < buf.len() {
+        match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
+}
+
 /// Core sync execution contract. Implemented by the delta sync engine.
 pub trait SyncEngine {
     /// Synchronize a single file from source to destination.
     fn sync_file(&self, path: &str) -> Result<(), SyncError>;
     /// Handle deletion of a file (archive on destination).
     fn delete_file(&self, path: &str) -> Result<(), SyncError>;
-    /// Perform a full directory scan and sync all changed files. Returns Ok(true) if healthy/clean, or Ok(false) if 100% of files failed to sync.
-    fn run_full_scan(&self) -> Result<bool, SyncError>;
+    /// Perform a full directory scan and sync all changed files.
+    fn run_full_scan(&self) -> Result<ScanOutcome, SyncError>;
 }
 
 /// Delta sync engine backed by a `HashStore` for signature caching.
@@ -82,7 +112,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let mut hashes = Vec::new();
 
         loop {
-            let bytes_read = file.read(&mut buffer)?;
+            let bytes_read = read_block(&mut file, &mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
@@ -135,30 +165,29 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         })?;
         let dest_path = dest_dir.join(&rel_path);
 
-        if !src_path.exists() {
-            return Err(SyncError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Source file not found",
-            )));
-        }
+        let src_meta = fs::metadata(&src_path).map_err(SyncError::Io)?;
+        let src_size = src_meta.len() as i64;
+        let src_mod = safe_modified_millis(&src_meta)?;
 
-        let (src_size, src_mod, src_hashes) = self.calculate_hashes(&src_path)?;
-
-        // Fast-path: metadata match means already in sync
-        if dest_path.exists() {
-            let dest_meta = fs::metadata(&dest_path)?;
+        // Fast-path: metadata match means already in sync (avoids hashing)
+        if dest_path.exists()
+            && let Ok(dest_meta) = fs::metadata(&dest_path)
+        {
             let dest_size = dest_meta.len() as i64;
             let dest_mod = safe_modified_millis(&dest_meta)?;
 
-            if let Some(record) = self.db.get_file(path)?
+            if let Some(ref record) = self.db.get_file(path)?
                 && record.file_size == src_size
                 && record.last_modified == src_mod
                 && dest_size == src_size
                 && (dest_mod - src_mod).abs() <= 2000
             {
+                tracing::debug!(path = path, "Metadata unchanged, skipping sync");
                 return Ok(());
             }
         }
+
+        let (_, _, src_hashes) = self.calculate_hashes(&src_path)?;
 
         // Small file: full copy
         if (src_size as u64) < self.config.block_sync_threshold_bytes {
@@ -194,6 +223,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let dest_existed = dest_path.exists();
         let mut dest_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -202,24 +232,33 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             .open(&dest_path)?;
 
         let file_record = self.db.get_file(path)?;
-        let old_hashes = match &file_record {
-            Some(rec) => {
-                let id = rec.id.ok_or_else(|| {
-                    SyncError::Validation("Corrupted file record: missing ID".to_string())
-                })?;
-                self.db.get_block_hashes(id)?
+        let old_hashes = if dest_existed {
+            match &file_record {
+                Some(rec) => {
+                    let id = rec.id.ok_or_else(|| {
+                        SyncError::Validation("Corrupted file record: missing ID".to_string())
+                    })?;
+                    self.db.get_block_hashes(id)?
+                }
+                None => Vec::new(),
             }
-            None => Vec::new(),
+        } else {
+            Vec::new() // Force all blocks written if destination was deleted
         };
 
         let mut src_file = File::open(&src_path)?;
         let block_size = self.config.block_size_bytes;
         let mut buffer = vec![0; block_size as usize];
+        let mut verify_buf = if self.config.verify_writes {
+            vec![0; block_size as usize]
+        } else {
+            Vec::new()
+        };
 
         for (idx, hash) in src_hashes.iter().enumerate() {
             if old_hashes.get(idx) != Some(hash) {
                 src_file.seek(SeekFrom::Start(idx as u64 * block_size))?;
-                let bytes_read = src_file.read(&mut buffer)?;
+                let bytes_read = read_block(&mut src_file, &mut buffer)?;
                 if bytes_read > 0 {
                     dest_file.seek(SeekFrom::Start(idx as u64 * block_size))?;
                     dest_file.write_all(&buffer[..bytes_read])?;
@@ -227,9 +266,9 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                     // Write-verification: read back and check hash
                     if self.config.verify_writes {
                         dest_file.seek(SeekFrom::Start(idx as u64 * block_size))?;
-                        let mut verify_buf = vec![0; bytes_read];
-                        dest_file.read_exact(&mut verify_buf)?;
-                        let verify_hash = blake3::hash(&verify_buf);
+                        let v_buf = &mut verify_buf[..bytes_read];
+                        dest_file.read_exact(v_buf)?;
+                        let verify_hash = blake3::hash(v_buf);
                         if verify_hash.as_bytes() != hash {
                             return Err(SyncError::Validation(
                                 "Write verification failed".to_string(),
@@ -276,16 +315,29 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         })?;
         let dest_path = dest_dir.join(&rel_path);
 
+        if !dest_dir.exists() {
+            return Err(SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Destination unreachable, skipping DB deletion for {}", path),
+            )));
+        }
+
         if dest_path.exists() && self.config.propagate_deletions {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| {
                     SyncError::Io(std::io::Error::other(format!("System clock error: {e}")))
                 })?
-                .as_secs()
+                .as_millis()
                 .to_string();
 
-            let archive_path = self.get_archive_path(&rel_path, &timestamp)?;
+            let mut archive_path = self.get_archive_path(&rel_path, &timestamp)?;
+            let mut counter = 1u32;
+            while archive_path.exists() {
+                archive_path =
+                    self.get_archive_path(&rel_path, &format!("{}_{}", timestamp, counter))?;
+                counter += 1;
+            }
 
             if let Some(parent) = archive_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -296,7 +348,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         Ok(())
     }
 
-    fn run_full_scan(&self) -> Result<bool, SyncError> {
+    fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
         let resolved_source = self.config.resolved_source_dir();
         if !resolved_source.exists() {
             return Err(SyncError::Validation(
@@ -329,61 +381,49 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                     target = %dest.display(),
                     "Target destination directory does not exist or is unreachable. Skipping full scan."
                 );
-                return Ok(false);
+                return Ok(ScanOutcome::DestinationUnreachable);
             }
         }
 
         let mut source_files = HashSet::new();
-
-        fn scan_dir(
-            dir: &Path,
-            source_root: &Path,
-            files: &mut HashSet<String>,
-        ) -> Result<(), std::io::Error> {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
-                    scan_dir(&path, source_root, files)?;
-                } else if path.is_file()
-                    && let Ok(rel) = path.strip_prefix(source_root)
-                {
-                    files.insert(rel.to_string_lossy().to_string());
-                }
-            }
-            Ok(())
-        }
-
-        scan_dir(&resolved_source, &resolved_source, &mut source_files)?;
+        scan_dir(&resolved_source, &resolved_source, &mut source_files, 0)?;
 
         // Sync all source files
+        let mut synced_count = 0usize;
+        let mut failed_count = 0usize;
         let mut sync_skip_count = 0usize;
         for rel_path in &source_files {
-            if let Err(e) = self.sync_file(rel_path) {
-                let os_code = match &e {
-                    SyncError::Io(io_err) => io_err.raw_os_error(),
-                    _ => None,
-                };
-                if e.is_network_offline() {
+            match self.sync_file(rel_path) {
+                Ok(()) => {
+                    synced_count += 1;
+                }
+                Err(e) => {
+                    failed_count += 1;
+                    let os_code = match &e {
+                        SyncError::Io(io_err) => io_err.raw_os_error(),
+                        _ => None,
+                    };
+                    if e.is_network_offline() {
+                        tracing::warn!(
+                            path = %rel_path,
+                            target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                            error = %e,
+                            os_error = ?os_code,
+                            remaining = source_files.len() - sync_skip_count - 1,
+                            "Target unreachable during full scan, skipping remaining files"
+                        );
+                        sync_skip_count = source_files.len();
+                        break;
+                    }
                     tracing::warn!(
                         path = %rel_path,
                         target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
                         error = %e,
                         os_error = ?os_code,
-                        remaining = source_files.len() - sync_skip_count - 1,
-                        "Target unreachable during full scan, skipping remaining files"
+                        "Skipped file during full scan"
                     );
-                    sync_skip_count = source_files.len();
-                    break;
+                    sync_skip_count += 1;
                 }
-                tracing::warn!(
-                    path = %rel_path,
-                    target = %self.config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
-                    error = %e,
-                    os_error = ?os_code,
-                    "Skipped file during full scan"
-                );
-                sync_skip_count += 1;
             }
         }
         if sync_skip_count > 0 {
@@ -395,12 +435,14 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             );
         }
 
+        // If 100% of files failed to sync (and there were files to sync), destination is inaccessible
+        if !source_files.is_empty() && sync_skip_count == source_files.len() {
+            return Ok(ScanOutcome::DestinationUnreachable);
+        }
+
         // Detect deletions: files in DB but missing from source
         if self.config.propagate_deletions {
             // Empty source directory safety check:
-            // If we found zero files on disk, but the local database cache contains
-            // tracked files, skip deletion propagation. This protects against
-            // mount-points or drives that appear empty due to unmounting.
             if source_files.is_empty() {
                 let tracked = self.db.list_files()?;
                 if !tracked.is_empty() {
@@ -408,7 +450,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                         tracked_count = tracked.len(),
                         "Source directory is empty but cache contains tracked files. Skipping deletion propagation to prevent accidental target wipe."
                     );
-                    return Ok(true);
+                    return Ok(ScanOutcome::Success { synced: 0 });
                 }
             }
 
@@ -441,25 +483,74 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             }
         }
 
-        // If 100% of files failed to sync (and there were files to sync), destination is inaccessible
-        if !source_files.is_empty() && sync_skip_count == source_files.len() {
-            Ok(false)
+        if failed_count > 0 {
+            Ok(ScanOutcome::PartialFailure {
+                synced: synced_count,
+                failed: failed_count,
+            })
         } else {
-            Ok(true)
+            Ok(ScanOutcome::Success {
+                synced: synced_count,
+            })
         }
     }
 }
 
-fn is_safe_relative_path(path: &Path) -> bool {
-    if !path.is_relative() {
+fn scan_dir(
+    dir: &Path,
+    source_root: &Path,
+    files: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), std::io::Error> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        tracing::warn!(path = %dir.display(), "Max directory depth exceeded, skipping");
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            tracing::debug!(path = %entry.path().display(), "Skipping symlink in scan");
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            scan_dir(&path, source_root, files, depth + 1)?;
+        } else if file_type.is_file()
+            && let Ok(rel) = path.strip_prefix(source_root)
+        {
+            files.insert(rel.to_string_lossy().to_string());
+        }
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn is_safe_relative_path(path: &Path) -> bool {
+    if !path.is_relative() || path.as_os_str().is_empty() {
         return false;
     }
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => return false,
-            std::path::Component::RootDir => return false,
-            std::path::Component::Prefix(_) => return false,
-            _ => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return false,
+            std::path::Component::Normal(os_str) => {
+                let s = os_str.to_string_lossy();
+                if s.contains(':') {
+                    return false;
+                }
+                let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+                if RESERVED.contains(&stem.as_str()) {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
     true
@@ -482,12 +573,13 @@ fn is_safe_relative_path(path: &Path) -> bool {
 /// # Returns
 ///
 /// Returns the join handle for the spawned background worker thread.
+#[must_use = "dropping the JoinHandle detaches the sync worker thread"]
 pub fn start_sync_worker<S: HashStore + Send + 'static>(
     target_index: usize,
     config: Config,
     db: S,
     rx: std::sync::mpsc::Receiver<SyncCommand>,
-    event_proxy: Option<winit::event_loop::EventLoopProxy<crate::tray::UserEvent>>,
+    observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
     source_online_atomic: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -548,13 +640,8 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                     }
                     last_sent_dest_online = Some(current_dest_online);
 
-                    if let Some(ref proxy) = event_proxy {
-                        let _ = proxy.send_event(crate::tray::UserEvent::StatusUpdate(
-                            crate::tray::TargetStatusUpdate {
-                                target_index,
-                                dest_online,
-                            },
-                        ));
+                    if let Some(ref obs) = observer {
+                        obs.on_target_status_change(target_index, dest_online);
                     }
                 }
             }
@@ -575,21 +662,33 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                 Ok(SyncCommand::TriggerFullScan) => {
                     if source_online_atomic.load(std::sync::atomic::Ordering::Relaxed) {
                         match engine.run_full_scan() {
-                            Ok(true) => {}
-                            Ok(false) => {
+                            Ok(ScanOutcome::Success { synced }) => {
+                                tracing::info!(synced, "Full scan completed successfully");
+                                if !dest_online {
+                                    dest_online = true;
+                                    last_sent_dest_online = Some(true);
+                                    if let Some(ref obs) = observer {
+                                        obs.on_target_status_change(target_index, true);
+                                    }
+                                }
+                            }
+                            Ok(ScanOutcome::PartialFailure { synced, failed }) => {
+                                tracing::warn!(
+                                    synced,
+                                    failed,
+                                    target_path = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                                    "Full scan completed with partial sync failures"
+                                );
+                            }
+                            Ok(ScanOutcome::DestinationUnreachable) => {
                                 tracing::warn!(
                                     target_path = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
-                                    "Full scan failed all destination file writes. Setting destination status to offline."
+                                    "Full scan destination unreachable. Setting destination status to offline."
                                 );
                                 dest_online = false;
                                 last_sent_dest_online = Some(false);
-                                if let Some(ref proxy) = event_proxy {
-                                    let _ = proxy.send_event(crate::tray::UserEvent::StatusUpdate(
-                                        crate::tray::TargetStatusUpdate {
-                                            target_index,
-                                            dest_online: false,
-                                        },
-                                    ));
+                                if let Some(ref obs) = observer {
+                                    obs.on_target_status_change(target_index, false);
                                 }
                             }
                             Err(e) => {
@@ -624,8 +723,11 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                             target = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
                             error = %e,
                             os_error = ?os_code,
-                            "Sync failed"
+                            "Sync failed, scheduling retry"
                         );
+                        let retry_at = Instant::now()
+                            + std::time::Duration::from_secs(config.retry_interval_seconds);
+                        pending_syncs.insert(path, retry_at);
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "Skipped syncing file: source or destination offline");
@@ -653,8 +755,11 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                             target = %config.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
                             error = %e,
                             os_error = ?os_code,
-                            "Delete failed"
+                            "Deletion failed, scheduling retry"
                         );
+                        let retry_at = Instant::now()
+                            + std::time::Duration::from_secs(config.retry_interval_seconds);
+                        pending_deletes.insert(path, retry_at);
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "Skipped deleting file: destination offline");
@@ -676,6 +781,74 @@ mod tests {
 
     fn test_config(source: PathBuf, dest: PathBuf) -> Config {
         Config::test_default(source, dest)
+    }
+
+    #[test]
+    fn test_read_block_fills_complete_buffer() {
+        struct ChunkyReader {
+            data: Vec<u8>,
+            pos: usize,
+            chunk: usize,
+        }
+        impl std::io::Read for ChunkyReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let rem = &self.data[self.pos..];
+                let n = buf.len().min(self.chunk).min(rem.len());
+                buf[..n].copy_from_slice(&rem[..n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        let data = vec![0xAB; 1024];
+        let mut reader = ChunkyReader {
+            data: data.clone(),
+            pos: 0,
+            chunk: 64,
+        };
+        let mut buf = vec![0u8; 1024];
+        let n = read_block(&mut reader, &mut buf).unwrap();
+        assert_eq!(n, 1024);
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn test_is_safe_relative_path_rejects_empty() {
+        assert!(!is_safe_relative_path(std::path::Path::new("")));
+    }
+
+    #[test]
+    fn test_is_safe_relative_path_rejects_reserved_names() {
+        assert!(!is_safe_relative_path(std::path::Path::new("CON")));
+        assert!(!is_safe_relative_path(std::path::Path::new(
+            "subdir\\NUL.txt"
+        )));
+        assert!(!is_safe_relative_path(std::path::Path::new("COM1")));
+    }
+
+    #[test]
+    fn test_is_safe_relative_path_rejects_ads() {
+        assert!(!is_safe_relative_path(std::path::Path::new(
+            "file.txt:stream"
+        )));
+    }
+
+    #[test]
+    fn test_scan_dir_skips_symlinks() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("real.txt"), "content").unwrap();
+        #[cfg(windows)]
+        {
+            let external = tmp.path().join("external");
+            fs::create_dir_all(&external).unwrap();
+            fs::write(external.join("secret.txt"), "sensitive").unwrap();
+            let _ = std::os::windows::fs::symlink_dir(&external, src.join("link"));
+        }
+        let mut files = std::collections::HashSet::new();
+        scan_dir(&src, &src, &mut files, 0).unwrap();
+        assert!(files.contains("real.txt"));
+        assert!(!files.iter().any(|f| f.contains("secret")));
     }
 
     #[test]
@@ -988,8 +1161,14 @@ mod tests {
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, config);
 
-        // Run full scan: should return Ok(true) because good.txt succeeded despite "bad/nested.txt" failing
-        assert!(engine.run_full_scan().unwrap());
+        // Run full scan: should return PartialFailure because good.txt succeeded despite "bad/nested.txt" failing
+        assert!(matches!(
+            engine.run_full_scan().unwrap(),
+            ScanOutcome::PartialFailure {
+                synced: 1,
+                failed: 1
+            }
+        ));
 
         // "good.txt" should be successfully synced
         assert!(dest.join("good.txt").exists());
@@ -1021,8 +1200,11 @@ mod tests {
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, config);
 
-        // Run full scan: 100% of files fail (1/1 file failed), so run_full_scan returns Ok(false)
-        assert!(!engine.run_full_scan().unwrap());
+        // Run full scan: 100% of files fail (1/1 file failed), so run_full_scan returns DestinationUnreachable
+        assert_eq!(
+            engine.run_full_scan().unwrap(),
+            ScanOutcome::DestinationUnreachable
+        );
     }
 
     #[test]
@@ -1037,9 +1219,11 @@ mod tests {
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, config);
 
-        // When dest_dir is missing, run_full_scan returns Ok(false) immediately
-        let result = engine.run_full_scan().unwrap();
-        assert!(!result);
+        // When dest_dir is missing, run_full_scan returns DestinationUnreachable immediately
+        assert_eq!(
+            engine.run_full_scan().unwrap(),
+            ScanOutcome::DestinationUnreachable
+        );
     }
 
     #[test]

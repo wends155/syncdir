@@ -15,6 +15,23 @@ use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+struct WinitStatusObserver {
+    proxy: winit::event_loop::EventLoopProxy<syncdir::tray::UserEvent>,
+}
+
+impl syncdir::sync::SyncStatusObserver for WinitStatusObserver {
+    fn on_target_status_change(&self, target_index: usize, online: bool) {
+        let _ = self
+            .proxy
+            .send_event(syncdir::tray::UserEvent::StatusUpdate(
+                syncdir::tray::TargetStatusUpdate {
+                    target_index,
+                    dest_online: online,
+                },
+            ));
+    }
+}
+
 fn try_main(app_dir: PathBuf) -> Result<TrayExitReason, SyncError> {
     let log_dir = app_dir.join("logs");
     tracing::info!("Initializing syncdir daemon...");
@@ -149,6 +166,11 @@ retry_interval_seconds = 10
         let (w_tx, w_rx) = channel();
         worker_txs.push(w_tx);
 
+        let status_observer: std::sync::Arc<dyn syncdir::sync::SyncStatusObserver> =
+            std::sync::Arc::new(WinitStatusObserver {
+                proxy: event_proxy.clone(),
+            });
+
         tracing::info!(
             "Starting sync worker thread for target: {}...",
             dest.display()
@@ -158,7 +180,7 @@ retry_interval_seconds = 10
             target_config,
             store,
             w_rx,
-            Some(event_proxy.clone()),
+            Some(status_observer),
             source_online.clone(),
         );
     }
