@@ -89,6 +89,9 @@ pub fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
         ) -> u32;
     }
 
+    // SAFETY: `local_name` is a null-terminated UTF-16 wide string pointing to a valid drive prefix.
+    // `buf` is pre-allocated with 512 `u16` elements and `len` accurately reflects its capacity.
+    // `WNetGetConnectionW` reads from `local_name` up to its null terminator and writes at most `len` elements to `buf`.
     let ret = unsafe { WNetGetConnectionW(local_name.as_ptr(), buf.as_mut_ptr(), &mut len) };
     if ret == 0 {
         let unc_str = String::from_utf16_lossy(&buf[..len as usize])
@@ -131,19 +134,28 @@ pub fn try_resolve_unc_path(path: &Path) -> PathBuf {
 
 /// Establish or refresh a Win32 SMB network connection for a UNC path using `WNetAddConnection2W`.
 /// Leverages stored credentials in Windows Credential Manager or session tokens.
-/// Returns `true` if `WNetAddConnection2W` succeeded or connection already exists.
+///
+/// # Errors
+/// Returns `SyncError::Validation` if the path is not a valid UNC path or share,
+/// or `SyncError::Io` if `WNetAddConnection2W` fails.
 #[cfg(target_os = "windows")]
-pub fn establish_smb_connection(unc_path: &Path) -> bool {
+pub fn establish_smb_connection(unc_path: &Path) -> Result<(), SyncError> {
     use std::os::windows::ffi::OsStrExt;
     let s = unc_path.to_string_lossy();
     if !s.starts_with(r"\\") {
-        return false;
+        return Err(SyncError::Validation(format!(
+            "Path '{}' is not a UNC network path",
+            unc_path.display()
+        )));
     }
 
     // Extract root share e.g. "\\172.16.0.193\Files" or "\\172.16.0.193\ABB Industrial IT Data"
     let parts: Vec<&str> = s[2..].split('\\').collect();
     if parts.len() < 2 {
-        return false;
+        return Err(SyncError::Validation(format!(
+            "UNC path '{}' does not contain a share name",
+            unc_path.display()
+        )));
     }
     let unc_share = format!(r"\\{}\{}", parts[0], parts[1]);
 
@@ -187,15 +199,25 @@ pub fn establish_smb_connection(unc_path: &Path) -> bool {
         lpProvider: std::ptr::null(),
     };
 
+    // SAFETY: `nr.lpRemoteName` points to a null-terminated UTF-16 wide string (`unc_share_w`)
+    // that remains valid for the duration of this call. All other pointer fields in NETRESOURCEW
+    // and the function arguments are null pointers, which is permitted by WNetAddConnection2W
+    // when using default/cached credentials and establishing an unmapped connection.
     let ret = unsafe { WNetAddConnection2W(&nr, std::ptr::null(), std::ptr::null(), 0) };
 
     // 0 = NO_ERROR, 85 = ERROR_ALREADY_ASSIGNED, 1219 = ERROR_SESSION_CREDENTIAL_CONFLICT
-    ret == 0 || ret == 85 || ret == 1219
+    if ret == 0 || ret == 85 || ret == 1219 {
+        Ok(())
+    } else {
+        Err(SyncError::Io(std::io::Error::from_raw_os_error(ret as i32)))
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn establish_smb_connection(_unc_path: &Path) -> bool {
-    false
+pub fn establish_smb_connection(_unc_path: &Path) -> Result<(), SyncError> {
+    Err(SyncError::Validation(
+        "SMB connection is only supported on Windows".into(),
+    ))
 }
 
 /// Reverse-lookup active Win32 mapped drive letters ('A'..='Z') to find a drive letter
@@ -212,11 +234,14 @@ pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
         if let Some(mapped_unc) = resolve_mapped_drive_unc(&drive_prefix) {
             let mapped_lower = mapped_unc.trim_end_matches('\\').to_lowercase();
             if !mapped_lower.is_empty() && unc_str.starts_with(&mapped_lower) {
-                let relative = unc_str[mapped_lower.len()..].trim_start_matches('\\');
-                if relative.is_empty() {
-                    return Some(PathBuf::from(format!(r"{}\", drive_prefix)));
-                } else {
-                    return Some(PathBuf::from(format!(r"{}\{}", drive_prefix, relative)));
+                let rest = &unc_str[mapped_lower.len()..];
+                if rest.is_empty() || rest.starts_with('\\') {
+                    let relative = rest.trim_start_matches('\\');
+                    if relative.is_empty() {
+                        return Some(PathBuf::from(format!(r"{}\", drive_prefix)));
+                    } else {
+                        return Some(PathBuf::from(format!(r"{}\{}", drive_prefix, relative)));
+                    }
                 }
             }
         }
@@ -246,7 +271,7 @@ pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
         let unc_path = try_resolve_unc_path(&normalized);
         if unc_path != normalized {
             // Attempt establishing SMB session on resolved UNC share
-            establish_smb_connection(&unc_path);
+            let _ = establish_smb_connection(&unc_path);
             if matches!(std::fs::metadata(&unc_path), Ok(m) if m.is_dir()) {
                 return unc_path;
             }
@@ -256,7 +281,7 @@ pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
     // Case 2: UNC path (e.g. "\\172.16.0.193\Files")
     if s.starts_with(r"\\") {
         // Attempt SMB session establishment on UNC path
-        establish_smb_connection(&normalized);
+        let _ = establish_smb_connection(&normalized);
         if matches!(std::fs::metadata(&normalized), Ok(m) if m.is_dir()) {
             return normalized;
         }
@@ -401,6 +426,16 @@ impl Config {
         if self.retry_interval_seconds == 0 {
             return Err(SyncError::Validation(
                 "Retry interval seconds must be greater than zero".into(),
+            ));
+        }
+        if self.block_size_bytes == 0 {
+            return Err(SyncError::Validation(
+                "block_size_bytes must be greater than zero".into(),
+            ));
+        }
+        if self.block_sync_threshold_bytes == 0 {
+            return Err(SyncError::Validation(
+                "block_sync_threshold_bytes must be greater than zero".into(),
             ));
         }
         Ok(())
@@ -863,8 +898,14 @@ mod tests {
 
     #[test]
     fn test_establish_smb_connection_non_unc() {
-        // Non-UNC path should safely return false without crashing
-        assert!(!establish_smb_connection(Path::new(r"C:\LocalFolder")));
+        // Non-UNC path should safely return Err without crashing
+        assert!(establish_smb_connection(Path::new(r"C:\LocalFolder")).is_err());
+    }
+
+    #[test]
+    fn test_find_mapped_drive_boundary_no_false_match() {
+        // UNC path with non-existent host should safely return None
+        assert!(find_mapped_drive_for_unc(Path::new(r"\\nonexistent_host_12345\share")).is_none());
     }
 
     #[test]
@@ -1057,6 +1098,31 @@ mod tests {
                 || err_msg.contains("invalid"),
             "Error message should mention parsing failure: {}",
             err_msg
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_block_size() {
+        let mut config =
+            Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"C:\dest"));
+        config.block_size_bytes = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("block_size_bytes"));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_threshold() {
+        let mut config =
+            Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"C:\dest"));
+        config.block_sync_threshold_bytes = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("block_sync_threshold_bytes")
         );
     }
 }

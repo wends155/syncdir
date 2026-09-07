@@ -61,6 +61,22 @@ fn test_config_validation_error_invalid_relative_source() {
     assert_snapshot!(err.to_string());
 }
 
+#[test]
+fn test_config_validation_error_zero_block_size() {
+    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
+    config.block_size_bytes = 0;
+    let err = config.validate().unwrap_err();
+    assert_snapshot!(err.to_string());
+}
+
+#[test]
+fn test_config_validation_error_zero_threshold() {
+    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
+    config.block_sync_threshold_bytes = 0;
+    let err = config.validate().unwrap_err();
+    assert_snapshot!(err.to_string());
+}
+
 // --- SyncError Display Snapshots ---
 
 #[test]

@@ -10,6 +10,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::sync::mpsc::Sender;
 
 /// Watches a source directory for file changes and deletions.
+#[must_use = "dropping DirectoryWatcher immediately unregisters OS directory notifications"]
 pub struct DirectoryWatcher {
     _watcher: RecommendedWatcher,
 }
