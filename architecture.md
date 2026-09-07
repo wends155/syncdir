@@ -60,34 +60,35 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), path compatibility filtering (`normalize_path` converting forward slashes `/` -> `\`, trimming quotes/whitespace/trailing slashes), defensive single-to-double backslash normalization (`\172...` -> `\\172...`), strict path format validation (`Config::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\` supporting mapped Windows drives), optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, Win32 mapped drive UNC resolution via `resolve_mapped_drive_unc` (queries `WNetGetConnectionW` to translate drive letters like `R:` to their underlying UNC network paths), mapped drive reachability fallback via `try_resolve_unc_path`, automatic SMB network session initialization via `establish_smb_connection` (`WNetAddConnection2W` FFI using cached Windows Credential Manager entries), automatic struct path normalization via `normalize_paths(&mut self)` applied at `Config::load()` and `Config::test_default()`, and runtime settings.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), path compatibility filtering (`normalize_path` converting forward slashes `/` -> `\`, trimming quotes/whitespace/trailing slashes), defensive single-to-double backslash normalization (`\172...` -> `\\172...`), strict path format validation (`Config::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\` supporting mapped Windows drives), block size and threshold positivity validation (`block_size_bytes > 0`, `block_sync_threshold_bytes > 0`), optional `dest_dir` and `dest_dirs` support, multi-destination merging via `resolved_dest_dirs()`, Win32 mapped drive UNC resolution via `resolve_mapped_drive_unc` (queries `WNetGetConnectionW` to translate drive letters like `R:` to their underlying UNC network paths), path boundary checks in `find_mapped_drive_for_unc`, mapped drive reachability fallback via `try_resolve_unc_path`, automatic SMB network session initialization returning `Result<(), SyncError>` via `establish_smb_connection` (`WNetAddConnection2W` FFI using cached Windows Credential Manager entries), automatic struct path normalization via `normalize_paths(&mut self)` applied at `Config::load()` and `Config::test_default()`, and runtime settings.
 * **Does NOT own**: Filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 
 ### `db`
-* **Owns**: Connection management to isolated local SQLite databases, SQL schemas, recording and retrieving file metadata and block signatures. Generates separate cache database files (`sigcache_<hash>.db`) named using the Blake3 hash of the target path to prevent collisions.
+* **Owns**: Connection management to isolated local SQLite databases with WAL mode (`PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, `foreign_keys = ON`), composite index `idx_block_hashes_file_block` on `(file_id, block_index)`, prepared statement caching (`prepare_cached`), schema versioning (`db_version = "3"`), recording and retrieving file metadata and fixed 32-byte block digests (`BlockHash = [u8; 32]`). Generates separate cache database files (`sigcache_<hash>.db`) named using the Blake3 hash of the target path to prevent collisions.
 * **Does NOT own**: Calculating block hashes or filesystem read/writes.
 * **Trait Interfaces**:
-  * `HashStore`: Interface for persisting and querying file block signatures.
+  * `HashStore`: Interface for persisting and querying file block signatures (`BlockHash`).
 * **Mock Availability**: `MockHashStore` (implemented in `src/db.rs`) for in-memory unit testing.
 
 ### `sync`
-* **Owns**: Scanning directory trees, comparing source/destination state with ±2000 ms SMB timestamp tolerance, hashing files in 1MB blocks via Blake3, performing in-place block updates, emitting structured `tracing::info!` file copy telemetry (`path`, `target`, `size`), handling deletions (moving to archive), and running concurrent background worker loops (`start_sync_worker`) spawned per target destination folder.
+* **Owns**: Scanning directory trees with symlink skipping and recursion depth limits (`scan_dir`), path safety validation (`is_safe_relative_path` rejecting empty paths, ADS colons, parent traversal, and Windows reserved names like CON/NUL/COM1-9/LPT1-9), comparing source/destination state with ±2000 ms SMB timestamp tolerance, fast-path metadata bypass before hashing, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, emitting structured `tracing::info!` file copy telemetry (`path`, `target`, `size`), handling deletions with collision-resistant millisecond timestamps and offline destination reachability guards, and running background worker loops (`start_sync_worker`) notifying UI/status listeners via the decoupled `SyncStatusObserver` trait with automatic transient error retry scheduling. Returns structured `ScanOutcome` (`Success`, `PartialFailure`, `DestinationUnreachable`) from `run_full_scan`.
 * **Does NOT own**: Watching directories, UI interactions.
 * **Trait Interfaces**:
   * `SyncEngine`: Core sync execution controller.
+  * `SyncStatusObserver`: Decoupled listener interface for target destination connectivity transitions.
 * **Mock Availability**: `MockSyncEngine` for UI/tray triggers.
 
 ### `monitor`
-* **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`), debouncing file events, and broadcasting `SyncCommand` events to multiple destination sync workers via crossbeam/std mpsc channels.
+* **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`) wrapped in `#[must_use]` `DirectoryWatcher`, debouncing file events, and broadcasting `SyncCommand` events to multiple destination sync workers via crossbeam/std mpsc channels.
 * **Does NOT own**: Sync execution (delegates to `SyncEngine` worker threads).
 
 ### `main`
-* **Owns**: Application entry point, CLI argument parsing, single-instance process mutex acquisition (`acquire_single_instance_mutex` / `SingleInstanceGuard`), dual-writer logging setup, system diagnostic telemetry collection, panic hook registration, and process restart handoff.
+* **Owns**: Application entry point, CLI argument parsing, single-instance process mutex acquisition (`acquire_single_instance_mutex` / `SingleInstanceGuard`), dual-writer logging setup, system diagnostic telemetry collection, panic hook registration, process restart handoff (dropping mutex guard before spawning new process), and `WinitStatusObserver` adapter connecting `start_sync_worker` to the tray event loop.
 * **Does NOT own**: Filesystem watching, tray menu construction, or SQLite database operations.
 
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), managing `TrayState` (pure state container tracking engine health status transitions, online destination counts, and tooltip text formatting without Win32/winit UI side-effects), and toggling Windows startup registration.
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), managing `TrayState` (pure state container tracking engine health status transitions, online destination counts, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping, thread-safe icon caching (`ICON_CACHE` via `OnceLock`), qualified `%SystemRoot%\explorer.exe` process execution, and toggling Windows startup registration via injected `RegistryBackend` trait (`run_tray<R: RegistryBackend + 'static>`).
 * **Does NOT own**: Filesystem watching or database execution.
 
 ### `startup`
@@ -103,7 +104,7 @@ syncdir/
 
 | Module | May Import | Must NOT Import |
 |--------|-----------|-----------------|
-| `tray` | `sync`, `config`, `monitor`, `error`, `startup` | `db` (direct) |
+| `tray` | `sync`, `config`, `monitor`, `error`, `startup` (trait) | `db` (direct) |
 | `monitor` | `sync`, `config`, `error` | `db`, `tray` |
 | `sync` | `db` (trait), `config`, `error` | `monitor`, `tray` |
 | `db` | `config`, `error` | `sync`, `monitor`, `tray` |
@@ -124,6 +125,7 @@ syncdir/
 * Swallowing errors is strictly prohibited. If a sync fails (e.g. network share disconnects), it logs the warning and schedules a retry.
 * Error propagation uses the standard `?` operator.
 * **Network Disconnect Classification**: `SyncError::is_network_offline()` inspects `std::io::Error::raw_os_error()` for Win32 SMB disconnect codes (53 `ERROR_BAD_NETPATH`, 59 `ERROR_UNEXP_NET_ERR`, 64 `ERROR_NETNAME_DELETED`, 67 `ERROR_BAD_NET_NAME`).
+* **Registry Errors**: `SyncError::Registry(String)` cleanly isolates Windows Startup Registry failures from generic configuration parsing errors.
 * **Panic-Free Architecture**: Production code contains zero `.unwrap()` or `.expect()` calls. Methods like `get_archive_path()` return `Result<PathBuf, SyncError>` propagating `SyncError::Validation` when `dest_dir` is unconfigured.
 * **Timestamp Safety**: File modification timestamps are normalized via `safe_modified_millis()` (clamping pre-1970 timestamps to 0 with warning logs) and restored via `safe_epoch_duration_millis()` (preventing wrapping integer underflow on `src_mod as u64`).
 
@@ -136,10 +138,10 @@ syncdir/
 * **Log Levels**: `INFO` for file copy telemetry and target reachability, `WARN` for recoverable errors/unreachable targets, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
-* **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs`, `src/db.rs`, `src/sync.rs`, `src/startup.rs`, and `src/tray.rs` (testing `TrayState` status transitions and tooltip text formatting).
-* **Integration Tests**: `tests/integration_tests.rs` simulating standard files, deletions, directory updates, and configuration reload validation using `tempfile`.
-* **Snapshot Tests**: `tests/snapshot_tests.rs` using `insta` (v1) for regression-guarding snapshot assertions on `Config` debug formatting, validation errors, `SyncError` display output, and `FileRecord` structures.
-* **Property-Based Tests**: `tests/property_tests.rs` using `proptest` (v1) for invariant validation (block boundary division, TOML round-tripping, SMB timestamp tolerance, path traversal safety, sync idempotency, and delta sync single-block isolation).
+* **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation), `src/db.rs` (CRUD, cascade deletion, BlockHash signatures), `src/sync.rs` (buffered reads via `read_block`, symlink skipping, path safety via `is_safe_relative_path`, metadata fast-path), `src/startup.rs`, and `src/tray.rs` (testing `TrayState` status transitions and tooltip text formatting).
+* **Integration Tests**: `tests/integration_tests.rs` simulating standard files, deletions, directory updates, configuration reload validation, and `run_tray` interface compilation.
+* **Snapshot Tests**: `tests/snapshot_tests.rs` using `insta` (v1) for regression-guarding snapshot assertions on `Config` debug formatting, validation errors (including zero block size/threshold), `SyncError` display output (including `SyncError::Registry`), and `FileRecord` structures.
+* **Property-Based Tests**: `tests/property_tests.rs` using `proptest` (v1) for invariant validation (block boundary division, TOML round-tripping, SMB timestamp tolerance, path traversal safety wired directly to `is_safe_relative_path`, sync idempotency, and delta sync single-block isolation).
 * **Assertions & Structural Diffing**: `pretty_assertions` (v1) for colorized diff output on test failure assertions across all test modules.
 * **Shared Test Fixtures**: `Config::test_default()` helper for consistent test configuration across unit and integration tests.
 * **In-Memory Mocks**: `MockHashStore` (`src/db.rs`) and `MockStartupRegistry` (`src/startup.rs`) for isolated in-memory unit testing without disk or registry side-effects.
@@ -214,7 +216,8 @@ sequenceDiagram
 * **Network Latency**: If the network connection to a destination mapped share drops, `syncdir` will record the failure for that specific target worker, skip sync for the file, and attempt to sync during the next periodic scan or when the share becomes reachable.
 * **Local DB Location**: Stored in `%APPDATA%\syncdir\sigcache_<hash>.db` (where `<hash>` is the Blake3 hash of the destination directory path). If deleted, it will rebuild automatically during the next full scan by hashing the source directory.
 * **UNC Path TOML Escaping Gotcha**: In standard TOML, double-quoted strings (`"\\172.16.0.60\share"`) unescape `\\` to a single backslash (`\172.16...`). `syncdir` works around this by pre-processing TOML strings to convert `\\` to `\\\\` before parsing, defensively auto-correcting single-leading-backslash UNC paths (`\172...` -> `\\172...`), and recommending single-quoted literal strings (`'\\172.16.0.60\share'`) or forward slashes (`"//172.16.0.60/share"`).
-* **Startup Registry Decoupling**: `RegistryBackend` trait and `MockStartupRegistry` exist for trait-based unit testing, but `run_tray` in `src/tray.rs` calls `StartupRegistry` static methods directly. Dependency injection for `run_tray` is deferred as design debt until a second UI surface is introduced.
+* **Startup Registry Decoupling**: Fully resolved via DIP refactoring (`run_tray<R: RegistryBackend + 'static>` receives registry backend implementation by value, decoupling UI from static Win32 registry calls).
+* **Database Version 3 & Schema Migration**: With `db_version` bumped to `"3"`, SQLite PRAGMAs enable WAL mode, foreign keys, normal synchronization, and a composite index on `block_hashes(file_id, block_index)`. Any previous database caches from version `"2"` are automatically invalidated and rebuilt on initial startup.
 
 ## 15. Data Model
 
@@ -232,7 +235,10 @@ sequenceDiagram
 | `id` | INTEGER | PK, AUTOINCREMENT | Block record ID |
 | `file_id` | INTEGER | FK (file_metadata.id) ON DELETE CASCADE | Reference to file |
 | `block_index` | INTEGER | NOT NULL | Zero-indexed chunk position |
-| `hash` | BLOB | NOT NULL | Blake3 256-bit hash (32 bytes) |
+| `hash` | BLOB | NOT NULL | Blake3 256-bit hash (32 bytes: `BlockHash`) |
+
+* **Indexes**: `idx_block_hashes_file_block` on `block_hashes (file_id, block_index)` for O(log N) block lookup performance.
+* **PRAGMAs**: `journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = ON`, `temp_store = MEMORY`.
 
 ```mermaid
 erDiagram
@@ -252,7 +258,7 @@ erDiagram
 ```
 
 ### Migration Strategy
-Migrations are managed in `src/db.rs` programmatically. At startup, `db` runs a `CREATE TABLE IF NOT EXISTS` statement for both tables to guarantee schema availability.
+Migrations are managed in `src/db.rs` programmatically. At startup, `db` runs a `CREATE TABLE IF NOT EXISTS` statement for both tables and creates the composite index to guarantee schema availability. Metadata table checks enforce `db_version` compatibility.
 
 ## 16. Environment Configuration
 No external APIs or environment variables are required. Configuration is loaded entirely from `%APPDATA%\syncdir\config.toml` containing:
