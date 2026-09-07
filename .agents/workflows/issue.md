@@ -26,6 +26,8 @@ User invokes: `/issue <description>`
 > **Execution Discipline:** You **MUST** use the `view_file` tool to read all listed rule files (e.g., `.agents/rules/...`) before starting Step 1. Do not rely on internal memory.
 
 - Read `.agents/rules/issue-rules.md` for classification criteria, report format, and investigation depth.
+- Read `global/skills/issue-investigator/SKILL.md` — skill to spawn the diagnostic investigation subagent.
+- Read `global/skills/codebase-recon/SKILL.md` — skill to spawn the structural reconnaissance subagent.
 - Read `architecture.md` (if present) for project structure, components, and toolchain.
 - Read `context.md` (if present) for historical decisions and known issues.
 - Confirm you are operating as the **Architect** role.
@@ -64,38 +66,86 @@ Gather background information:
 - **`git log -n 20`**: Review recent commits for changes in the affected area.
 - **Existing issues/TODOs**: Search for related `TODO`, `FIXME`, `HACK` comments in the codebase.
 
+### 2.5 Scope Triage
+
+Before investigating, assess the investigation approach:
+- **medium/high/critical severity** → Spawn subagents in parallel (Step 3).
+- **low severity** → Architect investigates inline (lightweight — affected files only).
+- Determine which subagents to spawn:
+  - **issue-investigator**: Spawn for all medium/high/critical issues. Handles diagnostic research, root cause analysis, test coverage, and issue localization.
+  - **codebase-recon**: Spawn for all medium/high/critical issues. Handles blast radius analysis, call graph mapping (callers/callees), and dependency impact.
+
+> [!NOTE]
+> **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode),
+> the Architect executes Step 3 inline — performing the investigation directly.
+> The step structure remains the same; only the executor changes.
+
 ### 3. Investigate
 
-Search the codebase to understand the problem area:
+#### Subagent-Orchestrated Investigation *(medium/high/critical — default)*
 
-- **Identify suspect files**: `grep` / `ripgrep` for keywords related to the issue.
+Spawn both subagents **in parallel**. Follow the respective skill instructions for each:
+
+**A. Issue Investigator** (diagnostic research):
+> 📘 **Skill:** [`issue-investigator`](../../global/skills/issue-investigator/SKILL.md) — spawn the diagnostic investigation subagent
+
+1. Load and follow the `issue-investigator` skill.
+2. Call `define_subagent` if `issue_investigator` is not yet defined.
+3. Call `invoke_subagent` adhering to the mandatory prompt contract:
+   - Pass the **severity level**, **affected component**, **keywords** from the issue description, and any context gathered in Step 2.
+   - Include `Repository Workspace: <path>` (explicit workspace root path).
+   - Include boundary reminder: `"Confine all searches strictly to the repository workspace; never search parent or user directories."`
+   - Include report formatting reminder: `"Format findings strictly following the report template provided in your system prompt."`
+   - Announce the model per `GEMINI.md §10` (`flash`).
+
+**B. Codebase Recon** (blast radius & call graph):
+> 📘 **Skill:** [`codebase-recon`](../../global/skills/codebase-recon/SKILL.md) — spawn the structural reconnaissance subagent
+
+1. Load and follow the `codebase-recon` skill.
+2. Call `define_subagent` if `codebase_recon` is not yet defined.
+3. Call `invoke_subagent` adhering to the mandatory prompt contract:
+   - Pass the **affected component/area** and instruct it to focus on blast radius mapping, `get_callers`/`get_callees`/`get_call_graph` around the issue area.
+   - Include `Repository Workspace: <path>` (explicit workspace root path).
+   - Include boundary reminder: `"Confine all searches strictly to the repository workspace; never search parent or user directories."`
+   - Include report formatting reminder: `"Format findings strictly following the report template provided in your system prompt."`
+   - Announce the model per `GEMINI.md §10` (`flash`).
+
+Both subagents are spawned in the **same `invoke_subagent` call block** (parallel).
+
+4. **Stop calling tools** and wait for both subagents to return their reports.
+
+#### Inline Investigation *(low severity or single-agent fallback)*
+
+When investigating inline, search the codebase to understand the problem area:
+
+- **Identify affected files**: `grep` / `ripgrep` for keywords related to the issue.
 - **Read relevant code**: Outline the affected functions/modules.
 - **Map dependencies**: What calls into or depends on the affected code?
 - **Query knowledge-rag**: Search for dependency API docs or patterns related to the issue (e.g., `search_knowledge "crate:notify event debounce"`). Use indexed context before resorting to web search.
 - **Look for obvious causes**: Missing error handling, logic errors, race conditions, etc.
 - **Check tests**: Are there existing tests covering this area? Are they passing?
 
-#### MCP-Enhanced Investigation *(when available)*
-
-If **Narsil MCP** is available, use it to improve investigation accuracy:
-- **Code search & navigation**: `search_code`, `semantic_search`, `search_chunks` — find relevant code faster than manual grep.
-- **Structural investigation**: `get_callers`, `get_callees`, `find_call_path` — trace the bug's propagation path and structural dependencies.
-- **Complexity analysis**: `get_complexity`, `get_function_hotspots` — identify high-risk, brittle code areas.
-- **Taint tracking**: `trace_taint`, `get_typed_taint_flow` — trace data flow from untrusted sources to sinks.
-- **Security scanning**: `scan_security`, `check_owasp_top10`, `check_cwe_top25` — if the issue has security implications.
-
-For **critical/high** severity issues, the Architect **SHOULD** use `sequentialthinking` to:
-- Structure complex, multi-factor investigations step by step.
-- Avoid jumping to conclusions by reasoning through causes systematically.
-- Evaluate and discard competing hypotheses before settling on a root cause.
-
-For **medium/low** severity, skip sequential thinking — the overhead isn't worth it.
-
 Scale investigation depth per `issue-rules.md` §3.
 
+### 3.5 Architect Diagnostic Synthesis
+
+Read **both** reports returned by the subagents:
+- **Issue Investigation Report** → Root cause analysis, issue location (module/file/function), test coverage, related history.
+- **Codebase Reconnaissance Report** → Blast Radius Table, dependency map (callers/callees), complexity hotspots, reuse opportunities.
+
+Synthesize the two reports:
+- Cross-reference the investigation's root cause against the recon's blast radius — does the root cause explain the downstream impact?
+- Merge the issue location (from investigation) with the call graph context (from recon) to build the complete picture.
+- For **critical/high** severity issues, use `sequentialthinking` to:
+  - Structure complex, multi-factor investigations step by step.
+  - Evaluate and discard competing hypotheses before settling on a root cause.
+  - Assess whether the investigation report's root cause analysis is convincing given the blast radius data.
+- For **medium** severity, validate the reports' findings with brief spot-checks if anything seems off.
+- Flag any gaps or contradictions between the two reports.
+
 > [!TIP]
-> Keep investigation focused. The goal is to understand the problem well enough to
-> write a clear report — not to find the exact fix (that's for `/plan-making`).
+> Keep synthesis focused. The goal is to validate the subagents' findings and
+> add architectural judgment — not to re-investigate everything.
 
 ### 4. Produce Issue Report
 
@@ -131,6 +181,6 @@ End the report with:
 3. **Always pause** — the user must explicitly say "Plan" to move forward.
 4. **Ask early** — if the issue is ambiguous, ask questions in Step 1, not Step 4.
 5. **Stay focused** — investigate just enough to produce a clear report; avoid rabbit holes.
-6. **Use MCP tools** — when Narsil or Sequential Thinking are available, prefer them over manual grep/search for higher accuracy.
+6. **Use subagents** — when `invoke_subagent` is available, delegate investigation to `issue-investigator` and `codebase-recon` subagents in parallel for medium/high/critical issues. When Narsil or Sequential Thinking MCP are available in single-agent fallback, prefer them over manual grep/search.
 
 
