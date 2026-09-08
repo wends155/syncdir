@@ -5,13 +5,16 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
+use std::thread::JoinHandle;
 use syncdir::config::Config;
 use syncdir::db::SqliteHashStore;
 use syncdir::error::SyncError;
 use syncdir::startup::RegistryBackend;
-use syncdir::sync::{SyncCommand, start_sync_worker};
-use syncdir::tray::{DestinationState, TrayExitReason, run_tray};
+use syncdir::sync::{SyncCommand, SyncStatusObserver, start_sync_worker};
+use syncdir::tray::{DestinationState, TrayActionHandler, TrayExitReason, run_tray};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -20,7 +23,7 @@ struct WinitStatusObserver {
     proxy: winit::event_loop::EventLoopProxy<syncdir::tray::UserEvent>,
 }
 
-impl syncdir::sync::SyncStatusObserver for WinitStatusObserver {
+impl SyncStatusObserver for WinitStatusObserver {
     fn on_target_status_change(&self, target_index: usize, online: bool) {
         let _ = self
             .proxy
@@ -31,17 +34,38 @@ impl syncdir::sync::SyncStatusObserver for WinitStatusObserver {
                 },
             ));
     }
+
+    fn on_watcher_status_change(&self, source_online: bool, watcher_active: bool) {
+        let _ = self
+            .proxy
+            .send_event(syncdir::tray::UserEvent::WatcherStatus {
+                source_online,
+                watcher_active,
+            });
+    }
 }
 
-struct DaemonTrayHandler<R: RegistryBackend> {
+pub struct DaemonTrayHandler<R: RegistryBackend> {
     config_path: PathBuf,
     command_tx: std::sync::mpsc::Sender<SyncCommand>,
     registry: R,
 }
 
-impl<R: RegistryBackend + Send + Sync + 'static> syncdir::tray::TrayActionHandler
-    for DaemonTrayHandler<R>
-{
+impl<R: RegistryBackend> DaemonTrayHandler<R> {
+    pub fn new(
+        config_path: PathBuf,
+        command_tx: std::sync::mpsc::Sender<SyncCommand>,
+        registry: R,
+    ) -> Self {
+        Self {
+            config_path,
+            command_tx,
+            registry,
+        }
+    }
+}
+
+impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTrayHandler<R> {
     fn on_sync_now(&self) -> Result<(), SyncError> {
         let _ = self.command_tx.send(SyncCommand::TriggerFullScan);
         Ok(())
@@ -68,11 +92,255 @@ impl<R: RegistryBackend + Send + Sync + 'static> syncdir::tray::TrayActionHandle
     }
 }
 
+/// Orchestrator for syncdir background sync workers, file watcher, and central command broadcaster.
+pub struct SyncDaemon {
+    config: Config,
+    worker_handles: Vec<JoinHandle<()>>,
+    shutdown_flag: Arc<AtomicBool>,
+    command_tx: std::sync::mpsc::Sender<SyncCommand>,
+}
+
+impl SyncDaemon {
+    /// Starts all sync workers, the central directory watcher, and the central command broadcaster.
+    pub fn start(
+        config: Config,
+        app_dir: &std::path::Path,
+        observer: Option<Arc<dyn SyncStatusObserver>>,
+    ) -> Result<Self, SyncError> {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let mut worker_handles = Vec::new();
+
+        let resolved_source = config.resolved_source_dir();
+        let initial_source_online = resolved_source.exists() && resolved_source.is_dir();
+        let source_online = Arc::new(AtomicBool::new(initial_source_online));
+
+        // 1. Initialize target databases and workers
+        let mut worker_txs = Vec::new();
+        for (idx, target_config) in config.target_configs().into_iter().enumerate() {
+            let dest = target_config.dest_dir.clone();
+
+            // Calculate isolated SQLite database filename using Blake3 hash of the target path
+            let dest_str = dest.to_string_lossy();
+            let hash = blake3::hash(dest_str.as_bytes());
+            let db_filename = format!("sigcache_{}.db", hash.to_hex());
+            let db_path = app_dir.join(db_filename);
+
+            tracing::info!(
+                target_index = idx + 1,
+                target_path = %dest.display(),
+                db_path = %db_path.display(),
+                "Opening signature cache database for target",
+            );
+            let store = SqliteHashStore::new(&db_path, &config)?;
+
+            match std::fs::metadata(&dest) {
+                Ok(meta) if meta.is_dir() => {
+                    tracing::info!(
+                        target_index = idx + 1,
+                        target_path = %dest.display(),
+                        "Target destination is online and reachable."
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        target_index = idx + 1,
+                        target_path = %dest.display(),
+                        "Target destination exists but is not a directory."
+                    );
+                }
+                Err(e) => {
+                    let alt_path = syncdir::net::try_resolve_alternate_path(&dest);
+                    if alt_path != dest
+                        && matches!(std::fs::metadata(&alt_path), Ok(m) if m.is_dir())
+                    {
+                        tracing::info!(
+                            target_index = idx + 1,
+                            target_path = %dest.display(),
+                            resolved_path = %alt_path.display(),
+                            "Target destination resolved alternate mapped drive/UNC SMB path."
+                        );
+                    } else {
+                        tracing::warn!(
+                            target_index = idx + 1,
+                            target_path = %dest.display(),
+                            resolved_path = %alt_path.display(),
+                            error = %e,
+                            os_error = ?e.raw_os_error(),
+                            "Target destination is currently offline or unreachable."
+                        );
+                    }
+                }
+            }
+
+            // Wire per-worker channel
+            let (w_tx, w_rx) = channel();
+            worker_txs.push(w_tx);
+
+            tracing::info!(
+                target_index = idx + 1,
+                target_path = %dest.display(),
+                "Starting sync worker thread for target..."
+            );
+            let worker_handle = start_sync_worker(
+                idx,
+                target_config,
+                store,
+                w_rx,
+                observer.clone(),
+                source_online.clone(),
+            );
+            worker_handles.push(worker_handle);
+        }
+
+        // 2. Central coordination channels and threads
+        let (tx, rx) = channel();
+
+        // Spawn central watcher coordinator thread
+        let watcher_config = config.clone();
+        let watcher_tx = tx.clone();
+        let watcher_source_online = source_online.clone();
+        let watcher_shutdown = shutdown_flag.clone();
+        let watcher_observer = observer.clone();
+        let watcher_handle = std::thread::spawn(move || {
+            let mut watcher: Option<syncdir::monitor::DirectoryWatcher> = None;
+            let retry_interval =
+                std::time::Duration::from_secs(watcher_config.retry_interval_seconds());
+            let mut last_status_check = std::time::Instant::now()
+                .checked_sub(retry_interval)
+                .unwrap_or_else(std::time::Instant::now);
+
+            let mut last_sent_online = None;
+            let mut last_sent_active = None;
+
+            while !watcher_shutdown.load(Ordering::Relaxed) {
+                let now = std::time::Instant::now();
+
+                if now.duration_since(last_status_check) >= retry_interval {
+                    last_status_check = now;
+                    let current_source = watcher_config.resolved_source_dir();
+                    let is_online = current_source.exists() && current_source.is_dir();
+                    watcher_source_online.store(is_online, Ordering::Relaxed);
+
+                    let mut watcher_active = false;
+                    if is_online {
+                        if watcher.is_none() {
+                            tracing::info!(
+                                "Source directory online. Starting directory watcher..."
+                            );
+                            match syncdir::monitor::DirectoryWatcher::start(
+                                &watcher_config,
+                                watcher_tx.clone(),
+                            ) {
+                                Ok(w) => {
+                                    watcher = Some(w);
+                                    watcher_active = true;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to start directory watcher: {e}");
+                                    watcher_active = false;
+                                }
+                            }
+                        } else {
+                            watcher_active = true;
+                        }
+                    } else if watcher.is_some() {
+                        tracing::warn!(
+                            "Source directory went offline. Dropping directory watcher."
+                        );
+                        watcher = None;
+                    }
+
+                    if last_sent_online != Some(is_online)
+                        || last_sent_active != Some(watcher_active)
+                    {
+                        last_sent_online = Some(is_online);
+                        last_sent_active = Some(watcher_active);
+                        if let Some(ref obs) = watcher_observer {
+                            obs.on_watcher_status_change(is_online, watcher_active);
+                        }
+                    }
+                }
+
+                for _ in 0..10 {
+                    if watcher_shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        });
+        worker_handles.push(watcher_handle);
+
+        // Spawn central broadcaster thread
+        let broadcaster_shutdown = shutdown_flag.clone();
+        let broadcaster_rx = rx;
+        let mut worker_senders = worker_txs;
+        let broadcaster_handle = std::thread::spawn(move || {
+            while !broadcaster_shutdown.load(Ordering::Relaxed) {
+                match broadcaster_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(cmd) => {
+                        worker_senders.retain(|worker_tx| match worker_tx.send(cmd.clone()) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Sync worker channel disconnected. Removing sender."
+                                );
+                                false
+                            }
+                        });
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        worker_handles.push(broadcaster_handle);
+
+        // Trigger initial sync scan
+        let _ = tx.send(SyncCommand::TriggerFullScan);
+
+        Ok(Self {
+            config,
+            worker_handles,
+            shutdown_flag,
+            command_tx: tx,
+        })
+    }
+
+    pub fn command_tx(&self) -> std::sync::mpsc::Sender<SyncCommand> {
+        self.command_tx.clone()
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn shutdown(mut self) {
+        self.perform_shutdown();
+    }
+
+    fn perform_shutdown(&mut self) {
+        if !self.shutdown_flag.swap(true, Ordering::Relaxed) {
+            tracing::info!("Shutting down SyncDaemon and all worker threads...");
+            for handle in self.worker_handles.drain(..) {
+                let _ = handle.join();
+            }
+            tracing::info!("SyncDaemon shutdown complete.");
+        }
+    }
+}
+
+impl Drop for SyncDaemon {
+    fn drop(&mut self) {
+        self.perform_shutdown();
+    }
+}
+
 fn try_main(app_dir: PathBuf) -> Result<TrayExitReason, SyncError> {
     let log_dir = app_dir.join("logs");
     tracing::info!("Initializing syncdir daemon...");
 
-    // 3. Load or create configuration
+    // 1. Load or create configuration
     let config_path = Config::default_config_path()?;
     if !config_path.exists() {
         let default_toml = r#"# syncdir Configuration File
@@ -135,196 +403,32 @@ retry_interval_seconds = 10
             .map_err(|e| SyncError::Tray(format!("Failed to create event loop: {e}")))?;
     let event_proxy = event_loop.create_proxy();
 
-    let dests = config.resolved_dest_dirs();
-    let mut worker_txs = Vec::new();
-    let resolved_source = config.resolved_source_dir();
-    let initial_source_online = resolved_source.exists() && resolved_source.is_dir();
-    let source_online =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(initial_source_online));
-
-    // 4. Initialize target databases and workers
-    for (idx, dest) in dests.iter().enumerate() {
-        let target_config = config.with_dest_dir(dest.clone());
-
-        // Calculate isolated SQLite database filename using Blake3 hash of the target path
-        let dest_str = dest.to_string_lossy();
-        let hash = blake3::hash(dest_str.as_bytes());
-        let db_filename = format!("sigcache_{}.db", hash.to_hex());
-        let db_path = app_dir.join(db_filename);
-
-        tracing::info!(
-            "Opening signature cache database for target {} at: {}",
-            dest.display(),
-            db_path.display()
-        );
-        let store = SqliteHashStore::new(&db_path, &target_config)?;
-
-        match std::fs::metadata(dest) {
-            Ok(meta) if meta.is_dir() => {
-                tracing::info!(
-                    target_index = idx + 1,
-                    target_path = %dest.display(),
-                    "Target destination is online and reachable."
-                );
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    target_index = idx + 1,
-                    target_path = %dest.display(),
-                    "Target destination exists but is not a directory."
-                );
-            }
-            Err(e) => {
-                let alt_path = syncdir::config::try_resolve_alternate_path(dest);
-                if alt_path != *dest && matches!(std::fs::metadata(&alt_path), Ok(m) if m.is_dir())
-                {
-                    tracing::info!(
-                        target_index = idx + 1,
-                        target_path = %dest.display(),
-                        resolved_path = %alt_path.display(),
-                        "Target destination resolved alternate mapped drive/UNC SMB path."
-                    );
-                } else {
-                    tracing::warn!(
-                        target_index = idx + 1,
-                        target_path = %dest.display(),
-                        resolved_path = %alt_path.display(),
-                        error = %e,
-                        os_error = ?e.raw_os_error(),
-                        "Target destination is currently offline or unreachable."
-                    );
-                }
-            }
-        }
-
-        // Wire per-worker channel
-        let (w_tx, w_rx) = channel();
-        worker_txs.push(w_tx);
-
-        let status_observer: std::sync::Arc<dyn syncdir::sync::SyncStatusObserver> =
-            std::sync::Arc::new(WinitStatusObserver {
-                proxy: event_proxy.clone(),
-            });
-
-        tracing::info!(
-            "Starting sync worker thread for target: {}...",
-            dest.display()
-        );
-        let _worker_handle = start_sync_worker(
-            idx,
-            target_config,
-            store,
-            w_rx,
-            Some(status_observer),
-            source_online.clone(),
-        );
-    }
-
-    // 5. Central coordination channels and threads
-    let (tx, rx) = channel();
-
-    // Spawn central watcher coordinator thread
-    let watcher_config = config.clone();
-    let watcher_tx = tx.clone();
-    let watcher_source_online = source_online.clone();
-    let watcher_event_proxy = event_proxy.clone();
-    std::thread::spawn(move || {
-        let mut watcher: Option<syncdir::monitor::DirectoryWatcher> = None;
-        let retry_interval =
-            std::time::Duration::from_secs(watcher_config.retry_interval_seconds());
-        let mut last_status_check = std::time::Instant::now()
-            .checked_sub(retry_interval)
-            .unwrap_or_else(std::time::Instant::now);
-
-        let mut last_sent_online = None;
-        let mut last_sent_active = None;
-
-        loop {
-            let now = std::time::Instant::now();
-
-            if now.duration_since(last_status_check) >= retry_interval {
-                last_status_check = now;
-                let current_source = watcher_config.resolved_source_dir();
-                let is_online = current_source.exists() && current_source.is_dir();
-                watcher_source_online.store(is_online, std::sync::atomic::Ordering::Relaxed);
-
-                let mut watcher_active = false;
-                if is_online {
-                    if watcher.is_none() {
-                        tracing::info!("Source directory online. Starting directory watcher...");
-                        match syncdir::monitor::DirectoryWatcher::start(
-                            &watcher_config,
-                            watcher_tx.clone(),
-                        ) {
-                            Ok(w) => {
-                                watcher = Some(w);
-                                watcher_active = true;
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to start directory watcher: {e}");
-                                watcher_active = false;
-                            }
-                        }
-                    } else {
-                        watcher_active = true;
-                    }
-                } else {
-                    if watcher.is_some() {
-                        tracing::warn!(
-                            "Source directory went offline. Dropping directory watcher."
-                        );
-                        watcher = None;
-                    }
-                }
-
-                if last_sent_online != Some(is_online) || last_sent_active != Some(watcher_active) {
-                    last_sent_online = Some(is_online);
-                    last_sent_active = Some(watcher_active);
-                    let _ =
-                        watcher_event_proxy.send_event(syncdir::tray::UserEvent::WatcherStatus {
-                            source_online: is_online,
-                            watcher_active,
-                        });
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    });
-
-    // Spawn central broadcaster thread
-    let broadcaster_rx = rx;
-    let mut worker_senders = worker_txs;
-    std::thread::spawn(move || {
-        while let Ok(cmd) = broadcaster_rx.recv() {
-            worker_senders.retain(|worker_tx| match worker_tx.send(cmd.clone()) {
-                Ok(()) => true,
-                Err(_) => {
-                    tracing::warn!("Sync worker channel disconnected. Removing sender.");
-                    false
-                }
-            });
-        }
-    });
-
-    // Trigger initial sync scan
-    let _ = tx.send(SyncCommand::TriggerFullScan);
-
-    // 6. Run tray UI (blocks the main thread)
-    tracing::info!("Starting system tray UI loop.");
-    let destinations: Vec<DestinationState> = dests
+    let destinations: Vec<DestinationState> = config
+        .resolved_dest_dirs()
         .into_iter()
         .map(|d| {
             let is_online = d.exists() && d.is_dir();
             DestinationState { path: d, is_online }
         })
         .collect();
-    let handler = std::sync::Arc::new(DaemonTrayHandler {
-        config_path: config_path.clone(),
-        command_tx: tx,
-        registry: syncdir::startup::StartupRegistry,
-    });
+
+    let observer: Arc<dyn SyncStatusObserver> =
+        Arc::new(WinitStatusObserver { proxy: event_proxy });
+
+    // Start daemon orchestrator
+    let daemon = SyncDaemon::start(config, &app_dir, Some(observer))?;
+
+    let handler = Arc::new(DaemonTrayHandler::new(
+        config_path.clone(),
+        daemon.command_tx(),
+        syncdir::startup::StartupRegistry,
+    ));
+
+    // Run tray UI (blocks the main thread)
+    tracing::info!("Starting system tray UI loop.");
     let exit_reason = run_tray(event_loop, config_path, log_dir, destinations, handler)?;
+
+    daemon.shutdown();
 
     Ok(exit_reason)
 }
@@ -575,5 +679,40 @@ fn main() {
             tracing::error!("Fatal error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syncdir::startup::MockStartupRegistry;
+
+    #[test]
+    fn test_sync_daemon_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = syncdir::config::Config::test_default(src, dst);
+        let daemon = SyncDaemon::start(config, temp.path(), None).expect("daemon start");
+        assert!(daemon.config().retry_interval_seconds() > 0);
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn test_daemon_tray_handler() {
+        let (tx, rx) = channel();
+        let mock_registry = MockStartupRegistry::new(false);
+        let handler = DaemonTrayHandler::new(PathBuf::from("config.toml"), tx, mock_registry);
+
+        assert!(!handler.is_startup_enabled());
+        assert!(handler.on_toggle_startup(true).unwrap());
+        assert!(handler.is_startup_enabled());
+        assert!(!handler.on_toggle_startup(false).unwrap());
+        assert!(!handler.is_startup_enabled());
+
+        handler.on_sync_now().unwrap();
+        assert_eq!(rx.recv().unwrap(), SyncCommand::TriggerFullScan);
     }
 }
