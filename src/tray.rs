@@ -67,14 +67,16 @@ pub enum UserEvent {
         source_online: bool,
         watcher_active: bool,
     },
+    /// Result of an asynchronous configuration reload validation.
+    ConfigReloadResult(Result<(), SyncError>),
 }
 
 /// Encapsulates visual and connectivity state tracking for the system tray interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayState {
-    pub source_online: bool,
-    pub watcher_active: bool,
-    pub dest_online: Vec<bool>,
+    source_online: bool,
+    watcher_active: bool,
+    dest_online: Vec<bool>,
 }
 
 impl TrayState {
@@ -85,6 +87,21 @@ impl TrayState {
             watcher_active: false,
             dest_online: initial_dest_online,
         }
+    }
+
+    /// Access whether the source directory is currently online.
+    pub fn source_online(&self) -> bool {
+        self.source_online
+    }
+
+    /// Access whether the directory watcher is currently active.
+    pub fn watcher_active(&self) -> bool {
+        self.watcher_active
+    }
+
+    /// Access the per-destination online reachability slice.
+    pub fn dest_online(&self) -> &[bool] {
+        &self.dest_online
     }
 
     /// Update target destination reachability by index.
@@ -219,33 +236,6 @@ fn generate_default_icon() -> Result<Icon, SyncError> {
     get_cached_icon(EngineStatus::Healthy)
 }
 
-/// Open a file or directory in the system default application.
-fn open_path(path: &std::path::Path) -> Result<(), SyncError> {
-    #[cfg(target_os = "windows")]
-    {
-        let explorer = crate::config::system_root().join("explorer.exe");
-        let mut cmd = if explorer.exists() {
-            std::process::Command::new(explorer)
-        } else {
-            std::process::Command::new("explorer")
-        };
-        cmd.arg(path).spawn().map_err(SyncError::Io)?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        std::process::Command::new(opener)
-            .arg(path)
-            .spawn()
-            .map_err(SyncError::Io)?;
-    }
-    Ok(())
-}
-
 /// Display a native Windows About modal dialog box containing version, description, copyright, and URL.
 #[cfg(target_os = "windows")]
 fn show_about_dialog() {
@@ -323,13 +313,20 @@ pub trait TrayActionHandler: Send + Sync + 'static {
     /// Callback when user requests manual synchronization.
     fn on_sync_now(&self) -> Result<(), SyncError>;
     /// Callback when user requests configuration reload.
-    /// Returns `Ok(true)` if daemon should restart with new config.
-    fn on_reload_config(&self) -> Result<bool, SyncError>;
+    fn on_reload_config(&self) -> Result<(), SyncError>;
     /// Callback when user toggles Windows startup registration.
     /// Returns the updated registration status.
     fn on_toggle_startup(&self, enable: bool) -> Result<bool, SyncError>;
     /// Query whether startup auto-run is currently registered.
-    fn is_startup_enabled(&self) -> bool;
+    fn is_startup_enabled(&self) -> Result<bool, SyncError>;
+    /// Open the active configuration file in system editor.
+    fn on_open_config(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
+    /// Open the active logs directory in system file explorer.
+    fn on_view_logs(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
 }
 
 /// Launch the system tray event loop (blocking).
@@ -340,8 +337,6 @@ pub trait TrayActionHandler: Send + Sync + 'static {
 /// # Arguments
 ///
 /// * `event_loop` - The winit event loop initialized on the main UI thread.
-/// * `config_path` - The system path to the user's `config.toml`.
-/// * `log_dir` - The path to the active log directory for manual retrieval.
 /// * `destinations` - Initial destination states with reachability status.
 /// * `handler` - Handler dispatching user actions to the sync daemon and startup backend.
 ///
@@ -354,8 +349,6 @@ pub trait TrayActionHandler: Send + Sync + 'static {
 /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
 pub fn run_tray<H: TrayActionHandler + ?Sized>(
     event_loop: winit::event_loop::EventLoop<UserEvent>,
-    config_path: PathBuf,
-    log_dir: PathBuf,
     destinations: Vec<DestinationState>,
     handler: Arc<H>,
 ) -> Result<TrayExitReason, SyncError> {
@@ -367,7 +360,13 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
     let view_logs = MenuItem::new("View Logs", true, None);
     let sync_now = MenuItem::new("Sync Now", true, None);
 
-    let initially_checked = handler.is_startup_enabled();
+    let initially_checked = match handler.is_startup_enabled() {
+        Ok(enabled) => enabled,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to query startup registration status");
+            false
+        }
+    };
     let startup_toggle =
         CheckMenuItem::new("Start on System Startup", true, initially_checked, None);
 
@@ -423,6 +422,7 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
 
     // Set menu event handler to forward menu events to the event loop
     let proxy = event_loop.create_proxy();
+    let reload_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event| {
         let _ = proxy.send_event(UserEvent::Menu(event));
     }));
@@ -456,40 +456,26 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
                             tracing::info!("Manual sync triggered from tray menu");
                         }
                     } else if menu_event.id == open_config_id {
-                        if let Err(e) = open_path(&config_path) {
-                            tracing::error!(
-                                error = %e,
-                                path = %config_path.display(),
-                                "Failed to open config file"
-                            );
+                        if let Err(e) = handler.on_open_config() {
+                            let err_msg = format!("Failed to open config:\n\n{e}");
+                            tracing::error!(error = %e, "Failed to open config file");
+                            show_error_dialog("Open Config Error", &err_msg);
                         }
                     } else if menu_event.id == reload_config_id {
-                        tracing::info!("Reload Config requested via tray menu.");
-                        match handler.on_reload_config() {
-                            Ok(true) => {
-                                tracing::info!(
-                                    "Configuration validated successfully. Restarting daemon..."
-                                );
-                                MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
-                                exit_reason_closure.set(TrayExitReason::Restart);
-                                elwt.exit();
-                            }
-                            Ok(false) => {
-                                tracing::warn!("Configuration reload cancelled or unchanged");
-                            }
-                            Err(e) => {
-                                let err_msg = format!("Configuration reload error:\n\n{e}");
-                                tracing::error!(error = %e, "Configuration reload failed");
-                                show_error_dialog("Config Reload Error", &err_msg);
-                            }
-                        }
+                        tracing::info!(
+                            "Reload Config requested via tray menu; offloading to background thread."
+                        );
+                        let handler_clone = handler.clone();
+                        let proxy_clone = reload_proxy.clone();
+                        std::thread::spawn(move || {
+                            let res = handler_clone.on_reload_config();
+                            let _ = proxy_clone.send_event(UserEvent::ConfigReloadResult(res));
+                        });
                     } else if menu_event.id == view_logs_id {
-                        if let Err(e) = open_path(&log_dir) {
-                            tracing::error!(
-                                error = %e,
-                                path = %log_dir.display(),
-                                "Failed to open log directory"
-                            );
+                        if let Err(e) = handler.on_view_logs() {
+                            let err_msg = format!("Failed to open log directory:\n\n{e}");
+                            tracing::error!(error = %e, "Failed to open log directory");
+                            show_error_dialog("View Logs Error", &err_msg);
                         }
                     } else if menu_event.id == startup_toggle_id {
                         let is_checked = startup_toggle.is_checked();
@@ -511,6 +497,23 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
                         }
                     } else if menu_event.id == about_id {
                         show_about_dialog();
+                    }
+                }
+                Event::UserEvent(UserEvent::ConfigReloadResult(res)) => {
+                    match res {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Configuration validated successfully. Restarting daemon..."
+                            );
+                            MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+                            exit_reason_closure.set(TrayExitReason::Restart);
+                            elwt.exit();
+                        }
+                        Err(e) => {
+                            let err_msg = format!("Configuration reload error:\n\n{e}");
+                            tracing::error!(error = %e, "Configuration reload failed");
+                            show_error_dialog("Config Reload Error", &err_msg);
+                        }
                     }
                 }
                 Event::UserEvent(UserEvent::StatusUpdate(update)) => {
@@ -647,7 +650,7 @@ mod tests {
     fn test_tray_state_update_target_out_of_bounds() {
         let mut state = TrayState::new(vec![true]);
         assert!(!state.update_target_status(5, false));
-        assert_eq!(state.dest_online, vec![true]);
+        assert_eq!(state.dest_online(), &[true]);
     }
 
     #[test]

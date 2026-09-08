@@ -18,25 +18,74 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
+/// Open a file or directory in the system default application.
+pub(crate) fn open_path(path: &Path) -> Result<(), SyncError> {
+    if !path.exists() {
+        return Err(SyncError::validation(format!(
+            "Path does not exist: {}",
+            path.display()
+        )));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let explorer = crate::config::system_root().join("explorer.exe");
+        let mut cmd = if explorer.exists() {
+            std::process::Command::new(explorer)
+        } else {
+            std::process::Command::new("explorer")
+        };
+        cmd.arg(path).spawn().map_err(SyncError::Io)?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(opener)
+            .arg(path)
+            .spawn()
+            .map_err(SyncError::Io)?;
+    }
+    Ok(())
+}
+
+/// Handle for dispatching asynchronous control commands to a running `SyncDaemon`.
+#[derive(Clone)]
+pub struct DaemonHandle {
+    command_tx: Sender<SyncCommand>,
+}
+
+impl DaemonHandle {
+    /// Create a new daemon handle wrapping the given command sender.
+    pub fn new(command_tx: Sender<SyncCommand>) -> Self {
+        Self { command_tx }
+    }
+
+    /// Trigger an immediate full synchronization scan across all targets.
+    pub fn trigger_full_scan(&self) -> Result<(), SyncError> {
+        self.command_tx
+            .send(SyncCommand::TriggerFullScan)
+            .map_err(|e| SyncError::tray_with_source("Sync worker channel disconnected", e))
+    }
+}
+
 /// Tray action handler connecting UI context menu callbacks to daemon and registry operations.
 pub struct DaemonTrayHandler<R: RegistryBackend> {
     config_path: PathBuf,
-    command_tx: Sender<SyncCommand>,
+    log_dir: PathBuf,
+    handle: DaemonHandle,
     registry: R,
 }
 
 impl<R: RegistryBackend> DaemonTrayHandler<R> {
-    /// Create a new tray handler with target config path, command sender, and registry backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `config_path` - Path to the `config.toml` file to reload.
-    /// * `command_tx` - Channel sender for dispatching [`SyncCommand`]s to the daemon.
-    /// * `registry` - Registry backend implementing [`RegistryBackend`].
-    pub fn new(config_path: PathBuf, command_tx: Sender<SyncCommand>, registry: R) -> Self {
+    /// Create a new tray handler with target config path, log directory, daemon handle, and registry backend.
+    pub fn new(config_path: PathBuf, log_dir: PathBuf, handle: DaemonHandle, registry: R) -> Self {
         Self {
             config_path,
-            command_tx,
+            log_dir,
+            handle,
             registry,
         }
     }
@@ -44,15 +93,13 @@ impl<R: RegistryBackend> DaemonTrayHandler<R> {
 
 impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTrayHandler<R> {
     fn on_sync_now(&self) -> Result<(), SyncError> {
-        self.command_tx
-            .send(SyncCommand::TriggerFullScan)
-            .map_err(|e| SyncError::tray_with_source("Sync worker channel disconnected", e))
+        self.handle.trigger_full_scan()
     }
 
-    fn on_reload_config(&self) -> Result<bool, SyncError> {
+    fn on_reload_config(&self) -> Result<(), SyncError> {
         let new_config = Config::load(&self.config_path)?;
         new_config.validate()?;
-        Ok(true)
+        Ok(())
     }
 
     fn on_toggle_startup(&self, enable: bool) -> Result<bool, SyncError> {
@@ -65,17 +112,25 @@ impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTra
         }
     }
 
-    fn is_startup_enabled(&self) -> bool {
-        self.registry.is_registered().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to query startup registration; defaulting to false");
-            false
-        })
+    fn is_startup_enabled(&self) -> Result<bool, SyncError> {
+        self.registry.is_registered()
+    }
+
+    fn on_open_config(&self) -> Result<(), SyncError> {
+        open_path(&self.config_path)
+    }
+
+    fn on_view_logs(&self) -> Result<(), SyncError> {
+        open_path(&self.log_dir)
     }
 }
 
 /// Orchestrator for syncdir background sync workers, file watcher, and central command broadcaster.
+#[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
 pub struct SyncDaemon {
     config: Config,
+    watcher_handle: Option<JoinHandle<()>>,
+    broadcaster_handle: Option<JoinHandle<()>>,
     worker_handles: Vec<JoinHandle<()>>,
     shutdown_flag: Arc<AtomicBool>,
     command_tx: Sender<SyncCommand>,
@@ -101,11 +156,15 @@ impl SyncDaemon {
     /// # Errors
     ///
     /// Returns [`SyncError::Db`] if SQLite database initialization fails for any target.
+    #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
     pub fn start(
         config: Config,
         app_dir: &Path,
         observer: Option<Arc<dyn SyncStatusObserver>>,
     ) -> Result<Self, SyncError> {
+        let mut config = config;
+        config.resolve_network_paths();
+
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let mut worker_handles = Vec::new();
 
@@ -206,18 +265,20 @@ impl SyncDaemon {
             let mut watcher: Option<crate::monitor::DirectoryWatcher> = None;
             let retry_interval =
                 std::time::Duration::from_secs(watcher_config.retry_interval_seconds());
-            let mut last_status_check = std::time::Instant::now()
-                .checked_sub(retry_interval)
-                .unwrap_or_else(std::time::Instant::now);
+            let mut last_status_check: Option<std::time::Instant> = None;
 
             let mut last_sent_online = None;
             let mut last_sent_active = None;
 
             while !watcher_shutdown.load(Ordering::Relaxed) {
                 let now = std::time::Instant::now();
+                let should_check = match last_status_check {
+                    None => true,
+                    Some(last) => now.duration_since(last) >= retry_interval,
+                };
 
-                if now.duration_since(last_status_check) >= retry_interval {
-                    last_status_check = now;
+                if should_check {
+                    last_status_check = Some(now);
                     let current_source = watcher_config.resolved_source_dir();
                     let is_online = current_source.exists() && current_source.is_dir();
                     watcher_source_online.store(is_online, Ordering::Relaxed);
@@ -275,7 +336,6 @@ impl SyncDaemon {
                 }
             }
         });
-        worker_handles.push(watcher_handle);
 
         // Spawn central broadcaster thread
         let broadcaster_shutdown = shutdown_flag.clone();
@@ -284,33 +344,50 @@ impl SyncDaemon {
         let broadcaster_handle = std::thread::spawn(move || {
             while !broadcaster_shutdown.load(Ordering::Relaxed) {
                 match broadcaster_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                    Ok(cmd) => {
-                        worker_senders.retain(|worker_tx| match worker_tx.send(cmd.clone()) {
-                            Ok(()) => true,
-                            Err(_) => {
+                    Ok(mut cmd) => {
+                        let count = worker_senders.len();
+                        let mut failed = Vec::new();
+                        for (i, tx) in worker_senders.iter().enumerate() {
+                            let to_send = if i + 1 == count {
+                                std::mem::replace(&mut cmd, SyncCommand::TriggerFullScan)
+                            } else {
+                                cmd.clone()
+                            };
+                            if tx.send(to_send).is_err() {
                                 tracing::warn!(
                                     "Sync worker channel disconnected. Removing sender."
                                 );
-                                false
+                                failed.push(i);
                             }
-                        });
+                        }
+                        for &i in failed.iter().rev() {
+                            worker_senders.swap_remove(i);
+                        }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
-        worker_handles.push(broadcaster_handle);
-
-        // Trigger initial sync scan
-        let _ = tx.send(SyncCommand::TriggerFullScan);
 
         Ok(Self {
             config,
+            watcher_handle: Some(watcher_handle),
+            broadcaster_handle: Some(broadcaster_handle),
             worker_handles,
             shutdown_flag,
             command_tx: tx,
         })
+    }
+
+    /// Create a handle for dispatching commands to this daemon.
+    pub fn handle(&self) -> DaemonHandle {
+        DaemonHandle::new(self.command_tx.clone())
+    }
+
+    /// Trigger an immediate full synchronization scan across all targets.
+    pub fn trigger_full_scan(&self) -> Result<(), SyncError> {
+        self.handle().trigger_full_scan()
     }
 
     /// Access the command sender for broadcasting commands into the daemon.
@@ -331,6 +408,15 @@ impl SyncDaemon {
     fn perform_shutdown(&mut self) {
         if !self.shutdown_flag.swap(true, Ordering::Relaxed) {
             tracing::info!("Shutting down SyncDaemon and all worker threads...");
+            // Step 1: Join watcher thread first so no new events are generated
+            if let Some(handle) = self.watcher_handle.take() {
+                let _ = handle.join();
+            }
+            // Step 2: Join broadcaster thread so in-flight commands are distributed
+            if let Some(handle) = self.broadcaster_handle.take() {
+                let _ = handle.join();
+            }
+            // Step 3: Join all worker threads
             for handle in self.worker_handles.drain(..) {
                 let _ = handle.join();
             }
@@ -361,7 +447,7 @@ mod tests {
 
         let config = Config::builder(src).dest_dir(dst).build();
         let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
-        assert_eq!(daemon.worker_handles.len(), 3); // 1 sync worker + 1 watcher + 1 broadcaster
+        assert_eq!(daemon.worker_handles.len(), 1);
         daemon.shutdown();
     }
 
@@ -380,13 +466,15 @@ dest_dir = "C:\\dummy_dest"
 
         let (tx, rx) = channel();
         let mock_registry = MockStartupRegistry::new(false);
-        let handler = DaemonTrayHandler::new(config_path, tx, mock_registry);
+        let handle = DaemonHandle::new(tx);
+        let handler =
+            DaemonTrayHandler::new(config_path, dir.path().join("logs"), handle, mock_registry);
 
-        assert!(!handler.is_startup_enabled());
+        assert!(!handler.is_startup_enabled().unwrap());
         assert!(handler.on_toggle_startup(true).unwrap());
-        assert!(handler.is_startup_enabled());
+        assert!(handler.is_startup_enabled().unwrap());
         assert!(!handler.on_toggle_startup(false).unwrap());
-        assert!(!handler.is_startup_enabled());
+        assert!(!handler.is_startup_enabled().unwrap());
 
         handler.on_sync_now().unwrap();
         let cmd = rx.try_recv().unwrap();

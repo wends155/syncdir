@@ -124,14 +124,15 @@ retry_interval_seconds = 10
     let daemon = SyncDaemon::start(config, &app_dir, Some(observer))?;
 
     let handler = Arc::new(DaemonTrayHandler::new(
-        config_path.clone(),
-        daemon.command_tx(),
+        config_path,
+        log_dir,
+        daemon.handle(),
         syncdir::startup::StartupRegistry,
     ));
 
     // Run tray UI (blocks the main thread)
     tracing::info!("Starting system tray UI loop.");
-    let exit_reason = run_tray(event_loop, config_path, log_dir, destinations, handler)?;
+    let exit_reason = run_tray(event_loop, destinations, handler)?;
 
     daemon.shutdown();
 
@@ -412,13 +413,19 @@ mod tests {
     fn test_daemon_tray_handler() {
         let (tx, rx) = channel();
         let mock_registry = MockStartupRegistry::new(false);
-        let handler = DaemonTrayHandler::new(PathBuf::from("config.toml"), tx, mock_registry);
+        let handle = syncdir::daemon::DaemonHandle::new(tx);
+        let handler = DaemonTrayHandler::new(
+            PathBuf::from("config.toml"),
+            PathBuf::from("logs"),
+            handle,
+            mock_registry,
+        );
 
-        assert!(!handler.is_startup_enabled());
+        assert!(!handler.is_startup_enabled().unwrap());
         assert!(handler.on_toggle_startup(true).unwrap());
-        assert!(handler.is_startup_enabled());
+        assert!(handler.is_startup_enabled().unwrap());
         assert!(!handler.on_toggle_startup(false).unwrap());
-        assert!(!handler.is_startup_enabled());
+        assert!(!handler.is_startup_enabled().unwrap());
 
         handler.on_sync_now().unwrap();
         assert_eq!(rx.recv().unwrap(), SyncCommand::TriggerFullScan);

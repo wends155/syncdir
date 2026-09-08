@@ -106,21 +106,19 @@ fn test_tray_module_compiles() {
         fn on_sync_now(&self) -> Result<(), syncdir::error::SyncError> {
             Ok(())
         }
-        fn on_reload_config(&self) -> Result<bool, syncdir::error::SyncError> {
-            Ok(false)
+        fn on_reload_config(&self) -> Result<(), syncdir::error::SyncError> {
+            Ok(())
         }
         fn on_toggle_startup(&self, _enable: bool) -> Result<bool, syncdir::error::SyncError> {
             Ok(false)
         }
-        fn is_startup_enabled(&self) -> bool {
-            false
+        fn is_startup_enabled(&self) -> Result<bool, syncdir::error::SyncError> {
+            Ok(false)
         }
     }
 
     let _func: fn(
         winit::event_loop::EventLoop<syncdir::tray::UserEvent>,
-        std::path::PathBuf,
-        std::path::PathBuf,
         std::vec::Vec<syncdir::tray::DestinationState>,
         std::sync::Arc<DummyHandler>,
     ) -> Result<syncdir::tray::TrayExitReason, syncdir::error::SyncError> =

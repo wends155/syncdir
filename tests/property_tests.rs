@@ -107,7 +107,8 @@ proptest! {
 
         let config = Config::test_default(source.clone(), dest.clone());
         let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
+        let engine = LocalSyncEngine::new(store, target_config);
 
         let file_path = source.join("prop_test.bin");
         let dest_file_path = dest.join("prop_test.bin");
@@ -141,7 +142,8 @@ proptest! {
             .block_sync_threshold_bytes(1024)
             .build();
         let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
+        let engine = LocalSyncEngine::new(store, target_config);
 
         let file_path = source.join("delta_test.bin");
         let dest_file_path = dest.join("delta_test.bin");
