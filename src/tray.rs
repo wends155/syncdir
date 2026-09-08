@@ -1,4 +1,5 @@
 use crate::error::SyncError;
+use crate::sync::{ConnectivityState, WatcherState};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -64,8 +65,8 @@ pub enum UserEvent {
     StatusUpdate(TargetStatusUpdate),
     /// Watcher status update sent by the coordinator thread.
     WatcherStatus {
-        source_online: bool,
-        watcher_active: bool,
+        source_online: ConnectivityState,
+        watcher_active: WatcherState,
     },
     /// Result of an asynchronous configuration reload validation.
     ConfigReloadResult(Result<(), SyncError>),
@@ -74,8 +75,8 @@ pub enum UserEvent {
 /// Encapsulates visual and connectivity state tracking for the system tray interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayState {
-    source_online: bool,
-    watcher_active: bool,
+    source_online: ConnectivityState,
+    watcher_active: WatcherState,
     dest_online: Vec<bool>,
 }
 
@@ -83,19 +84,29 @@ impl TrayState {
     /// Create a new TrayState with initial destination reachability states.
     pub fn new(initial_dest_online: Vec<bool>) -> Self {
         Self {
-            source_online: false,
-            watcher_active: false,
+            source_online: ConnectivityState::Offline,
+            watcher_active: WatcherState::Inactive,
             dest_online: initial_dest_online,
         }
     }
 
     /// Access whether the source directory is currently online.
     pub fn source_online(&self) -> bool {
+        self.source_online == ConnectivityState::Online
+    }
+
+    /// Access strongly-typed source connectivity state.
+    pub fn source_connectivity(&self) -> ConnectivityState {
         self.source_online
     }
 
     /// Access whether the directory watcher is currently active.
     pub fn watcher_active(&self) -> bool {
+        self.watcher_active == WatcherState::Active
+    }
+
+    /// Access strongly-typed directory watcher state.
+    pub fn watcher_state(&self) -> WatcherState {
         self.watcher_active
     }
 
@@ -115,12 +126,29 @@ impl TrayState {
         }
     }
 
-    /// Update source directory connectivity and watcher active status.
-    pub fn update_watcher_status(&mut self, source_online: bool, watcher_active: bool) -> bool {
+    /// Update source directory connectivity and watcher active status using domain enums.
+    pub fn update_watcher_status(
+        &mut self,
+        source_online: ConnectivityState,
+        watcher_active: WatcherState,
+    ) -> bool {
         let changed = self.source_online != source_online || self.watcher_active != watcher_active;
         self.source_online = source_online;
         self.watcher_active = watcher_active;
         changed
+    }
+
+    /// Legacy boolean updater for backward compatibility.
+    #[deprecated(
+        since = "0.1.14",
+        note = "use update_watcher_status with ConnectivityState and WatcherState"
+    )]
+    pub fn update_watcher_status_bool(
+        &mut self,
+        source_online: bool,
+        watcher_active: bool,
+    ) -> bool {
+        self.update_watcher_status(source_online.into(), watcher_active.into())
     }
 
     /// Calculate the overall engine health status based on current state.
@@ -129,7 +157,9 @@ impl TrayState {
             !self.dest_online.is_empty() && self.dest_online.iter().all(|&online| online);
         let any_dest_online = self.dest_online.iter().any(|&online| online);
 
-        if !self.source_online || !self.watcher_active {
+        if self.source_online != ConnectivityState::Online
+            || self.watcher_active != WatcherState::Active
+        {
             if !any_dest_online && !self.dest_online.is_empty() {
                 EngineStatus::BothOffline
             } else {
@@ -151,12 +181,10 @@ impl TrayState {
 
     /// Generate the formatted tooltip text for the system tray icon.
     pub fn tooltip_text(&self) -> String {
-        let src_status_str = if !self.source_online {
-            "Offline"
-        } else if !self.watcher_active {
-            "Degraded"
-        } else {
-            "Online"
+        let src_status_str = match (self.source_online, self.watcher_active) {
+            (ConnectivityState::Offline, _) => "Offline",
+            (ConnectivityState::Online, WatcherState::Inactive) => "Degraded",
+            (ConnectivityState::Online, WatcherState::Active) => "Online",
         };
         format!(
             "syncdir — Src: {} | Dests: {}/{} Online",
@@ -440,6 +468,8 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
     let exit_reason = Rc::new(Cell::new(TrayExitReason::UserExit));
     let exit_reason_closure = exit_reason.clone();
 
+    let is_reloading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     event_loop
         .run(move |event, elwt| {
             elwt.set_control_flow(ControlFlow::Wait);
@@ -462,15 +492,34 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
                             show_error_dialog("Open Config Error", &err_msg);
                         }
                     } else if menu_event.id == reload_config_id {
-                        tracing::info!(
-                            "Reload Config requested via tray menu; offloading to background thread."
-                        );
-                        let handler_clone = handler.clone();
-                        let proxy_clone = reload_proxy.clone();
-                        std::thread::spawn(move || {
-                            let res = handler_clone.on_reload_config();
-                            let _ = proxy_clone.send_event(UserEvent::ConfigReloadResult(res));
-                        });
+                        if is_reloading
+                            .compare_exchange(
+                                false,
+                                true,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok()
+                        {
+                            tracing::info!(
+                                "Reload Config requested via tray menu; offloading to background thread."
+                            );
+                            let handler_clone = handler.clone();
+                            let proxy_clone = reload_proxy.clone();
+                            let reloading_flag = is_reloading.clone();
+                            let _ = std::thread::Builder::new()
+                                .name("config-reload".to_string())
+                                .spawn(move || {
+                                    let res = handler_clone.on_reload_config();
+                                    reloading_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    let _ = proxy_clone
+                                        .send_event(UserEvent::ConfigReloadResult(res));
+                                });
+                        } else {
+                            tracing::warn!(
+                                "Configuration reload already in progress; ignoring duplicate request."
+                            );
+                        }
                     } else if menu_event.id == view_logs_id {
                         if let Err(e) = handler.on_view_logs() {
                             let err_msg = format!("Failed to open log directory:\n\n{e}");
@@ -574,8 +623,10 @@ mod tests {
     #[test]
     fn test_tray_state_initialization() {
         let state = TrayState::new(vec![true, false]);
-        assert_eq!(state.source_online, false);
-        assert_eq!(state.watcher_active, false);
+        assert_eq!(state.source_online(), false);
+        assert_eq!(state.watcher_active(), false);
+        assert_eq!(state.source_connectivity(), ConnectivityState::Offline);
+        assert_eq!(state.watcher_state(), WatcherState::Inactive);
         assert_eq!(state.dest_online, vec![true, false]);
         assert_eq!(state.online_dest_count(), 1);
     }
@@ -583,7 +634,7 @@ mod tests {
     #[test]
     fn test_tray_state_healthy() {
         let mut state = TrayState::new(vec![true, true]);
-        state.update_watcher_status(true, true);
+        state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
         assert_eq!(state.overall_status(), EngineStatus::Healthy);
         assert_eq!(
             state.tooltip_text(),
@@ -594,7 +645,7 @@ mod tests {
     #[test]
     fn test_tray_state_source_offline() {
         let mut state = TrayState::new(vec![true, true]);
-        state.update_watcher_status(false, true);
+        state.update_watcher_status(ConnectivityState::Offline, WatcherState::Active);
         assert_eq!(state.overall_status(), EngineStatus::SourceOffline);
         assert_eq!(
             state.tooltip_text(),
@@ -605,7 +656,7 @@ mod tests {
     #[test]
     fn test_tray_state_watcher_degraded() {
         let mut state = TrayState::new(vec![true, true]);
-        state.update_watcher_status(true, false);
+        state.update_watcher_status(ConnectivityState::Online, WatcherState::Inactive);
         assert_eq!(state.overall_status(), EngineStatus::SourceOffline);
         assert_eq!(
             state.tooltip_text(),
@@ -616,7 +667,7 @@ mod tests {
     #[test]
     fn test_tray_state_degraded() {
         let mut state = TrayState::new(vec![true, true, false]);
-        state.update_watcher_status(true, true);
+        state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
         assert_eq!(state.overall_status(), EngineStatus::Degraded);
         assert_eq!(
             state.tooltip_text(),
@@ -627,7 +678,7 @@ mod tests {
     #[test]
     fn test_tray_state_destination_offline() {
         let mut state = TrayState::new(vec![false, false]);
-        state.update_watcher_status(true, true);
+        state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
         assert_eq!(state.overall_status(), EngineStatus::DestinationOffline);
         assert_eq!(
             state.tooltip_text(),
@@ -638,7 +689,7 @@ mod tests {
     #[test]
     fn test_tray_state_both_offline() {
         let mut state = TrayState::new(vec![false, false]);
-        state.update_watcher_status(false, true);
+        state.update_watcher_status(ConnectivityState::Offline, WatcherState::Active);
         assert_eq!(state.overall_status(), EngineStatus::BothOffline);
         assert_eq!(
             state.tooltip_text(),
@@ -656,11 +707,31 @@ mod tests {
     #[test]
     fn test_tray_state_empty_destinations() {
         let mut state = TrayState::new(vec![]);
-        state.update_watcher_status(true, true);
+        state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
         assert_eq!(state.overall_status(), EngineStatus::Healthy);
         assert_eq!(
             state.tooltip_text(),
             "syncdir — Src: Online | Dests: 0/0 Online"
         );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_tray_state_update_watcher_status_bool_shim() {
+        let mut state = TrayState::new(vec![true]);
+        assert!(state.update_watcher_status_bool(true, true));
+        assert_eq!(state.source_connectivity(), ConnectivityState::Online);
+        assert_eq!(state.watcher_state(), WatcherState::Active);
+    }
+
+    #[test]
+    fn test_tray_state_update_watcher_status_domain_enums() {
+        use crate::sync::{ConnectivityState, WatcherState};
+        let mut state = TrayState::new(vec![true]);
+        let changed = state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
+        assert!(changed);
+        let not_changed =
+            state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
+        assert!(!not_changed);
     }
 }

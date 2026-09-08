@@ -35,8 +35,8 @@ impl SyncStatusObserver for WinitStatusObserver {
         let _ = self
             .proxy
             .send_event(syncdir::tray::UserEvent::WatcherStatus {
-                source_online: source.into(),
-                watcher_active: watcher.into(),
+                source_online: source,
+                watcher_active: watcher,
             });
     }
 }
