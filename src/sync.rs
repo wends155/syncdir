@@ -199,6 +199,13 @@ impl DirtyBlockRange {
         }
         Ok(())
     }
+
+    /// Reset the dirty block range for reuse across files without reallocating buffer capacity.
+    pub fn reset(&mut self) {
+        self.start_block = 0;
+        self.block_count = 0;
+        self.data.clear();
+    }
 }
 
 /// Read exactly `buf.len()` bytes or until EOF, handling partial reads.
@@ -229,10 +236,134 @@ pub trait SyncEngine: Send + Sync {
     fn run_full_scan(&self) -> Result<ScanOutcome, SyncError>;
 }
 
+fn verify_small_file_write(src: &Path, dest: &Path) -> Result<(), SyncError> {
+    let src_bytes = fs::read(src)?;
+    let dest_bytes = fs::read(dest)?;
+    if blake3::hash(&src_bytes) != blake3::hash(&dest_bytes) {
+        return Err(SyncError::validation(format!(
+            "Write verification failed: {}",
+            dest.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_destination_not_reparse(dest_path: &Path) -> Result<(), SyncError> {
+    use std::os::windows::fs::MetadataExt;
+    if let Ok(m) = fs::symlink_metadata(dest_path)
+        && ((m.file_attributes() & 0x400) != 0 || m.file_type().is_symlink())
+    {
+        return Err(SyncError::validation(format!(
+            "Destination '{}' is a symlink or reparse point; refusing to write",
+            dest_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_destination_not_reparse(dest_path: &Path) -> Result<(), SyncError> {
+    if let Ok(m) = fs::symlink_metadata(dest_path)
+        && m.file_type().is_symlink()
+    {
+        return Err(SyncError::validation(format!(
+            "Destination '{}' is a symlink; refusing to write",
+            dest_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_or_symlink_meta(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    (meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink()
+}
+
+#[cfg(not(windows))]
+fn is_reparse_or_symlink_meta(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+fn prune_archive(archive_dir: &Path, max_age_days: u64, max_bytes: u64) -> Result<(), SyncError> {
+    if !archive_dir.exists() {
+        return Ok(());
+    }
+    let max_age = std::time::Duration::from_secs(max_age_days * 24 * 3600);
+    let now = SystemTime::now();
+
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+
+    fn collect_files(
+        dir: &Path,
+        files: &mut Vec<(PathBuf, u64, SystemTime)>,
+        total_bytes: &mut u64,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let path = entry.path();
+            if ft.is_dir() {
+                collect_files(&path, files, total_bytes)?;
+            } else if ft.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                let len = meta.len();
+                let mod_time = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                *total_bytes += len;
+                files.push((path, len, mod_time));
+            }
+        }
+        Ok(())
+    }
+
+    let _ = collect_files(archive_dir, &mut files, &mut total_bytes);
+
+    // Evict files older than max_age_days
+    files.retain(|(path, len, mod_time)| {
+        if let Ok(age) = now.duration_since(*mod_time)
+            && age > max_age
+            && fs::remove_file(path).is_ok()
+        {
+            total_bytes = total_bytes.saturating_sub(*len);
+            return false;
+        }
+        true
+    });
+
+    // If total_bytes still exceeds max_bytes, evict oldest first
+    if total_bytes > max_bytes {
+        files.sort_by_key(|(_, _, m)| *m);
+        for (path, len, _) in files {
+            if total_bytes <= max_bytes {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(len);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Delta sync engine backed by a `HashStore` for signature caching.
 pub struct LocalSyncEngine<S: HashStore> {
     pub(crate) db: S,
     pub(crate) config: TargetSyncConfig,
+}
+
+#[derive(Debug)]
+pub(crate) struct FileSyncTask<'a> {
+    pub rel_path: &'a Path,
+    pub src_path: &'a Path,
+    pub dest_path: &'a Path,
+    pub dest_dir: &'a Path,
+    pub src_size: i64,
+    pub src_mod: i64,
+    pub cached_id: Option<i64>,
 }
 
 impl<S: HashStore> LocalSyncEngine<S> {
@@ -271,109 +402,84 @@ impl<S: HashStore> LocalSyncEngine<S> {
         self.sync_file_to_dest_buffered(rel_path, dest_dir, &mut scratch)
     }
 
-    /// Synchronize a file or directory tree using a reusable scratch buffer.
-    pub fn sync_file_to_dest_buffered(
-        &self,
-        rel_path: &Path,
-        dest_dir: &Path,
-        scratch: &mut [u8],
-    ) -> Result<(), SyncError> {
-        if !is_safe_relative_path(rel_path) {
-            return Err(SyncError::validation(format!(
-                "Unsafe path traversal detected: {}",
-                rel_path.display()
-            )));
-        }
-        let src_path = self.config.source_dir.join(rel_path);
-        let dest_path = dest_dir.join(rel_path);
-
-        let sym_meta = fs::symlink_metadata(&src_path).map_err(SyncError::Io)?;
-        if sym_meta.file_type().is_symlink() {
-            tracing::debug!(path = %src_path.display(), "Skipping symlink");
-            return Ok(());
-        }
-        if sym_meta.is_dir() {
-            fs::create_dir_all(&dest_path)?;
-            let mut dir_files = HashSet::new();
-            scan_dir(&src_path, &self.config.source_dir, &mut dir_files, 0)?;
-            for child_rel in &dir_files {
-                self.sync_file_to_dest_buffered(child_rel, dest_dir, scratch)?;
-            }
-            return Ok(());
-        }
-
-        let src_size = sym_meta.len() as i64;
-        let src_mod = safe_modified_millis(&sym_meta)?;
-
-        // Single DB lookup reused for fast-path and delta-sync
-        let file_record = self.db.get_file(rel_path)?;
-
-        if let Ok(dest_meta) = fs::metadata(&dest_path) {
+    fn is_metadata_up_to_date(
+        dest_meta: Option<&std::fs::Metadata>,
+        src_size: i64,
+        src_mod: i64,
+        rec: Option<&FileRecord>,
+    ) -> bool {
+        if let Some(dest_meta) = dest_meta {
             let dest_size = dest_meta.len() as i64;
-            let dest_mod = safe_modified_millis(&dest_meta)?;
-
-            if let Some(ref record) = file_record
+            let dest_mod = safe_modified_millis(dest_meta).unwrap_or(0);
+            if let Some(record) = rec
                 && record.file_size == src_size
                 && record.last_modified == src_mod
                 && dest_size == src_size
                 && (dest_mod - src_mod).abs() <= 2000
             {
-                tracing::debug!(path = %rel_path.display(), "Metadata unchanged, skipping sync");
-                return Ok(());
+                return true;
             }
         }
+        false
+    }
 
-        // Small file: full copy directly (skip chunking and block hashing)
-        if (src_size as u64) < self.config.block_sync_threshold_bytes {
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&src_path, &dest_path)?;
-
-            // Windows requires write access for set_times
-            let dest_file = OpenOptions::new().write(true).open(&dest_path)?;
-            dest_file.set_times(
-                fs::FileTimes::new()
-                    .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(src_mod)),
-            )?;
-
-            let record = FileRecord {
-                id: file_record.and_then(|r| r.id),
-                relative_path: rel_path.to_path_buf(),
-                file_size: src_size,
-                last_modified: src_mod,
-            };
-            self.db.save_file(&record, &[])?;
-            tracing::info!(
-                path = %rel_path.display(),
-                target = %dest_dir.display(),
-                size = src_size,
-                "Synced file to destination"
-            );
-            return Ok(());
-        }
-
-        // Large file: in-place delta sync
-        if let Some(parent) = dest_path.parent() {
+    fn sync_small_file(&self, task: &FileSyncTask<'_>) -> Result<(), SyncError> {
+        if let Some(parent) = task.dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let dest_existed = dest_path.exists();
+        fs::copy(task.src_path, task.dest_path)?;
+
+        if self.config.verify_writes {
+            verify_small_file_write(task.src_path, task.dest_path)?;
+        }
+
+        let dest_file = OpenOptions::new().write(true).open(task.dest_path)?;
+        dest_file.set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod)),
+        )?;
+
+        let record = FileRecord {
+            id: task.cached_id,
+            relative_path: task.rel_path.to_path_buf(),
+            file_size: task.src_size,
+            last_modified: task.src_mod,
+        };
+        self.db.save_file(&record, &[])?;
+        tracing::info!(
+            path = %task.rel_path.display(),
+            target = %task.dest_dir.display(),
+            size = task.src_size,
+            "Synced file to destination"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn sync_delta_large_file(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
+        if let Some(parent) = task.dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let dest_existed = task.dest_path.exists();
         let mut dest_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&dest_path)?;
+            .open(task.dest_path)?;
 
         let dest_len = dest_file.metadata().map(|m| m.len()).unwrap_or(0);
 
-        let old_hashes = if dest_existed && file_record.is_some() {
-            self.db.get_block_hashes(rel_path)?
+        let old_hashes = if dest_existed && task.cached_id.is_some() {
+            self.db.get_block_hashes(task.rel_path)?
         } else {
             Vec::new() // Force all blocks written if destination was deleted
         };
 
-        let mut src_file = File::open(&src_path)?;
+        let mut src_file = File::open(task.src_path)?;
         let block_size = self.config.block_size_bytes;
         let buf_size = block_size as usize;
         let mut heap_buf;
@@ -393,12 +499,14 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let mut modified_block_indices = Vec::new();
         let mut new_hashes = Vec::new();
         let mut block_idx = 0u64;
+        let mut total_bytes_read = 0u64;
 
         loop {
             let bytes_read = read_block(&mut src_file, &mut *buffer)?;
             if bytes_read == 0 {
                 break;
             }
+            total_bytes_read += bytes_read as u64;
             let chunk = &buffer[..bytes_read];
             let hash = *blake3::hash(chunk).as_bytes();
             new_hashes.push(hash);
@@ -416,9 +524,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
         range.flush(&mut dest_file, block_size)?;
 
-        // Verify all written blocks after destination file is completely flushed
         if self.config.verify_writes {
-            for (b_idx, bytes_len, expected_hash) in modified_block_indices {
+            for &(b_idx, bytes_len, expected_hash) in &modified_block_indices {
                 dest_file.seek(SeekFrom::Start(b_idx * block_size))?;
                 dest_file.read_exact(&mut verify_buf[..bytes_len])?;
                 if blake3::hash(&verify_buf[..bytes_len]).as_bytes() != &expected_hash {
@@ -427,27 +534,104 @@ impl<S: HashStore> LocalSyncEngine<S> {
             }
         }
 
-        // Truncate if file shrank
-        dest_file.set_len(src_size as u64)?;
+        // Truncate to exact bytes read (TOCTOU protection)
+        dest_file.set_len(total_bytes_read)?;
         dest_file.set_times(
             fs::FileTimes::new()
-                .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(src_mod)),
+                .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod)),
         )?;
 
         let record = FileRecord {
-            id: file_record.and_then(|r| r.id),
-            relative_path: rel_path.to_path_buf(),
-            file_size: src_size,
-            last_modified: src_mod,
+            id: task.cached_id,
+            relative_path: task.rel_path.to_path_buf(),
+            file_size: total_bytes_read as i64,
+            last_modified: task.src_mod,
         };
         self.db.save_file(&record, &new_hashes)?;
         tracing::info!(
-            path = %rel_path.display(),
-            target = %dest_dir.display(),
-            size = src_size,
+            path = %task.rel_path.display(),
+            target = %task.dest_dir.display(),
+            size = total_bytes_read,
             "Synced file to destination (delta)"
         );
         Ok(())
+    }
+
+    fn sync_file_to_dest_buffered_with_record(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+        file_record: Option<&FileRecord>,
+    ) -> Result<(), SyncError> {
+        if !is_safe_relative_path(rel_path) {
+            return Err(SyncError::validation(format!(
+                "Unsafe path traversal detected: {}",
+                rel_path.display()
+            )));
+        }
+        let src_path = self.config.source_dir.join(rel_path);
+        let dest_path = dest_dir.join(rel_path);
+
+        let sym_meta = fs::symlink_metadata(&src_path).map_err(SyncError::Io)?;
+        if is_reparse_or_symlink_meta(&sym_meta) {
+            tracing::debug!(path = %src_path.display(), "Skipping symlink or reparse point");
+            return Ok(());
+        }
+        if sym_meta.is_dir() {
+            verify_destination_not_reparse(&dest_path)?;
+            fs::create_dir_all(&dest_path)?;
+            let mut dir_files = HashSet::new();
+            scan_dir(&src_path, &self.config.source_dir, &mut dir_files, 0)?;
+            for child_rel in &dir_files {
+                self.sync_file_to_dest_buffered(child_rel, dest_dir, scratch)?;
+            }
+            return Ok(());
+        }
+
+        verify_destination_not_reparse(&dest_path)?;
+
+        let src_size = sym_meta.len() as i64;
+        let src_mod = safe_modified_millis(&sym_meta)?;
+
+        let dest_meta = fs::metadata(&dest_path).ok();
+        if Self::is_metadata_up_to_date(dest_meta.as_ref(), src_size, src_mod, file_record) {
+            tracing::debug!(path = %rel_path.display(), "Metadata unchanged, skipping sync");
+            return Ok(());
+        }
+
+        let cached_id = file_record.and_then(|r| r.id);
+        let task = FileSyncTask {
+            rel_path,
+            src_path: &src_path,
+            dest_path: &dest_path,
+            dest_dir,
+            src_size,
+            src_mod,
+            cached_id,
+        };
+
+        if (src_size as u64) < self.config.block_sync_threshold_bytes {
+            self.sync_small_file(&task)
+        } else {
+            self.sync_delta_large_file(&task, scratch)
+        }
+    }
+
+    /// Synchronize a file or directory tree using a reusable scratch buffer.
+    pub fn sync_file_to_dest_buffered(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
+        let file_record = self.db.get_file(rel_path)?;
+        self.sync_file_to_dest_buffered_with_record(
+            rel_path,
+            dest_dir,
+            scratch,
+            file_record.as_ref(),
+        )
     }
 
     /// Handle deletion of a file on a specific destination directory.
@@ -494,6 +678,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 fs::create_dir_all(parent)?;
             }
             fs::rename(&dest_path, &archive_path)?;
+            let archive_dir = dest_dir.join(".syncdir_archive");
+            let _ = prune_archive(&archive_dir, 30, 10 * 1024 * 1024 * 1024);
         }
         self.db.delete_file(rel_path)?;
         Ok(())
@@ -550,13 +736,20 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let mut source_files: HashSet<PathBuf> = HashSet::new();
         scan_dir(resolved_source, resolved_source, &mut source_files, 0)?;
 
+        let cached_records = self.db.list_all_records().unwrap_or_default();
+
         // Sync all source files
         let mut synced_count = 0usize;
         let mut failed_count = 0usize;
         let mut sync_skip_count = 0usize;
         let mut scratch = vec![0u8; self.config.block_size_bytes as usize];
         for rel_path in &source_files {
-            match self.sync_file_to_dest_buffered(rel_path, &active_dest, &mut scratch) {
+            match self.sync_file_to_dest_buffered_with_record(
+                rel_path,
+                &active_dest,
+                &mut scratch,
+                cached_records.get(rel_path),
+            ) {
                 Ok(()) => {
                     synced_count += 1;
                 }
@@ -606,22 +799,18 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         // Detect deletions: files in DB but missing from source
         if self.config.propagate_deletions {
             // Empty source directory safety check:
-            if source_files.is_empty() {
-                let tracked = self.db.list_files()?;
-                if !tracked.is_empty() {
-                    tracing::warn!(
-                        tracked_count = tracked.len(),
-                        "Source directory is empty but cache contains tracked files. Skipping deletion propagation to prevent accidental target wipe."
-                    );
-                    return Ok(ScanOutcome::Success { synced: 0 });
-                }
+            if source_files.is_empty() && !cached_records.is_empty() {
+                tracing::warn!(
+                    tracked_count = cached_records.len(),
+                    "Source directory is empty but cache contains tracked files. Skipping deletion propagation to prevent accidental target wipe."
+                );
+                return Ok(ScanOutcome::Success { synced: 0 });
             }
 
-            let tracked = self.db.list_files()?;
             let mut delete_skip_count = 0usize;
-            for tracked_path in tracked {
-                if !source_files.contains(&tracked_path)
-                    && let Err(e) = self.delete_file_from_dest(&tracked_path, &active_dest)
+            for tracked_path in cached_records.keys() {
+                if !source_files.contains(tracked_path)
+                    && let Err(e) = self.delete_file_from_dest(tracked_path, &active_dest)
                 {
                     let os_code = match &e {
                         SyncError::Io(io_err) => io_err.raw_os_error(),
@@ -662,7 +851,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 #[cfg(windows)]
 fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> bool {
     use std::os::windows::fs::MetadataExt;
-    if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+    if let Ok(meta) = entry.metadata() {
         (meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink()
     } else {
         true
@@ -818,7 +1007,8 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     source_online_atomic.load(std::sync::atomic::Ordering::Relaxed);
                 source_online = current_source_online;
 
-                let current_dest_online = match std::fs::metadata(&config.dest_dir) {
+                let resolved_dest = crate::net::try_resolve_alternate_path(&config.dest_dir);
+                let current_dest_online = match std::fs::metadata(&resolved_dest) {
                     Ok(meta) => meta.is_dir(),
                     Err(ref e) => {
                         if dest_online {
@@ -871,7 +1061,18 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                 }
             }
 
-            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            let earliest = pending_syncs
+                .values()
+                .chain(pending_deletes.values())
+                .min()
+                .copied();
+            let timeout = match earliest {
+                Some(dl) if dl > now => (dl - now).min(std::time::Duration::from_secs(1)),
+                Some(_) => std::time::Duration::ZERO,
+                None => std::time::Duration::from_secs(1),
+            };
+
+            match rx.recv_timeout(timeout) {
                 Ok(SyncCommand::FileModified(path)) => {
                     if pending_syncs.len() < MAX_PENDING_QUEUE {
                         let deadline = Instant::now()
@@ -971,7 +1172,8 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     *deadline = now + retry_dur;
                     return true;
                 }
-                match engine.sync_file_buffered(path, &mut scratch_buffer) {
+                let res = engine.sync_file_buffered(path, &mut scratch_buffer);
+                match res {
                     Ok(()) => false,
                     Err(e) if e.is_network_offline() => {
                         tracing::warn!(
@@ -986,6 +1188,15 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                         }
                         *deadline = now + retry_dur;
                         true
+                    }
+                    Err(SyncError::Validation(msg)) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            target = %config.dest_dir.display(),
+                            error = %msg,
+                            "Permanent validation failure; evicting from sync queue without retry"
+                        );
+                        false
                     }
                     Err(e) => {
                         let os_code = match &e {
@@ -1028,6 +1239,15 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                         }
                         *deadline = now + retry_dur;
                         true
+                    }
+                    Err(SyncError::Validation(msg)) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            target = %config.dest_dir.display(),
+                            error = %msg,
+                            "Permanent validation failure; evicting from deletion queue without retry"
+                        );
+                        false
                     }
                     Err(e) => {
                         let os_code = match &e {
@@ -1333,11 +1553,17 @@ mod tests {
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Write initial source file
+        fs::write(source.join("storm.txt"), b"initial").unwrap();
+
         let engine = LocalSyncEngine::new(store, config.clone());
         let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
         let _handle = start_sync_worker(context);
 
-        // Write source file
+        // Allow initial scan to complete
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Update source file and send rapid burst of interleaved modified/deleted events
         fs::write(source.join("storm.txt"), b"storm data").unwrap();
 
         // Send rapid burst of interleaved modified/deleted events
@@ -1348,12 +1574,22 @@ mod tests {
         tx.send(SyncCommand::FileModified(PathBuf::from("storm.txt")))
             .unwrap();
 
-        // Wait for debounce window (1s + margin)
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-
-        // The final state should be synced (FileModified won)
-        assert!(dest.join("storm.txt").exists());
-        assert_eq!(fs::read(dest.join("storm.txt")).unwrap(), b"storm data");
+        // Wait for debounce and sync to complete (debounce is 1s, allow up to 5s under load)
+        let start = std::time::Instant::now();
+        let mut synced = false;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if let Ok(content) = fs::read(dest.join("storm.txt"))
+                && content == b"storm data"
+            {
+                synced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            synced,
+            "Timed out waiting for debounced storm sync to complete"
+        );
     }
 
     #[test]
@@ -1763,5 +1999,204 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         // Dest should not exist and worker must not crash
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_sync_file_small_file_verify_writes() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::test_default(src.clone(), dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let engine = LocalSyncEngine::new(
+            MockHashStore::new(),
+            TargetSyncConfig {
+                verify_writes: true,
+                ..target_cfg
+            },
+        );
+        std::fs::write(src.join("small.txt"), b"payload").unwrap();
+        let mut scratch = vec![0u8; 4096];
+        assert!(
+            engine
+                .sync_file_to_dest_buffered(Path::new("small.txt"), &dst, &mut scratch)
+                .is_ok()
+        );
+        assert_eq!(std::fs::read(dst.join("small.txt")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn test_verify_small_file_write_corruption() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src.txt");
+        let dst = temp.path().join("dst.txt");
+        std::fs::write(&src, b"good data").unwrap();
+        std::fs::write(&dst, b"bad data").unwrap();
+        assert!(verify_small_file_write(&src, &dst).is_err());
+        assert!(verify_small_file_write(&src, &src).is_ok());
+    }
+
+    #[test]
+    fn test_sync_file_toctou_set_len_uses_total_bytes_read() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(512)
+            .block_sync_threshold_bytes(1024)
+            .build();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), config);
+
+        std::fs::write(src.join("file.bin"), vec![0xEEu8; 2048]).unwrap();
+        let mut scratch = vec![0u8; 512];
+        engine
+            .sync_file_to_dest_buffered(Path::new("file.bin"), &dst, &mut scratch)
+            .unwrap();
+        assert_eq!(std::fs::metadata(dst.join("file.bin")).unwrap().len(), 2048);
+
+        // Actual file shrank to 1024 bytes, but stale src_size of 2048 is passed
+        std::fs::write(src.join("file.bin"), vec![0x55u8; 1024]).unwrap();
+        let src_file = src.join("file.bin");
+        let dst_file = dst.join("file.bin");
+        let task = FileSyncTask {
+            rel_path: Path::new("file.bin"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dst,
+            src_size: 2048,
+            src_mod: 12345,
+            cached_id: None,
+        };
+        engine.sync_delta_large_file(&task, &mut scratch).unwrap();
+        let dest_len = std::fs::metadata(dst.join("file.bin")).unwrap().len();
+        assert_eq!(
+            dest_len, 1024,
+            "set_len must use total_bytes_read (1024), not stale src_size (2048)"
+        );
+    }
+
+    #[cfg(windows)]
+    fn create_test_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        link.display(),
+                        target.display()
+                    ),
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(std::io::Error::other("Failed to create test junction"));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_sync_refuses_dest_symlink_overwrite() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::test_default(src.clone(), dst.clone());
+        let engine = LocalSyncEngine::new(MockHashStore::new(), config);
+        std::fs::write(src.join("target.txt"), b"content").unwrap();
+        let link_target = temp.path().join("link_target");
+        std::fs::create_dir_all(&link_target).unwrap();
+        create_test_junction(&link_target, &dst.join("target.txt")).unwrap();
+
+        let mut scratch = vec![0u8; 4096];
+        let res = engine.sync_file_to_dest_buffered(Path::new("target.txt"), &dst, &mut scratch);
+        assert!(
+            res.is_err(),
+            "Engine must return Err when dest is a symlink/reparse point"
+        );
+    }
+
+    struct StubValidationFailEngine {
+        call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SyncEngine for StubValidationFailEngine {
+        fn sync_file(&self, _path: &Path) -> Result<(), SyncError> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(SyncError::validation("Permanent validation failure"))
+        }
+        fn sync_file_buffered(&self, _path: &Path, _scratch: &mut [u8]) -> Result<(), SyncError> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(SyncError::validation("Permanent validation failure"))
+        }
+        fn delete_file(&self, _path: &Path) -> Result<(), SyncError> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(SyncError::validation("Permanent validation failure"))
+        }
+        fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+            Ok(ScanOutcome::Success { synced: 0 })
+        }
+    }
+
+    #[test]
+    fn test_sync_worker_evicts_validation_errors_without_retry() {
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = StubValidationFailEngine {
+            call_count: call_count.clone(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src)
+            .dest_dir(dst)
+            .debounce_seconds(0)
+            .retry_interval_seconds(1)
+            .build();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let handle = start_sync_worker(ctx);
+        tx.send(SyncCommand::FileModified(PathBuf::from(
+            "unsafe/../file.txt",
+        )))
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(tx);
+        handle.join().unwrap();
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Validation error must be evicted after 1 attempt, not retried"
+        );
+    }
+
+    #[test]
+    fn test_prune_archive_retention() {
+        let temp = tempdir().unwrap();
+        let archive = temp.path().join(".syncdir_archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let f1 = archive.join("old.txt");
+        let f2 = archive.join("new.txt");
+        std::fs::write(&f1, vec![0u8; 100]).unwrap();
+        std::fs::write(&f2, vec![0u8; 200]).unwrap();
+
+        // Prune with max_bytes = 150
+        prune_archive(&archive, 365, 150).unwrap();
+        let total_remaining: u64 = std::fs::read_dir(&archive)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(total_remaining <= 150);
     }
 }

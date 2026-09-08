@@ -81,21 +81,30 @@ fn test_watcher_and_sync_engine_flow() {
     let worker_ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
     let _worker_handle = start_sync_worker(worker_ctx);
 
+    // Give watcher thread time to establish OS directory hook and catch-up scan to stabilize
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     // Write a file in source — watcher should pick it up
     let file_path = source.join("notes.txt");
     std::fs::write(&file_path, b"hello world").unwrap();
 
-    // Wait for debounce (1s) + processing margin
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // Verify dest file contains synchronized content
+    // Wait for debounce (1s) and sync to complete (allow up to 5s under load)
     let dest_file_path = dest.join("notes.txt");
-    assert!(
-        dest_file_path.exists(),
-        "Destination file should exist after sync"
+    let start = std::time::Instant::now();
+    let mut content = String::new();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        if let Ok(c) = std::fs::read_to_string(&dest_file_path)
+            && c == "hello world"
+        {
+            content = c;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        content, "hello world",
+        "Destination file should contain synchronized content after debounce"
     );
-    let content = std::fs::read_to_string(&dest_file_path).unwrap();
-    assert_eq!(content, "hello world");
 }
 
 #[test]
