@@ -25,6 +25,30 @@ pub struct TargetSyncConfig {
 }
 
 impl TargetSyncConfig {
+    /// Create a new `TargetSyncConfig`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_dir: PathBuf,
+        dest_dir: PathBuf,
+        block_size_bytes: u64,
+        block_sync_threshold_bytes: u64,
+        verify_writes: bool,
+        debounce_seconds: u64,
+        retry_interval_seconds: u64,
+        propagate_deletions: bool,
+    ) -> Self {
+        Self {
+            source_dir,
+            dest_dir,
+            block_size_bytes,
+            block_sync_threshold_bytes,
+            verify_writes,
+            debounce_seconds,
+            retry_interval_seconds,
+            propagate_deletions,
+        }
+    }
+
     /// Source directory getter.
     pub fn source_dir(&self) -> &Path {
         &self.source_dir
@@ -64,11 +88,6 @@ impl TargetSyncConfig {
     pub fn propagate_deletions(&self) -> bool {
         self.propagate_deletions
     }
-
-    /// Resolved source directory path.
-    pub fn resolved_source_dir(&self) -> &Path {
-        &self.source_dir
-    }
 }
 
 impl From<&Config> for TargetSyncConfig {
@@ -79,7 +98,7 @@ impl From<&Config> for TargetSyncConfig {
             .or_else(|| cfg.dest_dirs().and_then(|dirs| dirs.first().cloned()))
             .unwrap_or_default();
         Self {
-            source_dir: cfg.resolved_source_dir(),
+            source_dir: cfg.source_dir().to_path_buf(),
             dest_dir: dest,
             block_size_bytes: cfg.block_size_bytes(),
             block_sync_threshold_bytes: cfg.block_sync_threshold_bytes(),
@@ -192,6 +211,16 @@ impl ConfigBuilder {
         self
     }
 
+    /// Add an additional destination directory.
+    pub fn add_dest_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        match self.dest_dirs.as_mut() {
+            Some(dirs) => dirs.push(dir),
+            None => self.dest_dirs = Some(vec![dir]),
+        }
+        self
+    }
+
     /// Builds and normalizes paths without failing validation, allowing `config.validate()` to be called.
     pub fn build(self) -> Config {
         let mut cfg = Config {
@@ -207,6 +236,13 @@ impl ConfigBuilder {
         };
         cfg.normalize_paths();
         cfg
+    }
+
+    /// Builds and validates the configuration, returning an error if validation fails.
+    pub fn try_build(self) -> Result<Config, SyncError> {
+        let config = self.build();
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -268,10 +304,22 @@ impl Config {
         }
     }
 
-    /// Return the resolved, normalized source directory path, attempting `try_resolve_alternate_path`
-    /// if the raw path is unreachable or on a mapped drive / network share.
-    pub fn resolved_source_dir(&self) -> PathBuf {
-        try_resolve_alternate_path(&self.source_dir)
+    /// Return the normalized source directory path.
+    pub fn resolved_source_dir(&self) -> &Path {
+        &self.source_dir
+    }
+
+    /// Resolve network paths (UNC shares / mapped drives) in-place for source and destinations.
+    pub fn resolve_network_paths(&mut self) {
+        self.source_dir = try_resolve_alternate_path(&self.source_dir);
+        if let Some(ref mut d) = self.dest_dir {
+            *d = try_resolve_alternate_path(d);
+        }
+        if let Some(ref mut dirs) = self.dest_dirs {
+            for d in dirs.iter_mut() {
+                *d = try_resolve_alternate_path(d);
+            }
+        }
     }
 
     /// Return a merged, deduplicated list of all configured destination directories.
@@ -308,8 +356,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, SyncError> {
         let content = std::fs::read_to_string(path)?;
         let processed = preprocess_config_toml(&content);
-        let mut config: Config =
-            toml::from_str(&processed).map_err(|e| SyncError::Config(e.to_string()))?;
+        let mut config: Config = toml::from_str(&processed)?;
         config.normalize_paths();
         Ok(config)
     }
@@ -404,7 +451,7 @@ impl Config {
     /// Returns `SyncError::Config` if the `APPDATA` environment variable is not set.
     pub fn default_app_dir() -> Result<PathBuf, SyncError> {
         let appdata = std::env::var("APPDATA")
-            .map_err(|_| SyncError::Config("APPDATA environment variable not set".into()))?;
+            .map_err(|_| SyncError::config("APPDATA environment variable not set"))?;
         Ok(PathBuf::from(appdata).join("syncdir"))
     }
 
@@ -415,6 +462,15 @@ impl Config {
     pub fn default_config_path() -> Result<PathBuf, SyncError> {
         Ok(Self::default_app_dir()?.join("config.toml"))
     }
+}
+
+/// Returns the Windows system root directory (e.g. `C:\Windows`).
+/// Reads `%SystemRoot%`, then `%windir%`, defaulting to `C:\Windows`.
+pub fn system_root() -> PathBuf {
+    std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("windir"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
 }
 
 fn preprocess_config_toml(content: &str) -> String {
@@ -487,7 +543,7 @@ impl Config {
     /// Return a clone of this Config with the specified destination directory set.
     pub fn with_dest_dir(&self, dest: PathBuf) -> Self {
         let mut cloned = self.clone();
-        cloned.dest_dir = Some(dest);
+        cloned.dest_dir = Some(normalize_path(&dest));
         cloned
     }
 
@@ -537,9 +593,8 @@ impl Config {
     }
 
     /// Generate isolated target sync configurations for each configured destination directory.
-    /// Pre-resolves `source_dir` using `self.resolved_source_dir()`.
     pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
-        let resolved_src = self.resolved_source_dir();
+        let resolved_src = self.source_dir.clone();
         self.resolved_dest_dirs()
             .into_iter()
             .map(|dest| TargetSyncConfig {
@@ -1048,7 +1103,7 @@ mod tests {
         std::fs::create_dir(&source_path).unwrap();
 
         let config = Config::test_default(source_path.clone(), temp.path().join("dest"));
-        assert_eq!(config.resolved_source_dir(), source_path);
+        assert_eq!(config.resolved_source_dir(), &source_path);
     }
 
     #[test]
@@ -1153,5 +1208,52 @@ mod tests {
                 .to_string()
                 .contains("block_sync_threshold_bytes")
         );
+    }
+
+    #[test]
+    fn test_system_root() {
+        let root = system_root();
+        assert!(!root.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_builder_add_dest_dir_and_try_build() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst1 = temp.path().join("dst1");
+        let dst2 = temp.path().join("dst2");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst1).unwrap();
+        std::fs::create_dir_all(&dst2).unwrap();
+
+        let config = Config::builder(&src)
+            .dest_dir(&dst1)
+            .add_dest_dir(&dst2)
+            .try_build()
+            .unwrap();
+
+        assert_eq!(config.resolved_dest_dirs().len(), 2);
+    }
+
+    #[test]
+    fn test_target_sync_config_new() {
+        let target = TargetSyncConfig::new(
+            PathBuf::from(r"C:\src"),
+            PathBuf::from(r"C:\dst"),
+            1024,
+            2048,
+            true,
+            5,
+            15,
+            false,
+        );
+        assert_eq!(target.source_dir(), Path::new(r"C:\src"));
+        assert_eq!(target.dest_dir(), Path::new(r"C:\dst"));
+        assert_eq!(target.block_size_bytes(), 1024);
+        assert_eq!(target.block_sync_threshold_bytes(), 2048);
+        assert!(target.verify_writes());
+        assert_eq!(target.debounce_seconds(), 5);
+        assert_eq!(target.retry_interval_seconds(), 15);
+        assert!(!target.propagate_deletions());
     }
 }

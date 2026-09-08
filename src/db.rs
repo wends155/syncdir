@@ -6,29 +6,84 @@
 use crate::config::Config;
 use crate::error::SyncError;
 use rusqlite::{Connection, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Metadata record for a tracked file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
     pub id: Option<i64>,
-    pub relative_path: String,
+    pub relative_path: PathBuf,
     /// File size in bytes. Uses `i64` to match SQLite INTEGER column type.
     pub file_size: i64,
     pub last_modified: i64,
+}
+
+/// Convert relative path to canonical forward-slash SQLite storage key.
+pub fn path_to_sqlite_key(path: &Path) -> Result<String, SyncError> {
+    let s = path.to_string_lossy();
+    if s.is_empty() {
+        return Err(SyncError::validation("Path cannot be empty"));
+    }
+    // Normalize any backslashes to forward slashes for cross-platform SQLite storage
+    let key = s.replace('\\', "/");
+    Ok(key.trim_start_matches('/').to_string())
+}
+
+/// Minimal configuration parameters required by `SqliteHashStore`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreConfig {
+    pub block_size_bytes: u64,
+    pub block_sync_threshold_bytes: u64,
+}
+
+impl StoreConfig {
+    /// Create a new store configuration with specified block size and threshold.
+    pub fn new(block_size_bytes: u64, block_sync_threshold_bytes: u64) -> Self {
+        Self {
+            block_size_bytes,
+            block_sync_threshold_bytes,
+        }
+    }
+}
+
+impl From<&Config> for StoreConfig {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            block_size_bytes: cfg.block_size_bytes(),
+            block_sync_threshold_bytes: cfg.block_sync_threshold_bytes(),
+        }
+    }
+}
+
+impl From<&crate::config::TargetSyncConfig> for StoreConfig {
+    fn from(cfg: &crate::config::TargetSyncConfig) -> Self {
+        Self {
+            block_size_bytes: cfg.block_size_bytes(),
+            block_sync_threshold_bytes: cfg.block_sync_threshold_bytes(),
+        }
+    }
 }
 
 /// A Blake3 block hash: fixed 32-byte digest.
 pub type BlockHash = [u8; 32];
 
 /// Interface for persisting and querying file block signatures.
-pub trait HashStore {
-    fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError>;
+pub trait HashStore: Send + Sync {
+    /// Retrieve stored metadata and signatures for a file by relative path.
+    fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError>;
+
+    /// Persist file metadata and its associated block hashes.
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError>;
+
+    /// Retrieve all stored block hashes for a given file metadata row ID.
     fn get_block_hashes(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError>;
-    fn delete_file(&self, path: &str) -> Result<(), SyncError>;
-    fn list_files(&self) -> Result<Vec<String>, SyncError>;
+
+    /// Delete a file record and cascade removal of all its block hashes.
+    fn delete_file(&self, path: &Path) -> Result<(), SyncError>;
+
+    /// List relative paths of all currently tracked files in the database.
+    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError>;
 }
 
 /// SQLite implementation of `HashStore`.
@@ -45,7 +100,8 @@ impl SqliteHashStore {
     ///
     /// # Errors
     /// Returns `SyncError::Db` on any SQLite failure.
-    pub fn new(db_path: &Path, config: &Config) -> Result<Self, SyncError> {
+    pub fn new(db_path: &Path, config: impl Into<StoreConfig>) -> Result<Self, SyncError> {
+        let store_cfg = config.into();
         let conn = Connection::open(db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -57,7 +113,7 @@ impl SqliteHashStore {
             conn: Mutex::new(conn),
         };
         store.init_schema()?;
-        store.enforce_metadata(config)?;
+        store.enforce_metadata(store_cfg)?;
         Ok(store)
     }
 
@@ -93,13 +149,13 @@ impl SqliteHashStore {
         Ok(())
     }
 
-    fn enforce_metadata(&self, config: &Config) -> Result<(), SyncError> {
+    fn enforce_metadata(&self, config: StoreConfig) -> Result<(), SyncError> {
         let cached_block_size = self.get_meta_value("block_size_bytes")?;
         let cached_threshold = self.get_meta_value("block_sync_threshold_bytes")?;
         let cached_version = self.get_meta_value("db_version")?;
 
-        let current_block_size = config.block_size_bytes().to_string();
-        let current_threshold = config.block_sync_threshold_bytes().to_string();
+        let current_block_size = config.block_size_bytes.to_string();
+        let current_threshold = config.block_sync_threshold_bytes.to_string();
         let current_version = "3";
 
         // Treat any missing key or mismatch as requiring a full purge
@@ -125,7 +181,7 @@ impl SqliteHashStore {
 
     fn get_meta_value(&self, key: &str) -> Result<Option<String>, SyncError> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT value FROM db_metadata WHERE key = ?")?;
+        let mut stmt = conn.prepare_cached("SELECT value FROM db_metadata WHERE key = ?")?;
         let mut rows = stmt.query(params![key])?;
         if let Some(row) = rows.next()? {
             let val: String = row.get(0)?;
@@ -137,26 +193,27 @@ impl SqliteHashStore {
 
     fn set_meta_value(&self, key: &str, value: &str) -> Result<(), SyncError> {
         let conn = self.conn()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO db_metadata (key, value) VALUES (?, ?)",
-            params![key, value],
-        )?;
+        let mut stmt =
+            conn.prepare_cached("INSERT OR REPLACE INTO db_metadata (key, value) VALUES (?, ?)")?;
+        stmt.execute(params![key, value])?;
         Ok(())
     }
 }
 
 impl HashStore for SqliteHashStore {
-    fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError> {
+    fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
+        let key = path_to_sqlite_key(path)?;
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, relative_path, file_size, last_modified \
              FROM file_metadata WHERE relative_path = ?",
         )?;
-        let mut rows = stmt.query(params![path])?;
+        let mut rows = stmt.query(params![key])?;
         if let Some(row) = rows.next()? {
+            let path_str: String = row.get(1)?;
             Ok(Some(FileRecord {
                 id: Some(row.get(0)?),
-                relative_path: row.get(1)?,
+                relative_path: PathBuf::from(path_str),
                 file_size: row.get(2)?,
                 last_modified: row.get(3)?,
             }))
@@ -166,6 +223,7 @@ impl HashStore for SqliteHashStore {
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
+        let key = path_to_sqlite_key(&record.relative_path)?;
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
@@ -176,13 +234,13 @@ impl HashStore for SqliteHashStore {
              ON CONFLICT(relative_path) DO UPDATE SET \
                file_size = excluded.file_size, \
                last_modified = excluded.last_modified",
-            params![record.relative_path, record.file_size, record.last_modified],
+            params![key, record.file_size, record.last_modified],
         )?;
 
         // Retrieve the stable rowid (works for both insert and update)
         let file_id: i64 = tx.query_row(
             "SELECT id FROM file_metadata WHERE relative_path = ?",
-            params![record.relative_path],
+            params![key],
             |row| row.get(0),
         )?;
 
@@ -191,21 +249,22 @@ impl HashStore for SqliteHashStore {
             "DELETE FROM block_hashes WHERE file_id = ?",
             params![file_id],
         )?;
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO block_hashes (file_id, block_index, hash) \
-             VALUES (?, ?, ?)",
-        )?;
-        for (idx, hash) in hashes.iter().enumerate() {
-            stmt.execute(params![file_id, idx as i64, hash.as_slice()])?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO block_hashes (file_id, block_index, hash) \
+                 VALUES (?, ?, ?)",
+            )?;
+            for (idx, hash) in hashes.iter().enumerate() {
+                stmt.execute(params![file_id, idx as i64, hash.as_slice()])?;
+            }
         }
-        drop(stmt);
         tx.commit()?;
         Ok(())
     }
 
     fn get_block_hashes(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT hash FROM block_hashes WHERE file_id = ? \
              ORDER BY block_index ASC",
         )?;
@@ -213,31 +272,31 @@ impl HashStore for SqliteHashStore {
         let mut hashes = Vec::new();
         while let Some(row) = rows.next()? {
             let hash_blob: Vec<u8> = row.get(0)?;
-            let hash: BlockHash = hash_blob.try_into().map_err(|_| {
-                SyncError::Validation("Invalid block hash length in database".into())
-            })?;
+            let hash: BlockHash = hash_blob
+                .try_into()
+                .map_err(|_| SyncError::validation("Invalid block hash length in database"))?;
             hashes.push(hash);
         }
         Ok(hashes)
     }
 
-    fn delete_file(&self, path: &str) -> Result<(), SyncError> {
+    fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
+        let key = path_to_sqlite_key(path)?;
         let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM file_metadata WHERE relative_path = ?",
-            params![path],
-        )?;
+        let mut stmt = conn.prepare_cached("DELETE FROM file_metadata WHERE relative_path = ?")?;
+        stmt.execute(params![key])?;
         Ok(())
     }
 
-    fn list_files(&self) -> Result<Vec<String>, SyncError> {
+    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
         let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT relative_path FROM file_metadata ORDER BY relative_path ASC")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT relative_path FROM file_metadata ORDER BY relative_path ASC")?;
         let mut rows = stmt.query([])?;
         let mut paths = Vec::new();
         while let Some(row) = rows.next()? {
-            paths.push(row.get(0)?);
+            let key: String = row.get(0)?;
+            paths.push(PathBuf::from(key));
         }
         Ok(paths)
     }
@@ -259,32 +318,28 @@ pub struct MockHashStore {
 impl MockHashStore {
     /// Create a new empty in-memory hash store.
     pub fn new() -> Self {
-        Self {
-            inner: std::sync::Arc::new(std::sync::RwLock::new(MockStoreInner {
-                records: std::collections::HashMap::new(),
-                hashes: std::collections::HashMap::new(),
-                next_id: 1,
-            })),
-        }
+        Self::default()
     }
 }
 
 impl HashStore for MockHashStore {
-    fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError> {
+    fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
+        let key = path_to_sqlite_key(path)?;
         let inner = self
             .inner
             .read()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
-        Ok(inner.records.get(path).cloned())
+            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
+        Ok(inner.records.get(&key).cloned())
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
+        let key = path_to_sqlite_key(&record.relative_path)?;
         let mut inner = self
             .inner
             .write()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
 
-        let id = if let Some(existing) = inner.records.get(&record.relative_path) {
+        let id = if let Some(existing) = inner.records.get(&key) {
             existing.id.unwrap_or(1)
         } else {
             let assigned = inner.next_id;
@@ -294,7 +349,7 @@ impl HashStore for MockHashStore {
 
         let mut updated = record.clone();
         updated.id = Some(id);
-        inner.records.insert(record.relative_path.clone(), updated);
+        inner.records.insert(key, updated);
         inner.hashes.insert(id, hashes.to_vec());
         Ok(())
     }
@@ -303,17 +358,18 @@ impl HashStore for MockHashStore {
         let inner = self
             .inner
             .read()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
         Ok(inner.hashes.get(&file_id).cloned().unwrap_or_default())
     }
 
-    fn delete_file(&self, path: &str) -> Result<(), SyncError> {
+    fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
+        let key = path_to_sqlite_key(path)?;
         let mut inner = self
             .inner
             .write()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
 
-        if let Some(removed) = inner.records.remove(path)
+        if let Some(removed) = inner.records.remove(&key)
             && let Some(id) = removed.id
         {
             inner.hashes.remove(&id);
@@ -321,14 +377,14 @@ impl HashStore for MockHashStore {
         Ok(())
     }
 
-    fn list_files(&self) -> Result<Vec<String>, SyncError> {
+    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
         let inner = self
             .inner
             .read()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
         let mut keys: Vec<String> = inner.records.keys().cloned().collect();
         keys.sort();
-        Ok(keys)
+        Ok(keys.into_iter().map(PathBuf::from).collect())
     }
 }
 
@@ -356,7 +412,7 @@ mod tests {
 
         let record = FileRecord {
             id: None,
-            relative_path: "docs/spec.txt".to_string(),
+            relative_path: PathBuf::from("docs/spec.txt"),
             file_size: 2048,
             last_modified: 1234567890,
         };
@@ -364,8 +420,9 @@ mod tests {
 
         store.save_file(&record, &hashes).unwrap();
 
-        let fetched = store.get_file("docs/spec.txt").unwrap().unwrap();
+        let fetched = store.get_file(Path::new("docs/spec.txt")).unwrap().unwrap();
         let file_id = fetched.id.unwrap();
+        assert_eq!(fetched.relative_path, PathBuf::from("docs/spec.txt"));
         assert_eq!(fetched.file_size, 2048);
         assert_eq!(fetched.last_modified, 1234567890);
 
@@ -375,8 +432,13 @@ mod tests {
         assert_eq!(fetched_hashes[1], [2u8; 32]);
 
         // Verify foreign key cascade delete
-        store.delete_file("docs/spec.txt").unwrap();
-        assert!(store.get_file("docs/spec.txt").unwrap().is_none());
+        store.delete_file(Path::new("docs/spec.txt")).unwrap();
+        assert!(
+            store
+                .get_file(Path::new("docs/spec.txt"))
+                .unwrap()
+                .is_none()
+        );
 
         let count: i64 = store
             .conn
@@ -399,22 +461,27 @@ mod tests {
 
         let record = FileRecord {
             id: None,
-            relative_path: "test.bin".to_string(),
+            relative_path: PathBuf::from("test.bin"),
             file_size: 100,
             last_modified: 1000,
         };
         store.save_file(&record, &[[1u8; 32]]).unwrap();
-        let id1 = store.get_file("test.bin").unwrap().unwrap().id.unwrap();
+        let id1 = store
+            .get_file(Path::new("test.bin"))
+            .unwrap()
+            .unwrap()
+            .id
+            .unwrap();
 
         // Update same file — rowid should be preserved
         let updated = FileRecord {
             id: None,
-            relative_path: "test.bin".to_string(),
+            relative_path: PathBuf::from("test.bin"),
             file_size: 200,
             last_modified: 2000,
         };
         store.save_file(&updated, &[[2u8; 32], [3u8; 32]]).unwrap();
-        let fetched = store.get_file("test.bin").unwrap().unwrap();
+        let fetched = store.get_file(Path::new("test.bin")).unwrap().unwrap();
         assert_eq!(fetched.id.unwrap(), id1); // Same rowid
         assert_eq!(fetched.file_size, 200);
 
@@ -432,19 +499,19 @@ mod tests {
             let store = SqliteHashStore::new(temp.path(), &config_a).unwrap();
             let record = FileRecord {
                 id: None,
-                relative_path: "test.bin".to_string(),
+                relative_path: PathBuf::from("test.bin"),
                 file_size: 100,
                 last_modified: 9999,
             };
             store.save_file(&record, &[[7u8; 32]]).unwrap();
-            assert!(store.get_file("test.bin").unwrap().is_some());
+            assert!(store.get_file(Path::new("test.bin")).unwrap().is_some());
         }
 
         // Open with config B (different block size) — cache should be purged
         let config_b = dummy_config(512);
         {
             let store = SqliteHashStore::new(temp.path(), &config_b).unwrap();
-            assert!(store.get_file("test.bin").unwrap().is_none());
+            assert!(store.get_file(Path::new("test.bin")).unwrap().is_none());
         }
     }
 
@@ -460,13 +527,13 @@ mod tests {
         // Insert two files
         let r1 = FileRecord {
             id: None,
-            relative_path: "b_second.txt".to_string(),
+            relative_path: PathBuf::from("b_second.txt"),
             file_size: 100,
             last_modified: 1000,
         };
         let r2 = FileRecord {
             id: None,
-            relative_path: "a_first.txt".to_string(),
+            relative_path: PathBuf::from("a_first.txt"),
             file_size: 200,
             last_modified: 2000,
         };
@@ -474,12 +541,15 @@ mod tests {
         store.save_file(&r2, &[[2u8; 32]]).unwrap();
 
         let files = store.list_files().unwrap();
-        assert_eq!(files, vec!["a_first.txt", "b_second.txt"]);
+        assert_eq!(
+            files,
+            vec![PathBuf::from("a_first.txt"), PathBuf::from("b_second.txt")]
+        );
 
         // After delete, removed file is gone
-        store.delete_file("a_first.txt").unwrap();
+        store.delete_file(Path::new("a_first.txt")).unwrap();
         let files = store.list_files().unwrap();
-        assert_eq!(files, vec!["b_second.txt"]);
+        assert_eq!(files, vec![PathBuf::from("b_second.txt")]);
     }
 
     #[test]
@@ -490,24 +560,60 @@ mod tests {
 
         let record = FileRecord {
             id: None,
-            relative_path: "docs/readme.txt".to_string(),
+            relative_path: PathBuf::from("docs/readme.txt"),
             file_size: 1024,
             last_modified: 999,
         };
         let hashes = vec![[0xAAu8; 32]];
         store.save_file(&record, &hashes).unwrap();
 
-        let fetched = store.get_file("docs/readme.txt").unwrap().unwrap();
+        let fetched = store
+            .get_file(Path::new("docs/readme.txt"))
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.file_size, 1024);
         let id = fetched.id.unwrap();
 
         let block_hashes = store.get_block_hashes(id).unwrap();
         assert_eq!(block_hashes, vec![[0xAAu8; 32]]);
 
-        assert_eq!(store.list_files().unwrap(), vec!["docs/readme.txt"]);
+        assert_eq!(
+            store.list_files().unwrap(),
+            vec![PathBuf::from("docs/readme.txt")]
+        );
 
-        store.delete_file("docs/readme.txt").unwrap();
-        assert!(store.get_file("docs/readme.txt").unwrap().is_none());
+        store.delete_file(Path::new("docs/readme.txt")).unwrap();
+        assert!(
+            store
+                .get_file(Path::new("docs/readme.txt"))
+                .unwrap()
+                .is_none()
+        );
         assert!(store.list_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_path_to_sqlite_key() {
+        assert_eq!(
+            path_to_sqlite_key(Path::new(r"foo\bar\baz.txt")).unwrap(),
+            "foo/bar/baz.txt"
+        );
+        assert_eq!(
+            path_to_sqlite_key(Path::new("foo/bar/baz.txt")).unwrap(),
+            "foo/bar/baz.txt"
+        );
+        assert!(path_to_sqlite_key(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn test_store_config_conversions() {
+        let sc = StoreConfig::new(4096, 8192);
+        assert_eq!(sc.block_size_bytes, 4096);
+        assert_eq!(sc.block_sync_threshold_bytes, 8192);
+
+        let cfg = dummy_config(2048);
+        let from_cfg = StoreConfig::from(&cfg);
+        assert_eq!(from_cfg.block_size_bytes, 2048);
+        assert_eq!(from_cfg.block_sync_threshold_bytes, 4096);
     }
 }

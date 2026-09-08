@@ -220,12 +220,28 @@ fn generate_default_icon() -> Result<Icon, SyncError> {
 
 /// Open a file or directory in the system default application.
 fn open_path(path: &std::path::Path) -> Result<(), SyncError> {
-    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let explorer = PathBuf::from(sys_root).join("explorer.exe");
-    std::process::Command::new(explorer)
-        .arg(path)
-        .spawn()
-        .map_err(SyncError::Io)?;
+    #[cfg(target_os = "windows")]
+    {
+        let explorer = crate::config::system_root().join("explorer.exe");
+        let mut cmd = if explorer.exists() {
+            std::process::Command::new(explorer)
+        } else {
+            std::process::Command::new("explorer")
+        };
+        cmd.arg(path).spawn().map_err(SyncError::Io)?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(opener)
+            .arg(path)
+            .spawn()
+            .map_err(SyncError::Io)?;
+    }
     Ok(())
 }
 
@@ -298,42 +314,10 @@ fn show_error_dialog(title_str: &str, msg_str: &str) {
 #[cfg(not(target_os = "windows"))]
 fn show_error_dialog(_title_str: &str, _msg_str: &str) {}
 
-/// Launch the system tray event loop (blocking).
-///
-/// Creates a tray icon in the Windows notification area with a checkable
-/// context menu and listens for user mouse interactions and directory status updates.
-///
-/// # Arguments
-///
-/// * `event_loop` - The winit event loop initialized on the main UI thread.
-/// * `config_path` - The system path to the user's `config.toml`.
-/// * `log_dir` - The path to the active log directory for manual retrieval.
-/// * `tx` - Sender channel used to dispatch sync commands to the worker.
-///
-/// # Returns
-///
-/// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
-///
-/// Creates a tray icon in the Windows notification area with a checkable
-/// context menu and listens for user mouse interactions and directory status updates.
-///
-/// # Arguments
-///
-/// * `event_loop` - The winit event loop initialized on the main UI thread.
-/// * `config_path` - The system path to the user's `config.toml`.
-/// * `log_dir` - The path to the active log directory for manual retrieval.
-/// * `tx` - Sender channel used to dispatch sync commands to the worker.
-/// * `destinations` - Initial destination states with reachability status.
-/// * `registry` - Startup registry backend implementation for managing Windows auto-start.
-///
-/// # Returns
-///
-/// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
-///
-/// # Errors
-///
-/// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
 /// Handler interface for decoupled tray user actions.
+///
+/// Implementors handle UI actions triggered by context menu clicks, such as
+/// initiating a manual sync, reloading the configuration, or toggling Windows startup.
 pub trait TrayActionHandler: Send + Sync + 'static {
     /// Callback when user requests manual synchronization.
     fn on_sync_now(&self) -> Result<(), SyncError>;

@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: fac230b
+> Last verified against: 8e6f4a7
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
-| **Version** | 0.1.11 |
-| **Last Updated** | 2026-08-02 |
+| **Version** | 0.1.13 |
+| **Last Updated** | 2026-09-08 |
 
 
 ---
@@ -15,15 +15,26 @@
 
 ### 1. Config Module
  
-> Handles configuration file loading and validation.
+> Handles configuration file loading, path sanitization, and invariant validation.
  
 #### Public API
  
-| Function | Signature | Returns | Errors |
-|----------|-----------|---------|--------|
+| Function / Struct | Signature | Returns | Errors |
+|-------------------|-----------|---------|--------|
 | `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
 | `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid parameters, relative paths, or missing destination directories) |
+| `Config::resolved_source_dir` | `(&self) -> &Path` | `&Path` | — (pure non-blocking getter) |
 | `Config::resolved_dest_dirs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
+| `Config::target_configs` | `(&self) -> Vec<TargetSyncConfig>` | `Vec<TargetSyncConfig>` | — |
+| `Config::builder` | `(source_dir: impl Into<PathBuf>) -> ConfigBuilder` | `ConfigBuilder` | — |
+| `ConfigBuilder::new` | `(source_dir: impl Into<PathBuf>) -> Self` | `ConfigBuilder` | — |
+| `ConfigBuilder::dest_dir` | `(mut self, dest: impl Into<PathBuf>) -> Self` | `ConfigBuilder` | — |
+| `ConfigBuilder::dest_dirs` | `(mut self, dirs: Vec<PathBuf>) -> Self` | `ConfigBuilder` | — |
+| `ConfigBuilder::add_dest_dir` | `(mut self, dir: impl Into<PathBuf>) -> Self` | `ConfigBuilder` | — |
+| `ConfigBuilder::build` | `(self) -> Config` | `Config` | — |
+| `ConfigBuilder::try_build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` |
+| `system_root` | `() -> PathBuf` | `PathBuf` | — |
+| `TargetSyncConfig::new` | `(...) -> Self` | `TargetSyncConfig` | — |
  
 #### Behavioral Scenarios
  
@@ -69,61 +80,102 @@ THEN `SyncError::Validation` is returned rejecting the invalid destination path 
 
 ### 2. DB Module (HashStore)
 
-> Manages the local persistence of file signatures and metadata.
+> Manages the local persistence of file signatures and metadata via SQLite.
 
 #### Public API
 
-| Function | Signature | Returns | Errors |
-|----------|-----------|---------|--------|
-| `get_file` | `(&self, path: &str) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `SyncError::Db` |
-| `save_file` | `(&self, record: &FileRecord, hashes: &[Vec<u8>]) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
-| `delete_file` | `(&self, path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
+| Function / Trait | Signature | Returns | Errors |
+|------------------|-----------|---------|--------|
+| `HashStore::get_file` | `(&self, path: &Path) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `SyncError::Db` |
+| `HashStore::save_file` | `(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
+| `HashStore::get_block_hashes` | `(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError>` | `Vec<BlockHash>` | `SyncError::Db` |
+| `HashStore::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
+| `HashStore::list_files` | `(&self) -> Result<Vec<PathBuf>, SyncError>` | `Vec<PathBuf>` | `SyncError::Db` |
+| `SqliteHashStore::new` | `(db_path: &Path, config: impl Into<StoreConfig>) -> Result<Self, SyncError>` | `SqliteHashStore` | `SyncError::Db` |
+| `path_to_sqlite_key` | `(path: &Path) -> Result<String, SyncError>` | `String` | `SyncError::Validation` |
+| `StoreConfig::new` | `(block_size_bytes: u64, block_sync_threshold_bytes: u64) -> Self` | `StoreConfig` | — |
 
 #### Behavioral Scenarios
 
+[HAPPY] Canonical path key conversion for SQLite
+GIVEN a relative path with Windows backslashes `r"documents\subfolder\notes.txt"`
+WHEN `path_to_sqlite_key` is called
+THEN the path is returned as a forward-slash key `"documents/subfolder/notes.txt"`
+
 [HAPPY] Retrieve existing file signatures
 GIVEN a SQLite database containing file metadata and hashes for "documents/notes.txt"
-WHEN `get_file` is called with path "documents/notes.txt"
+WHEN `get_file` is called with path `Path::new("documents/notes.txt")`
 THEN a `FileRecord` is returned containing the matching file size, last modified time, and block hashes
 
-[HAPPY] Save new file signatures
+[HAPPY] Save new file signatures with cached statements and transactions
 GIVEN a file "notes.txt" with size 1500 bytes and two block hashes
 WHEN `save_file` is called
-THEN the record is written to `file_metadata` and the hashes are written to `block_hashes` with correct foreign keys
+THEN the record is written to `file_metadata` and the hashes are written to `block_hashes` using prepared cached statements
 AND subsequent calls to `get_file` return the written data
 
-[HAPPY] Delete file metadata
+[HAPPY] Delete file metadata with cascade
 GIVEN an existing record for "notes.txt" in the database
-WHEN `delete_file` is called
+WHEN `delete_file` is called with `Path::new("notes.txt")`
 THEN the metadata record and all associated block hashes are deleted (cascaded) from the database
 
 ### 3. Sync Module (SyncEngine)
  
-> Performs delta comparison, block-level updates, and runs the background daemon queue processing.
+> Performs streaming delta sync, single-pass I/O, contiguous block coalescing, and worker queue processing.
  
 #### Public API
  
 | Function / Component | Signature | Returns | Errors |
 |----------------------|-----------|---------|--------|
-| `sync_file` | `(&self, relative_path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db` |
-| `delete_file` | `(&self, relative_path: &str) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
-| `run_full_scan` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db` |
-| `start_sync_worker` | `(target_index: usize, config: Config, db: S, rx: Receiver<SyncCommand>, event_proxy: Option<EventLoopProxy<UserEvent>>, source_online: std::sync::Arc<std::sync::atomic::AtomicBool>) -> JoinHandle<()>` | `JoinHandle<()>` | — |
+| `sync_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db` |
+| `delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
+| `run_full_scan` | `(&self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
+| `start_sync_worker` | `(target_index: usize, config: TargetSyncConfig, db: S, rx: Receiver<SyncCommand>, event_proxy: Option<EventLoopProxy<UserEvent>>, source_online: Arc<AtomicBool>) -> JoinHandle<()>` | `JoinHandle<()>` | — |
+| `DirtyBlockRange::new` | `() -> Self` | `DirtyBlockRange` | — |
+| `DirtyBlockRange::add_block` | `(&mut self, block_idx: u64, bytes: &[u8], writer: &mut W, block_size: u64) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
+| `DirtyBlockRange::flush` | `(&mut self, writer: &mut W, block_size: u64) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
+| `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | — |
  
 #### Behavioral Scenarios
  
-[HAPPY] Sync large modified file with block delta sync and write verification
-GIVEN a source file of size 12MB (threshold is 10MB) where block 3 (offset 2MB-3MB) was modified
+[HAPPY] Single-pass streaming delta sync with contiguous block coalescing
+GIVEN a source file $\ge$ 10MB where blocks 2 and 3 were modified
 AND the destination file exists
-AND the local database has signatures matching the old state
-AND `verify_writes = true` in config
 WHEN `sync_file` is called
-THEN block 3 is hashed, compared, and identified as modified
-AND the destination file is opened in place, seeked to offset 2,097,152 (2MB), and modified with the new 1MB block data
-AND the engine seeks back to offset 2,097,152 on the destination, reads the written block back, and verifies its Blake3 hash matches the source block hash
-AND other blocks are NOT sent over the network
-AND the database is updated with the new block 3 signature
- 
+THEN the file is read in a single streaming pass
+AND modified blocks 2 and 3 are coalesced into a single contiguous `DirtyBlockRange` write (2MB seek and 2MB write)
+AND destination file length is trimmed via `set_len` to avoid tail remnants
+
+[HAPPY] Truncated destination file recovery
+GIVEN a destination file that was truncated (size is smaller than expected)
+AND the local database has matching hashes for all blocks
+WHEN `sync_file` is called
+THEN `dest_len < expected_offset` detects the truncation
+AND missing blocks are written to the target rather than zero-filled
+
+[HAPPY] Small file fast-path bypasses block hashing
+GIVEN a source file smaller than 10MB
+WHEN `sync_file` is called
+THEN block chunking and hashing is skipped entirely
+AND the file is copied via `fs::copy` directly
+AND metadata timestamps are updated in the SQLite cache
+
+[HAPPY] Symlink and NTFS reparse point rejection
+GIVEN a file or directory that is a symlink or reparse point
+WHEN `sync_file` inspects the file using `fs::symlink_metadata`
+THEN symlinks are skipped to prevent path traversal outside root
+
+[HAPPY] Recursive directory rename synchronization
+GIVEN a directory containing nested child files is renamed in the source
+WHEN `sync_file` is invoked for the directory path
+THEN `fs::create_dir_all` creates the target directory
+AND descendant files are traversed via `scan_dir` and synchronized recursively
+
+[HAPPY] Offline deletion protection
+GIVEN queued deletion commands for destination targets
+AND `source_online` is `false` (source network share disconnected)
+WHEN the worker processes the pending deletion queue
+THEN deletions are deferred and not executed until the source recovers
+
 [HAPPY] Timestamp alignment on successful sync
 GIVEN a successful file sync operation
 WHEN all sync writes complete
@@ -136,21 +188,14 @@ GIVEN a source file whose metadata `record.last_modified == src_mod`
 AND the destination file timestamp on an SMB share is within ±2000 ms of `src_mod` due to SMB 1-2 second rounding
 WHEN `sync_file` is called
 THEN the fast-path check evaluates to true and skips re-copying the file
- 
-[HAPPY] Sync small modified file using standard copy
-GIVEN a source file of size 5MB (below threshold) with a modified timestamp
-WHEN `sync_file` is called
-THEN the entire file is copied to the destination path
-AND the destination file's last-modified timestamp is set to match the source file's
-AND the local database metadata is updated with size and modification timestamp
- 
+
 [HAPPY] Handle source deletion with propagate_deletions enabled
 GIVEN `propagate_deletions = true` in config
 AND a file "documents/notes.txt" was deleted in the source
-WHEN `delete_file` is called for "documents/notes.txt"
+WHEN `delete_file` is called for `Path::new("documents/notes.txt")`
 THEN the destination file is moved to `.syncdir_archive/<timestamp>_documents/notes.txt`
 AND the metadata record is deleted from the database
- 
+
 [EDGE] Destination file is missing on share
 GIVEN a source file "notes.txt" with signatures in the local database
 AND the destination file is missing on the network share
@@ -163,13 +208,7 @@ AND the local database signatures are regenerated and saved
 GIVEN a running background worker
 WHEN the source or destination directory changes state (e.g., source goes offline)
 THEN `EngineStatus` is updated
-AND a `UserEvent::Status(...)` message is dispatched to the system tray event proxy
-
-[HAPPY] Watcher lifecycle bound to source directory presence
-GIVEN the source directory goes offline during daemon execution
-WHEN the periodic status polling executes
-THEN the `DirectoryWatcher` is dropped (releasing OS handles)
-AND when the source directory comes back online, a new `DirectoryWatcher` is dynamically spawned
+AND a `UserEvent::StatusUpdate(...)` message is dispatched to the system tray event proxy
 
 [HAPPY] Delay sync operation when source or destination is offline
 GIVEN a modified file event is queued
@@ -184,19 +223,10 @@ WHEN the command is processed
 THEN the full scan execution is skipped
 AND a warning is logged
 
-[HAPPY] Win32 SMB network error classification
-GIVEN a `SyncError::Io` error wrapping a Win32 OS error code (53, 59, 64, 65, 67, 121, 1326)
-WHEN `err.is_network_offline()` is called
-THEN it returns `true`
-AND for non-network I/O errors (e.g. NotFound) or non-I/O errors, it returns `false`
-
-[HAPPY] Early exit full scan on first network or authentication error
-GIVEN a full scan is executing across source files
-WHEN a target destination returns a network or authentication error matching `is_network_offline()`
-THEN a single structured warning is logged ("Target unreachable during full scan, skipping remaining files")
-AND `sync_skip_count` is set to the total source file count
-AND the full scan loop breaks immediately to prevent log bloat
-
+[HAPPY] DOS device name rejection
+GIVEN a path containing reserved names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, `CONIN$`, `CONOUT$`, `CLOCK$`)
+WHEN `is_safe_relative_path` is evaluated
+THEN it returns `false` and the path is rejected
 
 [HAPPY] Empty source safety threshold check
 GIVEN a source directory that is empty (0 files)
@@ -270,7 +300,8 @@ THEN `SyncCommand::FileDeleted("old.txt")` and `SyncCommand::FileModified("new.t
 
 | Function / Component | Signature | Returns | Errors |
 |----------------------|-----------|---------|--------|
-| `run_tray` | `(event_loop: EventLoop<UserEvent>, config_path: PathBuf, log_dir: PathBuf, tx: Sender<SyncCommand>, dests: Vec<PathBuf>, initial_dest_online: Vec<bool>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
+| `run_tray` | `<H: TrayActionHandler + ?Sized>(event_loop: EventLoop<UserEvent>, action_handler: Arc<H>, dests: Vec<PathBuf>, initial_dest_online: Vec<bool>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
+| `TrayActionHandler` | `trait: Send + Sync + 'static` | — | — |
 | `TrayState::new` | `(initial_dest_online: Vec<bool>) -> Self` | `TrayState` | — |
 | `TrayState::update_target_status` | `(&mut self, target_index: usize, online: bool) -> bool` | `bool` (changed) | — |
 | `TrayState::update_watcher_status` | `(&mut self, source_online: bool, watcher_active: bool) -> bool` | `bool` (changed) | — |
@@ -291,22 +322,21 @@ AND prints "syncdir is already running. Only one instance is allowed." to stderr
 AND exits with code 0 without creating a second tray icon
 
 [HAPPY] Update icon and tooltip on status change
-GIVEN the system tray event loop receives a `UserEvent::Status(status)` event
+GIVEN the system tray event loop receives a `UserEvent::StatusUpdate` or `UserEvent::WatcherStatus` event
 WHEN the event is processed
-THEN the tray icon is regenerated with status-specific colors (Healthy: Blue, Source Offline: Red, Destination Offline: Yellow, Both Offline: Gray)
+THEN the tray icon is regenerated with status-specific colors (Healthy: Blue, Degraded: Orange, Source Offline: Red, Destination Offline: Yellow, Both Offline: Gray)
 AND the hover tooltip is updated with the status description
 
 [HAPPY] Toggle startup registry via menu click
 GIVEN the startup menu item is toggled by the user
 WHEN the menu click event is received
-THEN `StartupRegistry` is updated to register or unregister the startup path
+THEN `DaemonTrayHandler` delegates to `StartupRegistry` to register or unregister the startup path
 AND if registry write fails, the checkable state of the menu item is restored to its previous value
 
 [HAPPY] Reload Config menu item validates config and restarts daemon
 GIVEN the user selects "Reload Config" from the system tray context menu
 WHEN `config.toml` is valid
 THEN `run_tray` returns `TrayExitReason::Restart` and exits the winit event loop cleanly
-AND `TrayIcon::Drop` unregisters the tray icon from Windows Shell (`Shell_NotifyIconW`)
 AND `main()` drops the single-instance mutex guard before spawning a fresh `syncdir.exe` process
 
 [EDGE] Reload Config validation failure displays error dialog
@@ -318,16 +348,93 @@ AND the current daemon process remains running unaffected
 [HAPPY] Pure TrayState status calculation and tooltip text generation
 GIVEN a `TrayState` initialized with destination reachability states
 WHEN `update_watcher_status` or `update_target_status` is called
-THEN `overall_status()` calculates `Healthy`, `SourceOffline`, `DestinationOffline`, or `BothOffline` without GUI event loop side effects
+THEN `overall_status()` calculates `Healthy`, `Degraded`, `SourceOffline`, `DestinationOffline`, or `BothOffline` without GUI event loop side effects
 AND `tooltip_text()` formats the tooltip string `"syncdir — Src: <status> | Dests: N/M Online"`
 
- 
+---
+
+### 7. Daemon Module (SyncDaemon)
+
+> Coordinates daemon lifecycle, worker thread spawning, watcher event loops, and clean shutdown.
+
+#### Public API
+
+| Function / Struct | Signature | Returns | Errors |
+|-------------------|-----------|---------|--------|
+| `SyncDaemon::start` | `(config: Config, app_dir: &Path, observer: Option<Arc<dyn SyncStatusObserver>>) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError::Db` |
+| `SyncDaemon::command_tx` | `(&self) -> Sender<SyncCommand>` | `Sender<SyncCommand>` | — |
+| `SyncDaemon::config` | `(&self) -> &Config` | `&Config` | — |
+| `SyncDaemon::shutdown` | `(mut self)` | `()` | — |
+| `DaemonTrayHandler::new` | `(config_path: PathBuf, command_tx: Sender<SyncCommand>, registry: R) -> Self` | `DaemonTrayHandler` | — |
+
+#### Behavioral Scenarios
+
+[HAPPY] Reconnect full scan trigger
+GIVEN a running `SyncDaemon` whose source directory was offline
+WHEN the source directory comes back online
+THEN `DirectoryWatcher` is dynamically restarted
+AND `SyncCommand::TriggerFullScan` is dispatched to all workers to perform a catch-up scan
+
+[HAPPY] RAII thread cleanup on drop
+GIVEN a running `SyncDaemon`
+WHEN `daemon.shutdown()` is called or the daemon instance is dropped
+THEN the shutdown atomic flag is asserted
+AND all background worker and broadcaster thread handles are cleanly joined
+
+---
+
+### 8. Net Module (Networking FFI)
+
+> Manages Win32 UNC and SMB connection resolution, mapped drive lookup, and alternate path fallbacks.
+
+#### Public API
+
+| Function | Signature | Returns | Errors |
+|----------|-----------|---------|--------|
+| `resolve_mapped_drive_unc` | `(drive_prefix: &str) -> Option<String>` | `Option<String>` | — |
+| `try_resolve_unc_path` | `(path: &Path) -> PathBuf` | `PathBuf` | — |
+| `establish_smb_connection` | `(unc_path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Validation`, `SyncError::Io` |
+| `find_mapped_drive_for_unc` | `(unc_path: &Path) -> Option<PathBuf>` | `Option<PathBuf>` | — |
+| `try_resolve_alternate_path` | `(path: &Path) -> PathBuf` | `PathBuf` | — |
+
+#### Behavioral Scenarios
+
+[HAPPY] Bidirectional mapped drive and UNC path translation
+GIVEN a destination path configured as a mapped drive `R:\data`
+WHEN `try_resolve_alternate_path` is called and `R:\` is offline
+THEN Win32 `WNetGetConnectionW` resolves the underlying UNC path `\\172.16.0.193\share\data`
+
+[HAPPY] Automatic SMB authentication
+GIVEN an unreachable UNC path `\\172.16.0.193\share`
+WHEN `establish_smb_connection` is called
+THEN `WNetAddConnection2W` authenticates against Windows Credential Manager
+
+---
+
+### 9. Error Module
+
+> Defines application-wide typed error structures and causal source wrapping.
+
+#### Public API
+
+| Type | Signature / Variants | Notes |
+|------|----------------------|-------|
+| `SyncError::Io` | `(#[from] std::io::Error)` | Standard I/O errors |
+| `SyncError::Db` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | SQLite database errors |
+| `SyncError::Config` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | TOML parse or validation errors |
+| `SyncError::Validation` | `(String)` | Semantic configuration validation errors |
+| `SyncError::LockPoison` | `(String)` | Mutex poisoning errors |
+| `SyncError::Watcher` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Directory watcher errors |
+| `SyncError::Tray` | `(String)` | GUI / Tray notification errors |
+| `SyncError::Registry` | `(String)` | Windows registry errors |
+| `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps Win32 network error codes (53, 59, 64, 65, 67, 121, 1326) |
+
 ---
  
 ## Data Models
  
 ### Config
-Represents the runtime parameters loaded from `config.toml`.
+Represents the runtime parameters loaded from `config.toml`. Fields are private and accessed via getters.
 - `source_dir`: PathBuf (validated to exist and be a directory)
 - `dest_dir`: Option<PathBuf> (optional primary destination directory)
 - `dest_dirs`: Option<Vec<PathBuf>> (optional additional destination directories)
@@ -337,21 +444,43 @@ Represents the runtime parameters loaded from `config.toml`.
 - `block_sync_threshold_bytes`: u64
 - `block_size_bytes`: u64
 - `verify_writes`: bool
+
+### TargetSyncConfig
+Isolated target sync configuration for an individual worker.
+- `source_dir`: PathBuf
+- `dest_dir`: PathBuf
+- `block_size_bytes`: u64
+- `block_sync_threshold_bytes`: u64
+- `verify_writes`: bool
+- `debounce_seconds`: u64
+- `retry_interval_seconds`: u64
+- `propagate_deletions`: bool
+
+### StoreConfig
+Minimal configuration parameters required by `SqliteHashStore`.
+- `block_size_bytes`: u64
+- `block_sync_threshold_bytes`: u64
  
 ### FileRecord
 Represents a file tracked in the signature database.
 - `id`: Option<i64> (database rowid)
-- `relative_path`: String (unique identifier)
+- `relative_path`: PathBuf (unique identifier)
 - `file_size`: i64
 - `last_modified`: i64
 
+### DirtyBlockRange
+Coalesced contiguous dirty block range for batched delta writes.
+- `start_block`: u64 (private)
+- `block_count`: u64 (private)
+- `data`: Vec<u8> (private)
+
 ### EngineStatus
 Represents the online/offline presence state of sync directories.
-- `Healthy` (source and all destination directories are online)
-- `Degraded` (source online, but some destination directories are offline)
-- `SourceOffline` (source directory offline)
-- `DestinationOffline` (all destination directories offline)
-- `BothOffline` (source and all destination directories offline)
+- `Healthy` (source and all destination directories are online — Blue icon)
+- `Degraded` (source online, but some destination directories are offline — Orange icon)
+- `SourceOffline` (source directory offline — Red icon)
+- `DestinationOffline` (all destination directories offline — Yellow icon)
+- `BothOffline` (source and all destination directories offline — Gray icon)
 
 ### TargetStatusUpdate
 Per-target status report sent from worker threads.
@@ -414,24 +543,24 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
     [*] --> Healthy : Check directories online
+    Healthy --> Degraded : Some destinations offline
     Healthy --> SourceOffline : Source directory offline
-    Healthy --> DestinationOffline : Destination directory offline
+    Healthy --> DestinationOffline : All destinations offline
     Healthy --> BothOffline : Both directories offline
+    Degraded --> Healthy : All destinations online
+    Degraded --> SourceOffline : Source directory offline
     SourceOffline --> Healthy : Source directory online
-    SourceOffline --> BothOffline : Destination directory offline
-    DestinationOffline --> Healthy : Destination directory online
-    DestinationOffline --> BothOffline : Source directory offline
+    DestinationOffline --> Healthy : Destination directories online
     BothOffline --> Healthy : Both directories online
-    BothOffline --> SourceOffline : Destination directory online
-    BothOffline --> DestinationOffline : Source directory online
 ```
 
 | From | To | Trigger | Side Effects |
 |------|----|---------|--------------|
-| — | Healthy | Periodic check: both directories exist | Tray tooltip set to "Healthy", icon set to blue |
+| — | Healthy | Periodic check: all directories exist | Tray tooltip set to "Healthy", icon set to blue |
+| Healthy | Degraded | Periodic check: some destinations missing | Tray tooltip set to "Degraded", icon set to orange |
 | Healthy | SourceOffline | Periodic check: source directory missing | Drop DirectoryWatcher, tray tooltip set to warning, icon set to red |
-| Healthy | DestinationOffline | Periodic check: destination directory missing | Tray tooltip set to warning, icon set to yellow |
-| Healthy | BothOffline | Periodic check: both directories missing | Drop DirectoryWatcher, tray tooltip set to error, icon set to gray |
+| Healthy | DestinationOffline | Periodic check: all destinations missing | Tray tooltip set to warning, icon set to yellow |
+| Healthy | BothOffline | Periodic check: all directories missing | Drop DirectoryWatcher, tray tooltip set to error, icon set to gray |
  
 ---
  
@@ -456,19 +585,22 @@ If no options are specified, the daemon starts the background sync. It defaults 
 
 ## Integration Points
 
-### 1. SQLite Database (`sigcache.db`)
-Local cache storing block hashes and file metadata. Validates configuration parameters `block_size_bytes` and `block_sync_threshold_bytes` to prevent database schema/metadata configuration drift.
+### 1. SQLite Database (`sigcache_<hash>.db`)
+Isolated local SQLite caches storing block hashes and file metadata per target destination. Validates configuration parameters `block_size_bytes` and `block_sync_threshold_bytes` to prevent database configuration drift.
 
 ### 2. Filesystem / Network Shares
-Local network shares mounted as folder paths. Delta synchronization reads 1MB block chunks, compares Blake3 hashes, and writes verified offsets.
+Local network shares mounted as folder paths or UNC network shares. Delta synchronization reads 1MB block chunks, compares Blake3 hashes, coalesces contiguous writes into `DirtyBlockRange` batches, and writes verified offsets.
 
-### 3. Windows System Notification Area (System Tray)
-User interface tray-icon utilizing the `tray-icon` and `winit` crates for controlling/viewing background sync status. Displays RGBA-rendered visual presence indicators and status tooltips. The context menu provides actions for opening configuration, viewing logs, forcing immediate sync, toggling Windows startup, inspecting destination target statuses, opening an "About" modal dialog box (via Win32 `MessageBoxW`), and exiting the daemon.
+### 3. Windows Win32 API Networking (`mpr.lib`)
+Integrates `WNetGetConnectionW` and `WNetAddConnection2W` to resolve mapped network drives to UNC paths and automatically establish authenticated SMB sessions using Windows Credential Manager.
 
-### 4. Testing Frameworks & Verification Infrastructure
-Multi-layered testing infrastructure combining colorized failure diffs (`pretty_assertions`), regression-guarding snapshot testing (`insta` for `Config`, `SyncError`, `FileRecord`), generative property-based invariant testing (`proptest` for block boundary division, TOML round-tripping, SMB timestamp tolerance, path traversal safety, sync idempotency, and delta sync isolation), and pure struct unit testing (`TrayState`).
+### 4. Windows System Notification Area (System Tray)
+User interface tray-icon utilizing `tray-icon` and `winit` for controlling and viewing background sync status. The context menu provides actions for opening configuration, viewing logs, forcing immediate sync, toggling Windows startup, and inspecting destination target statuses.
 
-### 5. Development & Release Automation Scripts (`scripts/`)
+### 5. Windows Registry (`Software\Microsoft\Windows\CurrentVersion\Run`)
+Integrates `StartupRegistry` under HKCU for automatic daemon launch on user login.
+
+### 6. Development & Release Automation Scripts (`scripts/`)
 Top-level, git-tracked PowerShell automation scripts:
 * `scripts/check-quality.ps1`: 4-gate code quality pipeline executing `cargo fmt`, `cargo clippy`, `cargo test`, and `sg scan` unconditionally with structured Markdown summary reporting.
 * `scripts/build-release.ps1`: Automated distribution builder that executes the quality gate pipeline, compiles release binaries (`cargo build --release` with MSVC `+crt-static` CRT linking), verifies zero dynamic CRT dependencies via `dumpbin`, stages `dist/syncdir.exe`, packages versioned ZIP archives (`syncdir-v{version}-x86_64-windows.zip`), and generates SHA256 checksums.

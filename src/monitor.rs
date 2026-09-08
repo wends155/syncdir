@@ -50,7 +50,7 @@ impl DirectoryWatcher {
     /// ```
     pub fn start(config: &Config, tx: Sender<SyncCommand>) -> Result<Self, SyncError> {
         let source = config.resolved_source_dir();
-        let source_root = source.clone();
+        let source_root = source.to_path_buf();
 
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
@@ -176,7 +176,7 @@ impl DirectoryWatcher {
                 }
             })?;
 
-        watcher.watch(&source, RecursiveMode::Recursive)?;
+        watcher.watch(source, RecursiveMode::Recursive)?;
         Ok(DirectoryWatcher { _watcher: watcher })
     }
 }

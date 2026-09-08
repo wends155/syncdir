@@ -114,12 +114,12 @@ proptest! {
         fs::write(&file_path, &content).unwrap();
 
         // First sync — writes file to dest
-        engine.sync_file("prop_test.bin").unwrap();
+        engine.sync_file(std::path::Path::new("prop_test.bin")).unwrap();
         prop_assert!(dest_file_path.exists());
         prop_assert_eq!(fs::read(&dest_file_path).unwrap(), content.clone());
 
         // Second sync — idempotent pass, succeeds without altering dest content
-        engine.sync_file("prop_test.bin").unwrap();
+        engine.sync_file(std::path::Path::new("prop_test.bin")).unwrap();
         prop_assert_eq!(fs::read(&dest_file_path).unwrap(), content);
     }
 
@@ -148,7 +148,7 @@ proptest! {
         fs::write(&file_path, &initial_data).unwrap();
 
         // Initial sync
-        engine.sync_file("delta_test.bin").unwrap();
+        engine.sync_file(std::path::Path::new("delta_test.bin")).unwrap();
         prop_assert_eq!(fs::read(&dest_file_path).unwrap(), initial_data.clone());
 
         // Mutate single byte in first block
@@ -164,7 +164,7 @@ proptest! {
         fs::write(&file_path, &modified_data).unwrap();
 
         // Delta sync — verifies file is updated to modified_data
-        engine.sync_file("delta_test.bin").unwrap();
+        engine.sync_file(std::path::Path::new("delta_test.bin")).unwrap();
         prop_assert_eq!(fs::read(&dest_file_path).unwrap(), modified_data);
     }
 }

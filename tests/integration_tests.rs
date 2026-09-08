@@ -34,14 +34,17 @@ fn test_integration_config_db_sync_commands() {
     let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
     let record = FileRecord {
         id: None,
-        relative_path: "test_file.bin".to_string(),
+        relative_path: PathBuf::from("test_file.bin"),
         file_size: 4096,
         last_modified: 99999,
     };
     let hashes = vec![[9u8; 32]; 4];
 
     store.save_file(&record, &hashes).unwrap();
-    let fetched = store.get_file("test_file.bin").unwrap().unwrap();
+    let fetched = store
+        .get_file(std::path::Path::new("test_file.bin"))
+        .unwrap()
+        .unwrap();
     assert_eq!(fetched.file_size, 4096);
 
     let fetched_hashes = store.get_block_hashes(fetched.id.unwrap()).unwrap();
@@ -141,14 +144,16 @@ fn test_propagate_deletions_false() {
 
     let file_path = source.join("test.txt");
     std::fs::write(&file_path, b"hello").unwrap();
-    engine.sync_file("test.txt").unwrap();
+    engine.sync_file(std::path::Path::new("test.txt")).unwrap();
 
     // Verify file exists on destination
     let dest_path = dest.join("test.txt");
     assert!(dest_path.exists());
 
     // Call delete_file
-    engine.delete_file("test.txt").unwrap();
+    engine
+        .delete_file(std::path::Path::new("test.txt"))
+        .unwrap();
 
     // Since propagate_deletions = false, the destination file MUST remain
     assert!(
@@ -219,14 +224,14 @@ fn test_path_traversal_prevention() {
     let engine = LocalSyncEngine::new(store, config);
 
     // Absolute path
-    let res1 = engine.sync_file("/etc/passwd");
+    let res1 = engine.sync_file(std::path::Path::new("/etc/passwd"));
     assert!(matches!(
         res1,
         Err(syncdir::error::SyncError::Validation(_))
     ));
 
     // Traversal path
-    let res2 = engine.sync_file("../test.txt");
+    let res2 = engine.sync_file(std::path::Path::new("../test.txt"));
     assert!(matches!(
         res2,
         Err(syncdir::error::SyncError::Validation(_))
@@ -249,7 +254,7 @@ fn test_subsecond_sync_precision() {
 
     let file_path = source.join("fast.txt");
     std::fs::write(&file_path, b"initial").unwrap();
-    engine.sync_file("fast.txt").unwrap();
+    engine.sync_file(std::path::Path::new("fast.txt")).unwrap();
     assert_eq!(
         std::fs::read_to_string(dest.join("fast.txt")).unwrap(),
         "initial"
@@ -257,10 +262,53 @@ fn test_subsecond_sync_precision() {
 
     // Write a second time immediately
     std::fs::write(&file_path, b"updated").unwrap();
-    engine.sync_file("fast.txt").unwrap();
+    engine.sync_file(std::path::Path::new("fast.txt")).unwrap();
     assert_eq!(
         std::fs::read_to_string(dest.join("fast.txt")).unwrap(),
         "updated"
+    );
+}
+
+#[test]
+fn test_directory_rename_syncs_child_files() {
+    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+    let db_path = dir.path().join("sigcache.db");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+
+    let config = Config::test_default(source.clone(), dest.clone());
+    let store = SqliteHashStore::new(&db_path, &config).unwrap();
+    let engine = LocalSyncEngine::new(store, config);
+
+    // Create a folder with child files
+    let sub = source.join("folder");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("file1.txt"), b"child 1").unwrap();
+    let nested = sub.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("file2.txt"), b"child 2").unwrap();
+
+    // sync_file on directory path should recursively sync child files
+    engine.sync_file(std::path::Path::new("folder")).unwrap();
+
+    assert!(dest.join("folder").join("file1.txt").exists());
+    assert_eq!(
+        std::fs::read(dest.join("folder").join("file1.txt")).unwrap(),
+        b"child 1"
+    );
+    assert!(
+        dest.join("folder")
+            .join("nested")
+            .join("file2.txt")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read(dest.join("folder").join("nested").join("file2.txt")).unwrap(),
+        b"child 2"
     );
 }
 

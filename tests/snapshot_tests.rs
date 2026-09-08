@@ -130,7 +130,7 @@ fn test_sync_error_display_io() {
 
 #[test]
 fn test_sync_error_display_config() {
-    let err = SyncError::Config("invalid TOML: missing field 'source_dir'".to_string());
+    let err = SyncError::config("invalid TOML: missing field 'source_dir'");
     assert_snapshot!(err.to_string());
 }
 
@@ -158,7 +158,7 @@ fn test_sync_error_display_registry() {
 fn test_file_record_snapshot() {
     let record = FileRecord {
         id: Some(42),
-        relative_path: "docs/readme.txt".to_string(),
+        relative_path: PathBuf::from("docs/readme.txt"),
         file_size: 8192,
         last_modified: 1722470400,
     };

@@ -91,9 +91,9 @@ pub fn establish_smb_connection(unc_path: &Path) -> Result<(), SyncError> {
 
     // Extract root share e.g. "\\172.16.0.193\Files" or "\\172.16.0.193\ABB Industrial IT Data"
     let parts: Vec<&str> = s[2..].split('\\').collect();
-    if parts.len() < 2 {
-        return Err(SyncError::Validation(format!(
-            "UNC path '{}' does not contain a share name",
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        return Err(SyncError::validation(format!(
+            "UNC path '{}' does not contain a valid host and share name",
             unc_path.display()
         )));
     }
@@ -164,8 +164,9 @@ pub fn establish_smb_connection(_unc_path: &Path) -> Result<(), SyncError> {
 /// mapped to a prefix of the given UNC path.
 pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
     let normalized = normalize_path(unc_path);
-    let unc_str = normalized.to_string_lossy().to_lowercase();
-    if !unc_str.starts_with(r"\\") {
+    let original_str = normalized.to_string_lossy();
+    let unc_str_lower = original_str.to_lowercase();
+    if !unc_str_lower.starts_with(r"\\") {
         return None;
     }
 
@@ -173,14 +174,15 @@ pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
         let drive_prefix = format!("{}:", letter);
         if let Some(mapped_unc) = resolve_mapped_drive_unc(&drive_prefix) {
             let mapped_lower = mapped_unc.trim_end_matches('\\').to_lowercase();
-            if !mapped_lower.is_empty() && unc_str.starts_with(&mapped_lower) {
-                let rest = &unc_str[mapped_lower.len()..];
+            if !mapped_lower.is_empty() && unc_str_lower.starts_with(&mapped_lower) {
+                let rest_idx = mapped_lower.len();
+                let rest = &original_str[rest_idx..];
                 if rest.is_empty() || rest.starts_with('\\') {
                     let relative = rest.trim_start_matches('\\');
                     if relative.is_empty() {
-                        return Some(PathBuf::from(format!(r"{}\\", drive_prefix)));
+                        return Some(PathBuf::from(format!(r"{}\", drive_prefix)));
                     } else {
-                        return Some(PathBuf::from(format!(r"{}\\{}", drive_prefix, relative)));
+                        return Some(PathBuf::from(format!(r"{}\{}", drive_prefix, relative)));
                     }
                 }
             }

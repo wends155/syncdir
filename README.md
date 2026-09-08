@@ -98,22 +98,27 @@ When configuring Windows paths in `config.toml`, choose one of the three support
 ## Features / Feature Flags
 
 - **Multiple Destinations**: Broadcasts filesystem change events from a single source folder to multiple independent target directories, running concurrent isolated sync processes.
-- **Block-level Delta Synchronization**: Only transfers modified 1MB blocks of files ≥ 10MB.
+- **Block-level Delta Synchronization**: Only transfers modified 1MB blocks of files $\ge$ 10MB using contiguous dirty block coalescing.
+- **Small File Fast-Path**: Files < 10MB bypass block hashing and synchronize via efficient whole-file copy.
 - **Write Verification**: Reads back and hashes blocks immediately after writing to guarantee block integrity.
 - **Timestamp Alignment**: Automatically syncs destination file timestamps to match the source file, allowing fast-path comparison.
 - **Real-Time Fs Watcher**: Uses Windows directory notification hooks (`notify` crate) with a configurable debounce filter.
 - **Automatic Deletion Archiving**: Moves deleted target files to a timestamped folder (`.syncdir_archive`) on the destination share instead of deleting them permanently.
+- **Resilient Windows Networking**: Bidirectional UNC $\longleftrightarrow$ mapped drive translation and automatic SMB session authentication.
 - **Registry Integration**: Directly toggle auto-launch at system startup via the checkable system tray menu.
 
 ## API Surface
 
 For integration details, refer to the library crate modules:
-- `syncdir::config`: Configuration parsing and validation models.
-- `syncdir::db`: Local SQLite signature caching database implementation.
-- `syncdir::sync`: Delta synchronization engine block hashing and verification logic.
-- `syncdir::monitor`: Filesystem event debouncer and monitoring worker.
-- `syncdir::startup`: Platform-specific Startup Registry configuration.
-- `syncdir::tray`: Tray-icon menus and event loops.
+- `syncdir::config`: Configuration parsing, validation models, and `ConfigBuilder`.
+- `syncdir::daemon`: `SyncDaemon` orchestrator, background thread management, and `DaemonTrayHandler`.
+- `syncdir::db`: Local SQLite signature caching database, `HashStore` trait, and `StoreConfig`.
+- `syncdir::error`: Structured error types and causal error chaining with `SyncError`.
+- `syncdir::monitor`: Filesystem event debouncer and monitoring worker (`DirectoryWatcher`).
+- `syncdir::net`: Win32 UNC and SMB connection resolution (`try_resolve_alternate_path`).
+- `syncdir::startup`: Platform-specific Startup Registry configuration (`StartupRegistry`).
+- `syncdir::sync`: Delta synchronization engine, `DirtyBlockRange` batching, and worker routines.
+- `syncdir::tray`: Tray-icon menus, tooltip state machine (`TrayState`), and event loops.
 
 ## Architecture
 
