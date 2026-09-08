@@ -47,7 +47,9 @@ fn test_integration_config_db_sync_commands() {
         .unwrap();
     assert_eq!(fetched.file_size, 4096);
 
-    let fetched_hashes = store.get_block_hashes(fetched.id.unwrap()).unwrap();
+    let fetched_hashes = store
+        .get_block_hashes(std::path::Path::new("test_file.bin"))
+        .unwrap();
     assert_eq!(fetched_hashes.len(), 4);
 }
 

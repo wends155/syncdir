@@ -367,16 +367,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         let dest_len = dest_file.metadata().map(|m| m.len()).unwrap_or(0);
 
-        let old_hashes = if dest_existed {
-            match &file_record {
-                Some(rec) => {
-                    let id = rec.id.ok_or_else(|| {
-                        SyncError::validation("Corrupted file record: missing ID")
-                    })?;
-                    self.db.get_block_hashes(id)?
-                }
-                None => Vec::new(),
-            }
+        let old_hashes = if dest_existed && file_record.is_some() {
+            self.db.get_block_hashes(rel_path)?
         } else {
             Vec::new() // Force all blocks written if destination was deleted
         };
@@ -1199,8 +1191,7 @@ mod tests {
         assert_eq!(synced, b"AAAAZZZZCCCC");
 
         // DB should have updated hashes
-        let record = engine.db.get_file(Path::new("big.bin")).unwrap().unwrap();
-        let hashes = engine.db.get_block_hashes(record.id.unwrap()).unwrap();
+        let hashes = engine.db.get_block_hashes(Path::new("big.bin")).unwrap();
         assert_eq!(hashes.len(), 3);
     }
 
@@ -1326,8 +1317,7 @@ mod tests {
         engine.sync_file(Path::new("exact.bin")).unwrap();
 
         assert_eq!(fs::read(dest.join("exact.bin")).unwrap(), b"12345678");
-        let rec = engine.db.get_file(Path::new("exact.bin")).unwrap().unwrap();
-        let hashes = engine.db.get_block_hashes(rec.id.unwrap()).unwrap();
+        let hashes = engine.db.get_block_hashes(Path::new("exact.bin")).unwrap();
         assert_eq!(hashes.len(), 2);
     }
 
@@ -1705,8 +1695,7 @@ mod tests {
             fs::read(dest.join("small.txt")).unwrap(),
             b"under threshold"
         );
-        let record = engine.db.get_file(Path::new("small.txt")).unwrap().unwrap();
-        let block_hashes = engine.db.get_block_hashes(record.id.unwrap()).unwrap();
+        let block_hashes = engine.db.get_block_hashes(Path::new("small.txt")).unwrap();
         assert!(
             block_hashes.is_empty(),
             "Small files should not record block hashes"
