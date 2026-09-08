@@ -6,10 +6,10 @@
 use crate::config::Config;
 use crate::db::SqliteHashStore;
 use crate::error::SyncError;
-use crate::net::try_resolve_alternate_path;
 use crate::startup::RegistryBackend;
 use crate::sync::{
-    LocalSyncEngine, SyncCommand, SyncStatusObserver, SyncWorkerContext, start_sync_worker,
+    LocalSyncEngine, SyncCommand, SyncEngine, SyncStatusObserver, SyncWorkerContext,
+    start_sync_worker,
 };
 use crate::tray::TrayActionHandler;
 use std::path::{Path, PathBuf};
@@ -125,6 +125,50 @@ impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTra
     }
 }
 
+/// Factory trait for creating synchronization engines for configured targets.
+pub trait SyncEngineFactory: Send + Sync + 'static {
+    /// Engine implementation type returned by this factory.
+    type Engine: SyncEngine + 'static;
+
+    /// Construct a sync engine for the target directory at `target_index`.
+    fn create_engine(
+        &self,
+        target_index: usize,
+        target_config: &crate::config::TargetSyncConfig,
+        app_dir: &Path,
+    ) -> Result<Self::Engine, SyncError>;
+}
+
+/// Default factory creating `LocalSyncEngine` backed by `SqliteHashStore`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SqliteEngineFactory;
+
+impl SyncEngineFactory for SqliteEngineFactory {
+    type Engine = LocalSyncEngine<SqliteHashStore>;
+
+    fn create_engine(
+        &self,
+        target_index: usize,
+        target_config: &crate::config::TargetSyncConfig,
+        app_dir: &Path,
+    ) -> Result<Self::Engine, SyncError> {
+        let dest = &target_config.dest_dir;
+        let dest_str = dest.to_string_lossy();
+        let hash = blake3::hash(dest_str.as_bytes());
+        let db_filename = format!("sigcache_{}.db", hash.to_hex());
+        let db_path = app_dir.join(db_filename);
+
+        tracing::info!(
+            target_index = target_index + 1,
+            target_path = %dest.display(),
+            db_path = %db_path.display(),
+            "Opening signature cache database for target",
+        );
+        let store = SqliteHashStore::new(&db_path, target_config)?;
+        Ok(LocalSyncEngine::new(store, target_config.clone()))
+    }
+}
+
 /// Orchestrator for syncdir background sync workers, file watcher, and central command broadcaster.
 #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
 pub struct SyncDaemon {
@@ -162,70 +206,28 @@ impl SyncDaemon {
         app_dir: &Path,
         observer: Option<Arc<dyn SyncStatusObserver>>,
     ) -> Result<Self, SyncError> {
+        Self::start_with_factory(SqliteEngineFactory, config, app_dir, observer)
+    }
+
+    /// Starts all sync workers using the provided engine factory.
+    #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
+    pub fn start_with_factory<F: SyncEngineFactory>(
+        factory: F,
+        config: Config,
+        app_dir: &Path,
+        observer: Option<Arc<dyn SyncStatusObserver>>,
+    ) -> Result<Self, SyncError> {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let mut worker_handles = Vec::new();
 
-        let resolved_source = config.resolved_source_dir();
-        let initial_source_online = resolved_source.exists() && resolved_source.is_dir();
-        let source_online = Arc::new(AtomicBool::new(initial_source_online));
+        // Avoid blocking network/SMB metadata checks on the main startup thread.
+        // Worker reachability and source watcher reachability are evaluated asynchronously.
+        let source_online = Arc::new(AtomicBool::new(false));
 
         // 1. Initialize target databases and workers
         let mut worker_txs = Vec::new();
         for (idx, target_config) in config.target_configs().into_iter().enumerate() {
-            let dest = target_config.dest_dir.clone();
-
-            // Calculate isolated SQLite database filename using Blake3 hash of the target path
-            let dest_str = dest.to_string_lossy();
-            let hash = blake3::hash(dest_str.as_bytes());
-            let db_filename = format!("sigcache_{}.db", hash.to_hex());
-            let db_path = app_dir.join(db_filename);
-
-            tracing::info!(
-                target_index = idx + 1,
-                target_path = %dest.display(),
-                db_path = %db_path.display(),
-                "Opening signature cache database for target",
-            );
-            let store = SqliteHashStore::new(&db_path, &config)?;
-
-            match std::fs::metadata(&dest) {
-                Ok(meta) if meta.is_dir() => {
-                    tracing::info!(
-                        target_index = idx + 1,
-                        target_path = %dest.display(),
-                        "Target destination is online and reachable."
-                    );
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        target_index = idx + 1,
-                        target_path = %dest.display(),
-                        "Target destination exists but is not a directory."
-                    );
-                }
-                Err(e) => {
-                    let alt_path = try_resolve_alternate_path(&dest);
-                    if alt_path != dest
-                        && matches!(std::fs::metadata(&alt_path), Ok(m) if m.is_dir())
-                    {
-                        tracing::info!(
-                            target_index = idx + 1,
-                            target_path = %dest.display(),
-                            resolved_path = %alt_path.display(),
-                            "Target destination resolved alternate mapped drive/UNC SMB path."
-                        );
-                    } else {
-                        tracing::warn!(
-                            target_index = idx + 1,
-                            target_path = %dest.display(),
-                            resolved_path = %alt_path.display(),
-                            error = %e,
-                            os_error = ?e.raw_os_error(),
-                            "Target destination is currently offline or unreachable."
-                        );
-                    }
-                }
-            }
+            let engine = factory.create_engine(idx, &target_config, app_dir)?;
 
             // Wire per-worker channel
             let (w_tx, w_rx) = channel();
@@ -233,10 +235,9 @@ impl SyncDaemon {
 
             tracing::info!(
                 target_index = idx + 1,
-                target_path = %dest.display(),
+                target_path = %target_config.dest_dir.display(),
                 "Starting sync worker thread for target..."
             );
-            let engine = LocalSyncEngine::new(store, target_config.clone());
             let worker_ctx = SyncWorkerContext::new(
                 idx,
                 target_config,
@@ -497,6 +498,39 @@ dest_dir = "C:\\dummy_dest"
         // Sleep past retry interval to allow coordinator loop to discover source
         std::thread::sleep(std::time::Duration::from_millis(1500));
 
+        daemon.shutdown();
+    }
+
+    struct MockEngineFactory;
+
+    impl SyncEngineFactory for MockEngineFactory {
+        type Engine = LocalSyncEngine<crate::db::MockHashStore>;
+
+        fn create_engine(
+            &self,
+            _target_index: usize,
+            target_config: &crate::config::TargetSyncConfig,
+            _app_dir: &Path,
+        ) -> Result<Self::Engine, SyncError> {
+            Ok(LocalSyncEngine::new(
+                crate::db::MockHashStore::new(),
+                target_config.clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_sync_daemon_start_with_custom_factory() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let config = Config::builder(src).dest_dir(dst).build();
+        let daemon =
+            SyncDaemon::start_with_factory(MockEngineFactory, config, dir.path(), None).unwrap();
+        assert_eq!(daemon.worker_handles.len(), 1);
         daemon.shutdown();
     }
 }

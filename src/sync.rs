@@ -719,10 +719,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 }
                 (alt_path, true)
             } else {
-                (dest.clone(), false)
+                (dest.to_path_buf(), false)
             }
         } else {
-            (dest.clone(), true)
+            (dest.to_path_buf(), true)
         };
 
         if !is_reachable {
@@ -980,7 +980,9 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
         source_online_atomic,
     } = context;
     const MAX_PENDING_QUEUE: usize = 50_000;
-    std::thread::spawn(move || {
+    std::thread::Builder::new()
+        .name(format!("sync-worker-{}", target_index))
+        .spawn(move || {
         let mut scratch_buffer = vec![0u8; config.block_size_bytes as usize];
         let mut pending_syncs: HashMap<PathBuf, Instant> = HashMap::new();
         let mut pending_deletes: HashMap<PathBuf, Instant> = HashMap::new();
@@ -1268,6 +1270,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
             });
         }
     })
+    .expect("failed to spawn sync worker thread")
 }
 
 #[cfg(test)]

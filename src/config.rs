@@ -16,7 +16,7 @@ fn default_retry_interval() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSyncConfig {
     pub source_dir: PathBuf,
-    pub dest_dir: PathBuf,
+    pub dest_dir: TargetDir,
     pub block_size_bytes: u64,
     pub block_sync_threshold_bytes: u64,
     pub verify_writes: bool,
@@ -27,41 +27,16 @@ pub struct TargetSyncConfig {
 
 impl TargetSyncConfig {
     /// Create a new `TargetSyncConfig` from a `Config` and a specific destination directory.
-    pub fn from_config(config: &Config, dest_dir: PathBuf) -> Self {
+    pub fn from_config(config: &Config, dest_dir: impl Into<TargetDir>) -> Self {
         Self {
             source_dir: config.source_dir().to_path_buf(),
-            dest_dir,
+            dest_dir: dest_dir.into(),
             block_size_bytes: config.block_size_bytes(),
             block_sync_threshold_bytes: config.block_sync_threshold_bytes(),
             verify_writes: config.verify_writes(),
             debounce_seconds: config.debounce_seconds(),
             retry_interval_seconds: config.retry_interval_seconds(),
             propagate_deletions: config.propagate_deletions(),
-        }
-    }
-
-    /// Create a new `TargetSyncConfig`.
-    #[deprecated(note = "Use TargetSyncConfig::from_config(config, dest) instead")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        source_dir: PathBuf,
-        dest_dir: PathBuf,
-        block_size_bytes: u64,
-        block_sync_threshold_bytes: u64,
-        verify_writes: bool,
-        debounce_seconds: u64,
-        retry_interval_seconds: u64,
-        propagate_deletions: bool,
-    ) -> Self {
-        Self {
-            source_dir,
-            dest_dir,
-            block_size_bytes,
-            block_sync_threshold_bytes,
-            verify_writes,
-            debounce_seconds,
-            retry_interval_seconds,
-            propagate_deletions,
         }
     }
 
@@ -222,6 +197,42 @@ impl From<&str> for TargetDir {
 impl From<TargetDir> for PathBuf {
     fn from(td: TargetDir) -> Self {
         td.0
+    }
+}
+
+impl PartialEq<PathBuf> for TargetDir {
+    fn eq(&self, other: &PathBuf) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<TargetDir> for PathBuf {
+    fn eq(&self, other: &TargetDir) -> bool {
+        self == &other.0
+    }
+}
+
+impl PartialEq<Path> for TargetDir {
+    fn eq(&self, other: &Path) -> bool {
+        self.0.as_path() == other
+    }
+}
+
+impl PartialEq<TargetDir> for Path {
+    fn eq(&self, other: &TargetDir) -> bool {
+        self == other.0.as_path()
+    }
+}
+
+impl PartialEq<&Path> for TargetDir {
+    fn eq(&self, other: &&Path) -> bool {
+        self.0.as_path() == *other
+    }
+}
+
+impl PartialEq<TargetDir> for &Path {
+    fn eq(&self, other: &TargetDir) -> bool {
+        *self == other.0.as_path()
     }
 }
 
@@ -557,9 +568,9 @@ impl Config {
         self.source_dir.as_path()
     }
 
-    /// Return strongly-typed destination collection.
-    pub fn destinations(&self) -> &DestinationCollection {
-        &self.destinations
+    /// Return strongly-typed destination slice.
+    pub fn destinations(&self) -> &[TargetDir] {
+        self.destinations.as_slice()
     }
 
     /// Return a merged, deduplicated list of all configured destination directories.
@@ -573,6 +584,10 @@ impl Config {
     }
 
     /// Extra destination directories getter.
+    #[deprecated(
+        since = "0.1.14",
+        note = "use destinations() or resolved_dest_dirs() instead"
+    )]
     pub fn dest_dirs(&self) -> Option<Vec<PathBuf>> {
         if self.destinations.is_empty() {
             None
@@ -613,9 +628,9 @@ impl Config {
 
     /// Generate isolated target sync configurations for each configured destination directory.
     pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
-        self.resolved_dest_dirs()
-            .into_iter()
-            .map(|dest| TargetSyncConfig::from_config(self, dest))
+        self.destinations
+            .iter()
+            .map(|dest| TargetSyncConfig::from_config(self, dest.clone()))
             .collect()
     }
 
@@ -1513,29 +1528,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn test_target_sync_config_new() {
-        let target = TargetSyncConfig::new(
-            PathBuf::from(r"C:\src"),
-            PathBuf::from(r"C:\dst"),
-            1024,
-            2048,
-            true,
-            5,
-            15,
-            false,
-        );
-        assert_eq!(target.source_dir(), Path::new(r"C:\src"));
-        assert_eq!(target.dest_dir(), Path::new(r"C:\dst"));
-        assert_eq!(target.block_size_bytes(), 1024);
-        assert_eq!(target.block_sync_threshold_bytes(), 2048);
-        assert!(target.verify_writes());
-        assert_eq!(target.debounce_seconds(), 5);
-        assert_eq!(target.retry_interval_seconds(), 15);
-        assert!(!target.propagate_deletions());
-    }
-
-    #[test]
     fn test_target_sync_config_from_config() {
         let config = Config::builder(r"C:\src")
             .dest_dir(r"C:\dst")
@@ -1599,5 +1591,21 @@ mod tests {
         assert_eq!(paths[0], PathBuf::from(r"D:\Backup1"));
         assert_eq!(paths[1], PathBuf::from(r"E:\Backup2"));
         assert_eq!(paths[2], PathBuf::from(r"\\172.16.0.60\scada_data"));
+    }
+
+    #[test]
+    fn test_config_destinations_matches_dest_dirs() {
+        let d1 = PathBuf::from(r"D:\Backup1");
+        let d2 = PathBuf::from(r"E:\Backup2");
+        let config = Config::builder(r"C:\Source")
+            .dest_dir(d1.clone())
+            .add_dest_dir(d2.clone())
+            .build();
+        let slice: &[_] = config.destinations();
+        assert_eq!(slice.len(), 2);
+        #[allow(deprecated)]
+        let legacy = config.dest_dirs().unwrap();
+        assert_eq!(slice[0].as_path(), legacy[0]);
+        assert_eq!(slice[1].as_path(), legacy[1]);
     }
 }
