@@ -72,7 +72,7 @@ fn test_watcher_and_sync_engine_flow() {
     let (tx, rx) = channel();
 
     // Start watcher & sync worker BEFORE writing the file
-    let _watcher = DirectoryWatcher::start(&config, tx.clone()).unwrap();
+    let _watcher = DirectoryWatcher::start(&source, tx.clone()).unwrap();
     let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let target_config = TargetSyncConfig::from_config(&config, dest.clone());
     let engine = LocalSyncEngine::new(store, target_config.clone());
@@ -176,10 +176,10 @@ fn test_watcher_rename_event() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&dest).unwrap();
 
-    let config = Config::test_default(source.clone(), dest.clone());
+    let _config = Config::test_default(source.clone(), dest.clone());
 
     let (tx, rx) = channel();
-    let _watcher = DirectoryWatcher::start(&config, tx).unwrap();
+    let _watcher = DirectoryWatcher::start(&source, tx).unwrap();
 
     let old_file = source.join("old.txt");
     std::fs::write(&old_file, b"test").unwrap();

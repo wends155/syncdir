@@ -3,10 +3,10 @@
 //! Uses the `notify` crate (wrapping Windows `ReadDirectoryChangesW`)
 //! to watch the source directory and feed `SyncCommand`s to the sync worker.
 
-use crate::config::Config;
 use crate::error::SyncError;
 use crate::sync::SyncCommand;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::path::Path;
 use std::sync::mpsc::Sender;
 
 /// Watches a source directory for file changes and deletions.
@@ -16,7 +16,7 @@ pub struct DirectoryWatcher {
 }
 
 impl DirectoryWatcher {
-    /// Starts watching the configured source directory.
+    /// Starts watching the specified source directory.
     ///
     /// Hooks into the OS filesystem event notifications via `notify` to capture
     /// creation, modification, removal, and rename events. Converts these OS events
@@ -24,7 +24,7 @@ impl DirectoryWatcher {
     ///
     /// # Arguments
     ///
-    /// * `config` - Runtime configuration specifying the source directory to monitor.
+    /// * `source_dir` - Path to the source directory to monitor.
     /// * `tx` - Sender channel handle to transmit [`SyncCommand`] messages to the background worker.
     ///
     /// # Returns
@@ -40,150 +40,156 @@ impl DirectoryWatcher {
     ///
     /// ```no_run
     /// # use std::sync::mpsc::channel;
-    /// # use syncdir::config::Config;
+    /// # use std::path::Path;
     /// # use syncdir::monitor::DirectoryWatcher;
-    /// # use std::path::PathBuf;
-    /// # let config = Config::test_default(PathBuf::from("C:/source"), PathBuf::from("D:/dest"));
     /// let (tx, rx) = channel();
-    /// let watcher = DirectoryWatcher::start(&config, tx)?;
+    /// let watcher = DirectoryWatcher::start(Path::new("C:/source"), tx)?;
     /// # Ok::<(), syncdir::error::SyncError>(())
     /// ```
-    pub fn start(config: &Config, tx: Sender<SyncCommand>) -> Result<Self, SyncError> {
-        let source = config.resolved_source_dir();
-        let source_root = source.to_path_buf();
+    pub fn start(source_dir: impl AsRef<Path>, tx: Sender<SyncCommand>) -> Result<Self, SyncError> {
+        let source_root = source_dir.as_ref().to_path_buf();
+        let source_clone = source_root.clone();
 
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
-                Ok(event) => {
-                    let send = |cmd: SyncCommand| -> bool {
-                        if let Err(e) = tx.send(cmd) {
-                            tracing::error!(
-                                error = %e,
-                                "Sync worker channel disconnected; watcher event dropped"
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    };
-                    match event.kind {
-                        EventKind::Create(_)
-                        | EventKind::Modify(notify::event::ModifyKind::Data(_))
-                        | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
-                        | EventKind::Modify(notify::event::ModifyKind::Any) => {
-                            for path in event.paths {
-                                if let Ok(rel_path) = path.strip_prefix(&source_root)
-                                    && !send(SyncCommand::FileModified(rel_path.to_path_buf()))
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                        EventKind::Remove(_) => {
-                            for path in event.paths {
-                                if let Ok(rel_path) = path.strip_prefix(&source_root)
-                                    && !send(SyncCommand::FileDeleted(rel_path.to_path_buf()))
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                        EventKind::Modify(notify::event::ModifyKind::Name(rename_mode)) => {
-                            match rename_mode {
-                                notify::event::RenameMode::Both => {
-                                    if event.paths.len() == 2 {
-                                        if let Ok(from_rel) =
-                                            event.paths[0].strip_prefix(&source_root)
-                                            && !send(SyncCommand::FileDeleted(
-                                                from_rel.to_path_buf(),
-                                            ))
-                                        {
-                                            return;
-                                        }
-                                        if let Ok(to_rel) =
-                                            event.paths[1].strip_prefix(&source_root)
-                                        {
-                                            send(SyncCommand::FileModified(to_rel.to_path_buf()));
-                                        }
-                                    } else {
-                                        for path in event.paths {
-                                            if let Ok(rel_path) = path.strip_prefix(&source_root)
-                                                && !send(SyncCommand::FileModified(
-                                                    rel_path.to_path_buf(),
-                                                ))
-                                            {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                                notify::event::RenameMode::From => {
-                                    for path in event.paths {
-                                        if let Ok(rel_path) = path.strip_prefix(&source_root)
-                                            && !send(SyncCommand::FileDeleted(
-                                                rel_path.to_path_buf(),
-                                            ))
-                                        {
-                                            return;
-                                        }
-                                    }
-                                }
-                                notify::event::RenameMode::To => {
-                                    for path in event.paths {
-                                        if let Ok(rel_path) = path.strip_prefix(&source_root)
-                                            && !send(SyncCommand::FileModified(
-                                                rel_path.to_path_buf(),
-                                            ))
-                                        {
-                                            return;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if event.paths.len() == 2 {
-                                        if let Ok(from_rel) =
-                                            event.paths[0].strip_prefix(&source_root)
-                                            && !send(SyncCommand::FileDeleted(
-                                                from_rel.to_path_buf(),
-                                            ))
-                                        {
-                                            return;
-                                        }
-                                        if let Ok(to_rel) =
-                                            event.paths[1].strip_prefix(&source_root)
-                                        {
-                                            send(SyncCommand::FileModified(to_rel.to_path_buf()));
-                                        }
-                                    } else {
-                                        for path in event.paths {
-                                            if let Ok(rel_path) = path.strip_prefix(&source_root)
-                                                && !send(SyncCommand::FileModified(
-                                                    rel_path.to_path_buf(),
-                                                ))
-                                            {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                Ok(event) => Self::dispatch_event(event, &source_clone, &tx),
                 Err(e) => {
                     tracing::error!(error = %e, "Watcher error");
                 }
             })?;
 
-        watcher.watch(source, RecursiveMode::Recursive)?;
+        watcher.watch(&source_root, RecursiveMode::Recursive)?;
         Ok(DirectoryWatcher { _watcher: watcher })
+    }
+
+    /// Dispatches a filesystem notification event, translating paths relative to `source_root`.
+    pub fn dispatch_event(event: Event, source_root: &Path, tx: &Sender<SyncCommand>) {
+        let send = |cmd: SyncCommand| -> bool {
+            if let Err(e) = tx.send(cmd) {
+                tracing::error!(
+                    error = %e,
+                    "Sync worker channel disconnected; watcher event dropped"
+                );
+                false
+            } else {
+                true
+            }
+        };
+        match event.kind {
+            EventKind::Create(_)
+            | EventKind::Modify(notify::event::ModifyKind::Data(_))
+            | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+            | EventKind::Modify(notify::event::ModifyKind::Any) => {
+                for path in event.paths {
+                    if let Ok(rel_path) = path.strip_prefix(source_root) {
+                        if rel_path.as_os_str().is_empty() {
+                            continue;
+                        }
+                        if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
+                            return;
+                        }
+                    }
+                }
+            }
+            EventKind::Remove(_) => {
+                for path in event.paths {
+                    if let Ok(rel_path) = path.strip_prefix(source_root) {
+                        if rel_path.as_os_str().is_empty() {
+                            continue;
+                        }
+                        if !send(SyncCommand::FileDeleted(rel_path.to_path_buf())) {
+                            return;
+                        }
+                    }
+                }
+            }
+            EventKind::Modify(notify::event::ModifyKind::Name(rename_mode)) => match rename_mode {
+                notify::event::RenameMode::Both => {
+                    if event.paths.len() == 2 {
+                        if let Ok(from_rel) = event.paths[0].strip_prefix(source_root)
+                            && !from_rel.as_os_str().is_empty()
+                            && !send(SyncCommand::FileDeleted(from_rel.to_path_buf()))
+                        {
+                            return;
+                        }
+                        if let Ok(to_rel) = event.paths[1].strip_prefix(source_root)
+                            && !to_rel.as_os_str().is_empty()
+                        {
+                            send(SyncCommand::FileModified(to_rel.to_path_buf()));
+                        }
+                    } else {
+                        for path in event.paths {
+                            if let Ok(rel_path) = path.strip_prefix(source_root) {
+                                if rel_path.as_os_str().is_empty() {
+                                    continue;
+                                }
+                                if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                notify::event::RenameMode::From => {
+                    for path in event.paths {
+                        if let Ok(rel_path) = path.strip_prefix(source_root) {
+                            if rel_path.as_os_str().is_empty() {
+                                continue;
+                            }
+                            if !send(SyncCommand::FileDeleted(rel_path.to_path_buf())) {
+                                return;
+                            }
+                        }
+                    }
+                }
+                notify::event::RenameMode::To => {
+                    for path in event.paths {
+                        if let Ok(rel_path) = path.strip_prefix(source_root) {
+                            if rel_path.as_os_str().is_empty() {
+                                continue;
+                            }
+                            if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
+                                return;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if event.paths.len() == 2 {
+                        if let Ok(from_rel) = event.paths[0].strip_prefix(source_root)
+                            && !from_rel.as_os_str().is_empty()
+                            && !send(SyncCommand::FileDeleted(from_rel.to_path_buf()))
+                        {
+                            return;
+                        }
+                        if let Ok(to_rel) = event.paths[1].strip_prefix(source_root)
+                            && !to_rel.as_os_str().is_empty()
+                        {
+                            send(SyncCommand::FileModified(to_rel.to_path_buf()));
+                        }
+                    } else {
+                        for path in event.paths {
+                            if let Ok(rel_path) = path.strip_prefix(source_root) {
+                                if rel_path.as_os_str().is_empty() {
+                                    continue;
+                                }
+                                if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::mpsc::channel;
     use tempfile::tempdir;
 
@@ -195,11 +201,10 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
 
-        let config = Config::test_default(src.clone(), dst);
         let (tx, rx) = channel();
         drop(rx); // Force channel disconnect
 
-        let watcher = DirectoryWatcher::start(&config, tx).expect("watcher should start");
+        let watcher = DirectoryWatcher::start(&src, tx).expect("watcher should start");
 
         // Trigger a file change event in the monitored directory
         std::fs::write(src.join("test.txt"), b"hello").unwrap();
@@ -208,5 +213,24 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         drop(watcher);
+    }
+
+    #[test]
+    fn test_watcher_does_not_forward_empty_relative_path() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = PathBuf::from(r"C:\test\source");
+
+        let event = notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![root.clone()],
+            attrs: notify::event::EventAttributes::default(),
+        };
+
+        DirectoryWatcher::dispatch_event(event, &root, &tx);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "Events targeting the source root itself must not forward empty relative path to sync worker"
+        );
     }
 }

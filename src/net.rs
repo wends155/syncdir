@@ -3,8 +3,8 @@
 //! Provides utilities for querying mapped drive UNC targets, establishing SMB sessions,
 //! and resolving alternate network paths.
 
-use crate::config::normalize_path;
 use crate::error::SyncError;
+use crate::path_util::normalize_path;
 use std::path::{Path, PathBuf};
 
 /// Query Windows Win32 API `WNetGetConnectionW` to resolve a local drive letter (e.g. "R:")
@@ -160,6 +160,39 @@ pub fn establish_smb_connection(_unc_path: &Path) -> Result<(), SyncError> {
     ))
 }
 
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetLogicalDrives() -> u32;
+}
+
+/// Find the byte boundary in `original` where the lowercase representation matches `lower_prefix`.
+///
+/// Returns `None` if `lower_prefix` does not match the lowercase prefix of `original`
+/// or cuts across a multi-character lowercase expansion.
+fn find_prefix_byte_boundary(original: &str, lower_prefix: &str) -> Option<usize> {
+    if !original.to_lowercase().starts_with(lower_prefix) {
+        return None;
+    }
+    let mut accumulated_lower_len = 0;
+    for (idx, ch) in original.char_indices() {
+        if accumulated_lower_len == lower_prefix.len() {
+            return Some(idx);
+        }
+        if accumulated_lower_len > lower_prefix.len() {
+            return None;
+        }
+        for lower_ch in ch.to_lowercase() {
+            accumulated_lower_len += lower_ch.len_utf8();
+        }
+    }
+    if accumulated_lower_len == lower_prefix.len() {
+        Some(original.len())
+    } else {
+        None
+    }
+}
+
 /// Reverse-lookup active Win32 mapped drive letters ('A'..='Z') to find a drive letter
 /// mapped to a prefix of the given UNC path.
 pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
@@ -170,13 +203,25 @@ pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    for letter in (b'A'..=b'Z').map(|b| b as char) {
+    #[cfg(target_os = "windows")]
+    let drive_mask = unsafe { GetLogicalDrives() };
+    #[cfg(not(target_os = "windows"))]
+    let drive_mask = 0u32;
+
+    for i in 0..26 {
+        #[cfg(target_os = "windows")]
+        if (drive_mask & (1 << i)) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
         let drive_prefix = format!("{}:", letter);
         if let Some(mapped_unc) = resolve_mapped_drive_unc(&drive_prefix) {
             let mapped_lower = mapped_unc.trim_end_matches('\\').to_lowercase();
             if !mapped_lower.is_empty() && unc_str_lower.starts_with(&mapped_lower) {
-                let rest_idx = mapped_lower.len();
-                let rest = &original_str[rest_idx..];
+                let rest = match find_prefix_byte_boundary(&original_str, &mapped_lower) {
+                    Some(idx) => &original_str[idx..],
+                    None => continue,
+                };
                 if rest.is_empty() || rest.starts_with('\\') {
                     let relative = rest.trim_start_matches('\\');
                     if relative.is_empty() {
@@ -249,4 +294,40 @@ pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
     }
 
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_mapped_drive_for_unc_unicode_safe() {
+        let test_paths = [
+            Path::new(r"\\server\share\föö\bär\файл.dat"),
+            Path::new(r"\\10.0.0.1\分享\数据\测试.txt"),
+            Path::new(r"\\server\share\🚀\item"),
+            Path::new(r"\\server\share\café\résumé.doc"),
+        ];
+
+        for path in &test_paths {
+            let result = std::panic::catch_unwind(|| find_mapped_drive_for_unc(path));
+            assert!(
+                result.is_ok(),
+                "find_mapped_drive_for_unc panicked on UTF-8 path: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_prefix_byte_boundary_unicode() {
+        let orig = "föö_BÄR_test";
+        assert_eq!(find_prefix_byte_boundary(orig, "föö"), Some(5));
+        assert_eq!(find_prefix_byte_boundary(orig, "föö_bär"), Some(10));
+        assert_eq!(
+            find_prefix_byte_boundary(orig, "föö_bär_test"),
+            Some(orig.len())
+        );
+        assert_eq!(find_prefix_byte_boundary(orig, "nonexistent"), None);
+    }
 }

@@ -25,6 +25,7 @@
 //! - [`error`]: Typed error hierarchy and causal error chaining with [`error::SyncError`].
 //! - [`monitor`]: Real-time filesystem watcher and debounced event dispatch.
 //! - [`net`]: Win32 UNC and SMB connection resolution.
+//! - [`path_util`]: Path canonicalization, slash normalization, and UNC repair.
 //! - [`startup`]: Windows registry auto-start integration.
 //! - [`sync`]: Streaming delta sync engine, [`sync::DirtyBlockRange`] coalescing, and worker routines.
 //! - [`tray`]: System tray notification area icon, tooltip state machine, and context menus.
@@ -56,6 +57,7 @@ pub mod db;
 pub mod error;
 pub mod monitor;
 pub mod net;
+pub mod path_util;
 pub mod startup;
 pub mod sync;
 pub mod tray;

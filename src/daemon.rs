@@ -290,7 +290,7 @@ impl SyncDaemon {
                                 "Source directory online. Starting directory watcher..."
                             );
                             match crate::monitor::DirectoryWatcher::start(
-                                &watcher_config,
+                                watcher_config.resolved_source_dir(),
                                 watcher_tx.clone(),
                             ) {
                                 Ok(w) => {
