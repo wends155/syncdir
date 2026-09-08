@@ -54,8 +54,9 @@ fn test_integration_config_db_sync_commands() {
 #[test]
 fn test_watcher_and_sync_engine_flow() {
     use std::sync::mpsc::channel;
+    use syncdir::config::TargetSyncConfig;
     use syncdir::monitor::DirectoryWatcher;
-    use syncdir::sync::start_sync_worker;
+    use syncdir::sync::{LocalSyncEngine, SyncWorkerContext, start_sync_worker};
 
     let dir = tempdir().unwrap();
     let source = dir.path().join("source");
@@ -73,7 +74,10 @@ fn test_watcher_and_sync_engine_flow() {
     // Start watcher & sync worker BEFORE writing the file
     let _watcher = DirectoryWatcher::start(&config, tx.clone()).unwrap();
     let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let _worker_handle = start_sync_worker(0, config.clone(), store, rx, None, source_online);
+    let target_config = TargetSyncConfig::from_config(&config, dest.clone());
+    let engine = LocalSyncEngine::new(store, target_config.clone());
+    let worker_ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+    let _worker_handle = start_sync_worker(worker_ctx);
 
     // Write a file in source — watcher should pick it up
     let file_path = source.join("notes.txt");

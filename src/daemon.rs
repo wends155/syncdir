@@ -8,7 +8,9 @@ use crate::db::SqliteHashStore;
 use crate::error::SyncError;
 use crate::net::try_resolve_alternate_path;
 use crate::startup::RegistryBackend;
-use crate::sync::{SyncCommand, SyncStatusObserver, start_sync_worker};
+use crate::sync::{
+    LocalSyncEngine, SyncCommand, SyncStatusObserver, SyncWorkerContext, start_sync_worker,
+};
 use crate::tray::TrayActionHandler;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -178,14 +180,16 @@ impl SyncDaemon {
                 target_path = %dest.display(),
                 "Starting sync worker thread for target..."
             );
-            let worker_handle = start_sync_worker(
+            let engine = LocalSyncEngine::new(store, target_config.clone());
+            let worker_ctx = SyncWorkerContext::new(
                 idx,
                 target_config,
-                store,
+                engine,
                 w_rx,
                 observer.clone(),
                 source_online.clone(),
             );
+            let worker_handle = start_sync_worker(worker_ctx);
             worker_handles.push(worker_handle);
         }
 
@@ -258,7 +262,7 @@ impl SyncDaemon {
                         last_sent_online = Some(is_online);
                         last_sent_active = Some(watcher_active);
                         if let Some(ref obs) = watcher_observer {
-                            obs.on_watcher_status_change(is_online, watcher_active);
+                            obs.on_watcher_status_change(is_online.into(), watcher_active.into());
                         }
                     }
                 }

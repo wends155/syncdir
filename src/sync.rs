@@ -59,11 +59,53 @@ pub enum ScanOutcome {
     DestinationUnreachable,
 }
 
+/// Network and target connection status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectivityState {
+    /// Connection is online and reachable.
+    Online,
+    /// Connection is offline or unreachable.
+    Offline,
+}
+
+impl From<bool> for ConnectivityState {
+    fn from(b: bool) -> Self {
+        if b { Self::Online } else { Self::Offline }
+    }
+}
+
+impl From<ConnectivityState> for bool {
+    fn from(c: ConnectivityState) -> Self {
+        matches!(c, ConnectivityState::Online)
+    }
+}
+
+/// Directory watcher status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherState {
+    /// Directory watcher is active.
+    Active,
+    /// Directory watcher is inactive.
+    Inactive,
+}
+
+impl From<bool> for WatcherState {
+    fn from(b: bool) -> Self {
+        if b { Self::Active } else { Self::Inactive }
+    }
+}
+
+impl From<WatcherState> for bool {
+    fn from(w: WatcherState) -> Self {
+        matches!(w, WatcherState::Active)
+    }
+}
+
 /// Observer for sync worker status changes. Decouples sync from UI.
 pub trait SyncStatusObserver: Send + Sync + 'static {
-    fn on_target_status_change(&self, target_index: usize, online: bool);
+    fn on_target_status_change(&self, target_index: usize, state: ConnectivityState);
     /// Forward source directory connectivity and watcher active status to observers.
-    fn on_watcher_status_change(&self, _source_online: bool, _watcher_active: bool) {}
+    fn on_watcher_status_change(&self, _source: ConnectivityState, _watcher: WatcherState) {}
 }
 
 /// Contiguous range of dirty blocks to coalesce delta writes and reduce seek overhead.
@@ -177,6 +219,10 @@ fn read_block<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize,
 pub trait SyncEngine: Send + Sync {
     /// Synchronize a single file from source to destination.
     fn sync_file(&self, path: &Path) -> Result<(), SyncError>;
+    /// Synchronize a single file with a reusable scratch buffer.
+    fn sync_file_buffered(&self, path: &Path, _scratch: &mut [u8]) -> Result<(), SyncError> {
+        self.sync_file(path)
+    }
     /// Handle deletion of a file (archive on destination).
     fn delete_file(&self, path: &Path) -> Result<(), SyncError>;
     /// Perform a full directory scan and sync all changed files.
@@ -221,6 +267,17 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
     /// Synchronize a file or directory tree to a specific destination directory (primary or alternate).
     pub fn sync_file_to_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
+        let mut scratch = vec![0u8; self.config.block_size_bytes as usize];
+        self.sync_file_to_dest_buffered(rel_path, dest_dir, &mut scratch)
+    }
+
+    /// Synchronize a file or directory tree using a reusable scratch buffer.
+    pub fn sync_file_to_dest_buffered(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
         if !is_safe_relative_path(rel_path) {
             return Err(SyncError::validation(format!(
                 "Unsafe path traversal detected: {}",
@@ -240,7 +297,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             let mut dir_files = HashSet::new();
             scan_dir(&src_path, &self.config.source_dir, &mut dir_files, 0)?;
             for child_rel in &dir_files {
-                self.sync_file_to_dest(child_rel, dest_dir)?;
+                self.sync_file_to_dest_buffered(child_rel, dest_dir, scratch)?;
             }
             return Ok(());
         }
@@ -326,9 +383,16 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         let mut src_file = File::open(&src_path)?;
         let block_size = self.config.block_size_bytes;
-        let mut buffer = vec![0; block_size as usize];
+        let buf_size = block_size as usize;
+        let mut heap_buf;
+        let buffer: &mut [u8] = if scratch.len() >= buf_size {
+            &mut scratch[..buf_size]
+        } else {
+            heap_buf = vec![0; buf_size];
+            &mut heap_buf
+        };
         let mut verify_buf = if self.config.verify_writes {
-            vec![0; block_size as usize]
+            vec![0; buf_size]
         } else {
             Vec::new()
         };
@@ -339,7 +403,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let mut block_idx = 0u64;
 
         loop {
-            let bytes_read = read_block(&mut src_file, &mut buffer)?;
+            let bytes_read = read_block(&mut src_file, &mut *buffer)?;
             if bytes_read == 0 {
                 break;
             }
@@ -449,6 +513,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         self.sync_file_to_dest(path, &self.config.dest_dir)
     }
 
+    fn sync_file_buffered(&self, path: &Path, scratch: &mut [u8]) -> Result<(), SyncError> {
+        self.sync_file_to_dest_buffered(path, &self.config.dest_dir, scratch)
+    }
+
     fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
         self.delete_file_from_dest(path, &self.config.dest_dir)
     }
@@ -494,8 +562,9 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let mut synced_count = 0usize;
         let mut failed_count = 0usize;
         let mut sync_skip_count = 0usize;
+        let mut scratch = vec![0u8; self.config.block_size_bytes as usize];
         for rel_path in &source_files {
-            match self.sync_file_to_dest(rel_path, &active_dest) {
+            match self.sync_file_to_dest_buffered(rel_path, &active_dest, &mut scratch) {
                 Ok(()) => {
                     synced_count += 1;
                 }
@@ -598,6 +667,21 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     }
 }
 
+#[cfg(windows)]
+fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+        (meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink()
+    } else {
+        true
+    }
+}
+
+#[cfg(not(windows))]
+fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true)
+}
+
 fn scan_dir(
     dir: &Path,
     source_root: &Path,
@@ -611,11 +695,11 @@ fn scan_dir(
     }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            tracing::debug!(path = %entry.path().display(), "Skipping symlink in scan");
+        if is_reparse_or_symlink(&entry) {
+            tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in scan");
             continue;
         }
+        let file_type = entry.file_type()?;
         let path = entry.path();
         if file_type.is_dir() {
             scan_dir(&path, source_root, files, depth + 1)?;
@@ -659,6 +743,37 @@ pub fn is_safe_relative_path(path: &Path) -> bool {
     true
 }
 
+/// Execution context for a target synchronization worker thread.
+pub struct SyncWorkerContext<E: SyncEngine> {
+    pub target_index: usize,
+    pub config: TargetSyncConfig,
+    pub engine: E,
+    pub rx: std::sync::mpsc::Receiver<SyncCommand>,
+    pub observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
+    pub source_online_atomic: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<E: SyncEngine> SyncWorkerContext<E> {
+    /// Create a new sync worker context.
+    pub fn new(
+        target_index: usize,
+        config: impl Into<TargetSyncConfig>,
+        engine: E,
+        rx: std::sync::mpsc::Receiver<SyncCommand>,
+        observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
+        source_online_atomic: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            target_index,
+            config: config.into(),
+            engine,
+            rx,
+            observer,
+            source_online_atomic,
+        }
+    }
+}
+
 /// Spawns a background synchronization worker thread.
 ///
 /// The worker listens for filesystem events (file changes/deletions) on its channel
@@ -666,29 +781,26 @@ pub fn is_safe_relative_path(path: &Path) -> bool {
 ///
 /// # Arguments
 ///
-/// * `target_index` - The unique index of the destination target.
-/// * `config` - Synchronization daemon configuration copy.
-/// * `db` - Persistent SQLite signature store.
-/// * `rx` - Channel receiver for processing `SyncCommand`s.
-/// * `event_proxy` - Winit proxy to signal directory status updates to the system tray.
-/// * `source_online_atomic` - Shared thread-safe flag indicating source presence.
+/// * `context` - Worker execution context containing the engine, configuration, channels, and observers.
 ///
 /// # Returns
 ///
 /// Returns the join handle for the spawned background worker thread.
 #[must_use = "dropping the JoinHandle detaches the sync worker thread"]
-pub fn start_sync_worker<S: HashStore + Send + 'static>(
-    target_index: usize,
-    config: impl Into<TargetSyncConfig>,
-    db: S,
-    rx: std::sync::mpsc::Receiver<SyncCommand>,
-    observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
-    source_online_atomic: std::sync::Arc<std::sync::atomic::AtomicBool>,
+pub fn start_sync_worker<E: SyncEngine + 'static>(
+    context: SyncWorkerContext<E>,
 ) -> std::thread::JoinHandle<()> {
-    let config: TargetSyncConfig = config.into();
+    let SyncWorkerContext {
+        target_index,
+        config,
+        engine,
+        rx,
+        observer,
+        source_online_atomic,
+    } = context;
     const MAX_PENDING_QUEUE: usize = 50_000;
     std::thread::spawn(move || {
-        let engine = LocalSyncEngine::new(db, config.clone());
+        let mut scratch_buffer = vec![0u8; config.block_size_bytes as usize];
         let mut pending_syncs: HashMap<PathBuf, Instant> = HashMap::new();
         let mut pending_deletes: HashMap<PathBuf, Instant> = HashMap::new();
 
@@ -696,22 +808,24 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
         let mut dest_online = false;
         let mut last_sent_dest_online = None;
 
-        let mut last_status_check = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(
-                config.retry_interval_seconds,
-            ))
-            .unwrap_or_else(Instant::now);
+        let mut last_status_check: Option<Instant> = None;
 
         loop {
             let now = Instant::now();
+            let retry_dur = std::time::Duration::from_secs(config.retry_interval_seconds);
 
-            if now.duration_since(last_status_check)
-                >= std::time::Duration::from_secs(config.retry_interval_seconds)
-            {
-                last_status_check = now;
+            let should_check = match last_status_check {
+                None => true,
+                Some(last) => now.duration_since(last) >= retry_dur,
+            };
+
+            if should_check {
+                last_status_check = Some(now);
 
                 let current_source_online =
                     source_online_atomic.load(std::sync::atomic::Ordering::Relaxed);
+                source_online = current_source_online;
+
                 let current_dest_online = match std::fs::metadata(&config.dest_dir) {
                     Ok(meta) => meta.is_dir(),
                     Err(ref e) => {
@@ -728,30 +842,39 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                     }
                 };
 
-                source_online = current_source_online;
+                let was_offline = !dest_online;
                 dest_online = current_dest_online;
 
-                if last_sent_dest_online != Some(current_dest_online) {
-                    if current_dest_online && last_sent_dest_online == Some(false) {
+                if was_offline && dest_online {
+                    tracing::info!(
+                        target_index = target_index + 1,
+                        target_path = %config.dest_dir.display(),
+                        "Target destination is back online."
+                    );
+                    if source_online {
                         tracing::info!(
                             target_index = target_index + 1,
-                            target_path = %config.dest_dir.display(),
-                            "Target destination is back online."
+                            "Triggering catch-up full scan following destination reconnect."
                         );
-                        if source_online {
-                            tracing::info!(
-                                target_index = target_index + 1,
-                                "Triggering catch-up full scan following destination reconnect."
-                            );
-                            if let Err(e) = engine.run_full_scan() {
+                        match engine.run_full_scan() {
+                            Ok(ScanOutcome::DestinationUnreachable) => {
+                                tracing::warn!(
+                                    "Catch-up scan determined destination is unreachable"
+                                );
+                                dest_online = false;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
                                 tracing::error!(error = %e, "Catch-up full scan on reconnect failed");
                             }
                         }
                     }
-                    last_sent_dest_online = Some(current_dest_online);
+                }
 
+                if last_sent_dest_online != Some(dest_online) {
+                    last_sent_dest_online = Some(dest_online);
                     if let Some(ref obs) = observer {
-                        obs.on_target_status_change(target_index, dest_online);
+                        obs.on_target_status_change(target_index, dest_online.into());
                     }
                 }
             }
@@ -792,7 +915,10 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                                     dest_online = true;
                                     last_sent_dest_online = Some(true);
                                     if let Some(ref obs) = observer {
-                                        obs.on_target_status_change(target_index, true);
+                                        obs.on_target_status_change(
+                                            target_index,
+                                            ConnectivityState::Online,
+                                        );
                                     }
                                 }
                             }
@@ -803,27 +929,35 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                                     target_path = %config.dest_dir.display(),
                                     "Full scan completed with partial sync failures"
                                 );
-                                if synced > 0 && !dest_online {
+                                if !dest_online {
                                     dest_online = true;
                                     last_sent_dest_online = Some(true);
                                     if let Some(ref obs) = observer {
-                                        obs.on_target_status_change(target_index, true);
+                                        obs.on_target_status_change(
+                                            target_index,
+                                            ConnectivityState::Online,
+                                        );
                                     }
                                 }
                             }
                             Ok(ScanOutcome::DestinationUnreachable) => {
                                 tracing::warn!(
                                     target_path = %config.dest_dir.display(),
-                                    "Full scan destination unreachable. Setting destination status to offline."
+                                    "Full scan aborted: destination is unreachable"
                                 );
-                                dest_online = false;
-                                last_sent_dest_online = Some(false);
-                                if let Some(ref obs) = observer {
-                                    obs.on_target_status_change(target_index, false);
+                                if dest_online {
+                                    dest_online = false;
+                                    last_sent_dest_online = Some(false);
+                                    if let Some(ref obs) = observer {
+                                        obs.on_target_status_change(
+                                            target_index,
+                                            ConnectivityState::Offline,
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
-                                tracing::error!(error = %e, "Full scan failed");
+                                tracing::error!(error = %e, "Full scan execution failed");
                             }
                         }
                     } else {
@@ -835,16 +969,33 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
             }
 
             let now = Instant::now();
+            let mut network_offline_detected = false;
 
-            let ready_syncs: Vec<_> = pending_syncs
-                .iter()
-                .filter(|(_, deadline)| now >= **deadline)
-                .map(|(path, _)| path.clone())
-                .collect();
-            for path in ready_syncs {
-                pending_syncs.remove(&path);
-                if source_online && dest_online {
-                    if let Err(e) = engine.sync_file(&path) {
+            pending_syncs.retain(|path, deadline| {
+                if now < *deadline {
+                    return true;
+                }
+                if network_offline_detected || !source_online || !dest_online {
+                    *deadline = now + retry_dur;
+                    return true;
+                }
+                match engine.sync_file_buffered(path, &mut scratch_buffer) {
+                    Ok(()) => false,
+                    Err(e) if e.is_network_offline() => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "Target offline detected; bailing out queue"
+                        );
+                        network_offline_detected = true;
+                        dest_online = false;
+                        if let Some(ref obs) = observer {
+                            obs.on_target_status_change(target_index, ConnectivityState::Offline);
+                        }
+                        *deadline = now + retry_dur;
+                        true
+                    }
+                    Err(e) => {
                         let os_code = match &e {
                             SyncError::Io(io_err) => io_err.raw_os_error(),
                             _ => None,
@@ -856,31 +1007,37 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                             os_error = ?os_code,
                             "Sync failed, scheduling retry"
                         );
-                        let retry_at = Instant::now()
-                            + std::time::Duration::from_secs(config.retry_interval_seconds);
-                        if pending_syncs.len() < MAX_PENDING_QUEUE {
-                            pending_syncs.insert(path, retry_at);
-                        }
-                    }
-                } else {
-                    tracing::warn!(path = %path.display(), "Skipped syncing file: source or destination offline");
-                    let deadline = Instant::now()
-                        + std::time::Duration::from_secs(config.retry_interval_seconds);
-                    if pending_syncs.len() < MAX_PENDING_QUEUE {
-                        pending_syncs.insert(path, deadline);
+                        *deadline = now + retry_dur;
+                        true
                     }
                 }
-            }
+            });
 
-            let ready_deletes: Vec<_> = pending_deletes
-                .iter()
-                .filter(|(_, deadline)| now >= **deadline)
-                .map(|(path, _)| path.clone())
-                .collect();
-            for path in ready_deletes {
-                pending_deletes.remove(&path);
-                if source_online && dest_online {
-                    if let Err(e) = engine.delete_file(&path) {
+            pending_deletes.retain(|path, deadline| {
+                if now < *deadline {
+                    return true;
+                }
+                if network_offline_detected || !source_online || !dest_online {
+                    *deadline = now + retry_dur;
+                    return true;
+                }
+                match engine.delete_file(path) {
+                    Ok(()) => false,
+                    Err(e) if e.is_network_offline() => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "Target offline detected during deletion; bailing out queue"
+                        );
+                        network_offline_detected = true;
+                        dest_online = false;
+                        if let Some(ref obs) = observer {
+                            obs.on_target_status_change(target_index, ConnectivityState::Offline);
+                        }
+                        *deadline = now + retry_dur;
+                        true
+                    }
+                    Err(e) => {
                         let os_code = match &e {
                             SyncError::Io(io_err) => io_err.raw_os_error(),
                             _ => None,
@@ -892,21 +1049,11 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                             os_error = ?os_code,
                             "Deletion failed, scheduling retry"
                         );
-                        let retry_at = Instant::now()
-                            + std::time::Duration::from_secs(config.retry_interval_seconds);
-                        if pending_deletes.len() < MAX_PENDING_QUEUE {
-                            pending_deletes.insert(path, retry_at);
-                        }
-                    }
-                } else {
-                    tracing::warn!(path = %path.display(), "Skipped deleting file: source or destination offline");
-                    let deadline = Instant::now()
-                        + std::time::Duration::from_secs(config.retry_interval_seconds);
-                    if pending_deletes.len() < MAX_PENDING_QUEUE {
-                        pending_deletes.insert(path, deadline);
+                        *deadline = now + retry_dur;
+                        true
                     }
                 }
-            }
+            });
         }
     })
 }
@@ -1196,8 +1343,9 @@ mod tests {
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        let _handle = start_sync_worker(0, config, store, rx, None, source_online);
+        let engine = LocalSyncEngine::new(store, config.clone());
+        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let _handle = start_sync_worker(context);
 
         // Write source file
         fs::write(source.join("storm.txt"), b"storm data").unwrap();
@@ -1229,8 +1377,9 @@ mod tests {
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let _handle = start_sync_worker(0, config, store, rx, None, source_online);
+        let engine = LocalSyncEngine::new(store, config.clone());
+        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let _handle = start_sync_worker(context);
 
         // Send TriggerFullScan
         tx.send(SyncCommand::TriggerFullScan).unwrap();
@@ -1584,8 +1733,9 @@ mod tests {
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let _handle = start_sync_worker(0, config, store, rx, None, source_online);
+        let engine = LocalSyncEngine::new(store, config.clone());
+        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let _handle = start_sync_worker(context);
 
         // Queue deletion while source is offline
         tx.send(SyncCommand::FileDeleted(PathBuf::from("keep_me.txt")))
@@ -1613,8 +1763,9 @@ mod tests {
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        let _handle = start_sync_worker(0, config, store, rx, None, source_online);
+        let engine = LocalSyncEngine::new(store, config.clone());
+        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let _handle = start_sync_worker(context);
 
         fs::write(source.join("file1.txt"), b"hello").unwrap();
         tx.send(SyncCommand::FileModified(PathBuf::from("file1.txt")))

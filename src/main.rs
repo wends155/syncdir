@@ -9,7 +9,7 @@ use std::sync::Arc;
 use syncdir::config::Config;
 use syncdir::daemon::{DaemonTrayHandler, SyncDaemon};
 use syncdir::error::SyncError;
-use syncdir::sync::SyncStatusObserver;
+use syncdir::sync::{ConnectivityState, SyncStatusObserver, WatcherState};
 use syncdir::tray::{DestinationState, TrayExitReason, run_tray};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
@@ -20,23 +20,23 @@ struct WinitStatusObserver {
 }
 
 impl SyncStatusObserver for WinitStatusObserver {
-    fn on_target_status_change(&self, target_index: usize, online: bool) {
+    fn on_target_status_change(&self, target_index: usize, state: ConnectivityState) {
         let _ = self
             .proxy
             .send_event(syncdir::tray::UserEvent::StatusUpdate(
                 syncdir::tray::TargetStatusUpdate {
                     target_index,
-                    dest_online: online,
+                    dest_online: state.into(),
                 },
             ));
     }
 
-    fn on_watcher_status_change(&self, source_online: bool, watcher_active: bool) {
+    fn on_watcher_status_change(&self, source: ConnectivityState, watcher: WatcherState) {
         let _ = self
             .proxy
             .send_event(syncdir::tray::UserEvent::WatcherStatus {
-                source_online,
-                watcher_active,
+                source_online: source.into(),
+                watcher_active: watcher.into(),
             });
     }
 }
