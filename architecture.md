@@ -48,7 +48,10 @@ syncdir/
 └── src/
     ├── lib.rs            # Crate library root and module declarations
     ├── main.rs           # Daemon entry point and runner orchestration
+    ├── daemon.rs         # Background daemon lifecycle and worker orchestration
     ├── config.rs         # Configuration parsing and TOML path validation
+    ├── path_util.rs      # Path canonicalization and normalization leaf
+    ├── net.rs            # Win32 network UNC and mapped drive FFI
     ├── db.rs             # SQLite local database cache layer
     ├── error.rs          # Project-wide error definitions
     ├── monitor.rs        # ReadDirectoryChangesW event monitor
@@ -60,35 +63,51 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, strongly-typed path domain modeling via `TargetDir` (self-normalizing path newtype enforcing drive roots `R:\`, UNC repair `\\172...`, and slash conversion at construction) and `DestinationCollection` (encapsulating destination lists with Windows case-insensitive deduplication while strictly preserving insertion order), Serde backward-compatibility bridging via `RawConfig`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), path compatibility filtering (`normalize_path`), strict path format validation (`Config::validate()` and `TargetDir::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\` supporting mapped Windows drives), block size and threshold positivity validation (`block_size_bytes > 0`, `block_sync_threshold_bytes > 0`), multi-destination resolution via `resolved_dest_dirs()`, Win32 mapped drive UNC resolution via `resolve_mapped_drive_unc` (queries `WNetGetConnectionW` to translate drive letters like `R:` to their underlying UNC network paths), path boundary checks in `find_mapped_drive_for_unc`, mapped drive reachability fallback via `try_resolve_unc_path`, automatic SMB network session initialization returning `Result<(), SyncError>` via `establish_smb_connection` (`WNetAddConnection2W` FFI using cached Windows Credential Manager entries), and runtime settings.
-* **Does NOT own**: Filesystem synchronization, database access.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, strongly-typed path domain modeling via `TargetDir` (self-normalizing path newtype enforcing drive roots `R:\`, UNC repair `\\172...`, and slash conversion at construction) and `DestinationCollection` (encapsulating destination lists with Windows case-insensitive deduplication while strictly preserving insertion order), zero-copy `destinations()` slice, Serde backward-compatibility bridging via `RawConfig`, TOML 4-backslash UNC string escaping (`preprocess_config_toml`), strict path format validation (`Config::validate()` and `TargetDir::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\` supporting mapped Windows drives), path containment/overlap validation preventing recursive sync loops, block size cap (64MB) and threshold positivity validation, and runtime settings.
+* **Does NOT own**: Network path resolution (delegated to `net`), filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 
+### `path_util`
+* **Owns**: Crate-private path canonicalization leaf (`normalize_path`), drive root slash repair (`C:` -> `C:\`), and UNC backslash preservation. Pure leaf module with zero internal crate dependencies, resolving the historical circular dependency between `config` and `net`.
+* **Does NOT own**: Filesystem access, configuration modeling, network resolution.
+* **Trait Interfaces**: None.
+
+### `net`
+* **Owns**: Win32 network UNC and mapped drive FFI (`WNetGetConnectionW`, `WNetAddConnection2W`), `find_mapped_drive_for_unc` with `GetLogicalDrives()` bitmask optimization and Unicode prefix boundary detection, and `try_resolve_alternate_path` translating between drive letters and UNC paths.
+* **Does NOT own**: Config parsing, database operations, sync worker logic.
+* **Trait Interfaces**: None.
+
+### `daemon`
+* **Owns**: Background daemon lifecycle (`SyncDaemon`), generic worker orchestration via `SyncEngineFactory` (`SqliteEngineFactory`), non-blocking asynchronous startup (deferring network checks to background threads), central directory watcher thread coordination, reconnection scan triggering, `DaemonHandle`, and RAII shutdown (`perform_shutdown`).
+* **Does NOT own**: Low-level delta sync hashing, schema migrations, tray UI event loop.
+* **Trait Interfaces**:
+  * `SyncEngineFactory`: Abstract factory interface for engine instantiation per target directory.
+
 ### `db`
-* **Owns**: Connection management to isolated local SQLite databases with WAL mode (`PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, `foreign_keys = ON`), composite index `idx_block_hashes_file_block` on `(file_id, block_index)`, prepared statement caching (`prepare_cached`), schema versioning (`db_version = "3"`), recording and retrieving file metadata and fixed 32-byte block digests (`BlockHash = [u8; 32]`). Generates separate cache database files (`sigcache_<hash>.db`) named using the Blake3 hash of the target path to prevent collisions.
+* **Owns**: Connection management to isolated local SQLite databases with WAL mode (`PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, `foreign_keys = ON`), composite index `idx_block_hashes_file_block` on `(file_id, block_index)`, unique index `idx_file_metadata_relative_path`, prepared statement caching (`prepare_cached`), schema versioning (`db_version = "4"`), recording and retrieving file metadata and fixed 32-byte block digests (`BlockHash = [u8; 32]`), path-keyed block hash lookups, single-query bulk metadata preload (`list_all_records`), single-block UPSERT updates (`save_file`), and recursive child cascade deletion on directory remove. Generates separate cache database files (`sigcache_<hash>.db`) named using the Blake3 hash of the target path to prevent collisions.
 * **Does NOT own**: Calculating block hashes or filesystem read/writes.
 * **Trait Interfaces**:
   * `HashStore`: Interface for persisting and querying file block signatures (`BlockHash`).
 * **Mock Availability**: `MockHashStore` (implemented in `src/db.rs`) for in-memory unit testing.
 
 ### `sync`
-* **Owns**: Scanning directory trees with symlink skipping and recursion depth limits (`scan_dir`), path safety validation (`is_safe_relative_path` rejecting empty paths, ADS colons, parent traversal, and Windows reserved names like CON/NUL/COM1-9/LPT1-9), comparing source/destination state with ±2000 ms SMB timestamp tolerance, fast-path metadata bypass before hashing, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, emitting structured `tracing::info!` file copy telemetry (`path`, `target`, `size`), handling deletions with collision-resistant millisecond timestamps and offline destination reachability guards, and running background worker loops (`start_sync_worker`) notifying UI/status listeners via the decoupled `SyncStatusObserver` trait with automatic transient error retry scheduling. Returns structured `ScanOutcome` (`Success`, `PartialFailure`, `DestinationUnreachable`) from `run_full_scan`.
-* **Does NOT own**: Watching directories, UI interactions.
+* **Owns**: Scanning directory trees with symlink and directory junction skipping (`verify_destination_not_reparse`, cached attribute reparse checks) and recursion depth limits (`scan_dir`), path safety validation (`is_safe_relative_path`), comparing source/destination state with ±2000 ms SMB timestamp tolerance, fast-path metadata bypass before hashing, small-file write verification (`verify_writes`), TOCTOU file length truncation protection using actual streamed byte counts, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, reusable dirty range buffer memory management (`DirtyBlockRange::reset`), automatic archive pruning (`prune_archive`), and running background worker loops (`start_sync_worker`) with dynamic earliest-deadline sleep and permanent validation error eviction.
+* **Does NOT own**: Watching directories, UI interactions, daemon lifecycle.
 * **Trait Interfaces**:
   * `SyncEngine`: Core sync execution controller.
   * `SyncStatusObserver`: Decoupled listener interface for target destination connectivity transitions.
 * **Mock Availability**: `MockSyncEngine` for UI/tray triggers.
 
 ### `monitor`
-* **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`) wrapped in `#[must_use]` `DirectoryWatcher`, debouncing file events, and broadcasting `SyncCommand` events to multiple destination sync workers via crossbeam/std mpsc channels.
-* **Does NOT own**: Sync execution (delegates to `SyncEngine` worker threads).
+* **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`) wrapped in `#[must_use]` `DirectoryWatcher`, empty relative path filtering, debouncing file events, and broadcasting `SyncCommand` events to destination sync workers via crossbeam/std mpsc channels. Decoupled from `Config` (ISP fix accepting `impl AsRef<Path>`).
+* **Does NOT own**: Config parsing, sync execution (delegates to `SyncEngine` worker threads).
 
 ### `main`
 * **Owns**: Application entry point, CLI argument parsing, single-instance process mutex acquisition (`acquire_single_instance_mutex` / `SingleInstanceGuard`), dual-writer logging setup, system diagnostic telemetry collection, panic hook registration, process restart handoff (dropping mutex guard before spawning new process), and `WinitStatusObserver` adapter connecting `start_sync_worker` to the tray event loop.
 * **Does NOT own**: Filesystem watching, tray menu construction, or SQLite database operations.
 
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), managing `TrayState` (pure state container tracking engine health status transitions, online destination counts, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping, thread-safe icon caching (`ICON_CACHE` via `OnceLock`), qualified `%SystemRoot%\explorer.exe` process execution, and toggling Windows startup registration via injected `RegistryBackend` trait (`run_tray<R: RegistryBackend + 'static>`).
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), managing `TrayState` (pure state container tracking strongly-typed `ConnectivityState` and `WatcherState` domain enum transitions, online destination counts, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping, guarded config reload background thread execution, thread-safe icon caching (`ICON_CACHE` via `OnceLock`), qualified `%SystemRoot%\explorer.exe` process execution, and toggling Windows startup registration via injected `RegistryBackend` trait (`run_tray<R: RegistryBackend + 'static>`).
 * **Does NOT own**: Filesystem watching or database execution.
 
 ### `startup`
@@ -104,13 +123,19 @@ syncdir/
 
 | Module | May Import | Must NOT Import |
 |--------|-----------|-----------------|
-| `tray` | `sync`, `config`, `monitor`, `error`, `startup` (trait) | `db` (direct) |
-| `monitor` | `sync`, `config`, `error` | `db`, `tray` |
-| `sync` | `db` (trait), `config`, `error` | `monitor`, `tray` |
-| `db` | `config`, `error` | `sync`, `monitor`, `tray` |
-| `startup` | `config`, `error` | `sync`, `db`, `monitor`, `tray` |
-| `config` | `error` | `sync`, `db`, `monitor`, `tray` |
+| `main` | `daemon`, `tray`, `config`, `sync`, `startup`, `error` | `db` (direct) |
+| `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `tray`, `startup`, `path_util`, `error` | `main` |
+| `tray` | `sync`, `config`, `error`, `startup` (trait) | `db` (direct), `main`, `daemon` |
+| `monitor` | `sync`, `error` | `config`, `db`, `tray`, `main`, `daemon` |
+| `sync` | `db` (trait), `config`, `net`, `path_util`, `error` | `monitor`, `tray`, `main`, `daemon` |
+| `db` | `config`, `error` | `sync`, `monitor`, `tray`, `main`, `daemon` |
+| `startup` | `config`, `error` | `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
+| `net` | `path_util`, `error` | `config`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
+| `config` | `path_util`, `error` | `net`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
+| `path_util` | `std::path` only | All internal modules |
 | `error` | None | All |
+
+> **Cycle Resolution Note**: The historical circular dependency between `config` and `net` is permanently resolved by extracting path canonicalization into `path_util`. `config` imports `path_util` and `error` only; `net` imports `path_util` and `error` only. `monitor` does not import `config`, accepting `impl AsRef<Path>` instead.
 
 ---
 
@@ -177,16 +202,16 @@ syncdir/
 ### Module Interaction Graph
 ```mermaid
 graph TD
-    Tray[tray] -->|Triggers/Monitors Sync| Sync[sync/workers]
-    Tray -->|Reads config| Config[config]
-    Monitor[monitor/watcher] -->|Broadcasts SyncCommand| Sync
-    Monitor -->|Reads paths| Config
-    Sync -->|Loads signatures| Db[db]
-    Sync -->|Reads paths| Config
-    Db -->|Generates DB path from target hash| Config
-    Sync -->|Logs errors| Error[error]
-    Db -->|Converts errors| Error
-    Config -->|Converts errors| Error
+    main --> daemon & tray & config & sync & startup & error
+    daemon --> config & net & monitor & sync & tray & startup & path_util & error
+    daemon -.->|via factory| db
+    tray --> sync & config & error & startup
+    monitor --> sync & error
+    sync --> db & config & net & path_util & error
+    db --> config & error
+    config --> path_util & error
+    net --> path_util & error
+    startup --> error
 ```
 
 ### Data Flow Diagram (Sync Action)
