@@ -9,6 +9,7 @@ use std::sync::mpsc::channel;
 use syncdir::config::Config;
 use syncdir::db::SqliteHashStore;
 use syncdir::error::SyncError;
+use syncdir::startup::RegistryBackend;
 use syncdir::sync::{SyncCommand, start_sync_worker};
 use syncdir::tray::{DestinationState, TrayExitReason, run_tray};
 use tracing_appender::rolling::{Builder, Rotation};
@@ -29,6 +30,41 @@ impl syncdir::sync::SyncStatusObserver for WinitStatusObserver {
                     dest_online: online,
                 },
             ));
+    }
+}
+
+struct DaemonTrayHandler<R: RegistryBackend> {
+    config_path: PathBuf,
+    command_tx: std::sync::mpsc::Sender<SyncCommand>,
+    registry: R,
+}
+
+impl<R: RegistryBackend + Send + Sync + 'static> syncdir::tray::TrayActionHandler
+    for DaemonTrayHandler<R>
+{
+    fn on_sync_now(&self) -> Result<(), SyncError> {
+        let _ = self.command_tx.send(SyncCommand::TriggerFullScan);
+        Ok(())
+    }
+
+    fn on_reload_config(&self) -> Result<bool, SyncError> {
+        let new_config = Config::load(&self.config_path)?;
+        new_config.validate()?;
+        Ok(true)
+    }
+
+    fn on_toggle_startup(&self, enable: bool) -> Result<bool, SyncError> {
+        if enable {
+            self.registry.register()?;
+            Ok(true)
+        } else {
+            self.registry.unregister()?;
+            Ok(false)
+        }
+    }
+
+    fn is_startup_enabled(&self) -> bool {
+        self.registry.is_registered().unwrap_or(false)
     }
 }
 
@@ -283,14 +319,12 @@ retry_interval_seconds = 10
             DestinationState { path: d, is_online }
         })
         .collect();
-    let exit_reason = run_tray(
-        event_loop,
-        config_path,
-        log_dir,
-        tx,
-        destinations,
-        syncdir::startup::StartupRegistry,
-    )?;
+    let handler = std::sync::Arc::new(DaemonTrayHandler {
+        config_path: config_path.clone(),
+        command_tx: tx,
+        registry: syncdir::startup::StartupRegistry,
+    });
+    let exit_reason = run_tray(event_loop, config_path, log_dir, destinations, handler)?;
 
     Ok(exit_reason)
 }

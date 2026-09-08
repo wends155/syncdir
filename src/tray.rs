@@ -1,10 +1,8 @@
 use crate::error::SyncError;
-use crate::startup::RegistryBackend;
-use crate::sync::SyncCommand;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use winit::event::Event;
@@ -335,13 +333,46 @@ fn show_error_dialog(_title_str: &str, _msg_str: &str) {}
 /// # Errors
 ///
 /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
-pub fn run_tray<R: RegistryBackend + 'static>(
+/// Handler interface for decoupled tray user actions.
+pub trait TrayActionHandler: Send + Sync + 'static {
+    /// Callback when user requests manual synchronization.
+    fn on_sync_now(&self) -> Result<(), SyncError>;
+    /// Callback when user requests configuration reload.
+    /// Returns `Ok(true)` if daemon should restart with new config.
+    fn on_reload_config(&self) -> Result<bool, SyncError>;
+    /// Callback when user toggles Windows startup registration.
+    /// Returns the updated registration status.
+    fn on_toggle_startup(&self, enable: bool) -> Result<bool, SyncError>;
+    /// Query whether startup auto-run is currently registered.
+    fn is_startup_enabled(&self) -> bool;
+}
+
+/// Launch the system tray event loop (blocking).
+///
+/// Creates a tray icon in the Windows notification area with a checkable
+/// context menu and listens for user mouse interactions and directory status updates.
+///
+/// # Arguments
+///
+/// * `event_loop` - The winit event loop initialized on the main UI thread.
+/// * `config_path` - The system path to the user's `config.toml`.
+/// * `log_dir` - The path to the active log directory for manual retrieval.
+/// * `destinations` - Initial destination states with reachability status.
+/// * `handler` - Handler dispatching user actions to the sync daemon and startup backend.
+///
+/// # Returns
+///
+/// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
+///
+/// # Errors
+///
+/// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
+pub fn run_tray<H: TrayActionHandler + ?Sized>(
     event_loop: winit::event_loop::EventLoop<UserEvent>,
     config_path: PathBuf,
     log_dir: PathBuf,
-    tx: Sender<SyncCommand>,
     destinations: Vec<DestinationState>,
-    registry: R,
+    handler: Arc<H>,
 ) -> Result<TrayExitReason, SyncError> {
     let dests: Vec<PathBuf> = destinations.iter().map(|d| d.path.clone()).collect();
     let initial_dest_online: Vec<bool> = destinations.iter().map(|d| d.is_online).collect();
@@ -351,7 +382,7 @@ pub fn run_tray<R: RegistryBackend + 'static>(
     let view_logs = MenuItem::new("View Logs", true, None);
     let sync_now = MenuItem::new("Sync Now", true, None);
 
-    let initially_checked = registry.is_registered().unwrap_or(false);
+    let initially_checked = handler.is_startup_enabled();
     let startup_toggle =
         CheckMenuItem::new("Start on System Startup", true, initially_checked, None);
 
@@ -434,31 +465,30 @@ pub fn run_tray<R: RegistryBackend + 'static>(
                         MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
                         elwt.exit();
                     } else if menu_event.id == sync_now_id {
-                        let _ = tx.send(SyncCommand::TriggerFullScan);
-                        tracing::info!("Manual sync triggered from tray menu");
+                        if let Err(e) = handler.on_sync_now() {
+                            tracing::error!(error = %e, "Manual sync failed");
+                        } else {
+                            tracing::info!("Manual sync triggered from tray menu");
+                        }
                     } else if menu_event.id == open_config_id {
                         let _ = open_path(&config_path);
                     } else if menu_event.id == reload_config_id {
                         tracing::info!("Reload Config requested via tray menu.");
-                        match crate::config::Config::load(&config_path) {
-                            Ok(new_config) => {
-                                if let Err(e) = new_config.validate() {
-                                    let err_msg =
-                                        format!("Configuration validation failed:\n\n{e}");
-                                    tracing::error!("{err_msg}");
-                                    show_error_dialog("Config Reload Error", &err_msg);
-                                } else {
-                                    tracing::info!(
-                                        "Configuration validated successfully. Restarting daemon..."
-                                    );
-                                    MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
-                                    exit_reason_closure.set(TrayExitReason::Restart);
-                                    elwt.exit();
-                                }
+                        match handler.on_reload_config() {
+                            Ok(true) => {
+                                tracing::info!(
+                                    "Configuration validated successfully. Restarting daemon..."
+                                );
+                                MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+                                exit_reason_closure.set(TrayExitReason::Restart);
+                                elwt.exit();
+                            }
+                            Ok(false) => {
+                                tracing::warn!("Configuration reload cancelled or unchanged");
                             }
                             Err(e) => {
-                                let err_msg = format!("Failed to parse configuration file:\n\n{e}");
-                                tracing::error!("{err_msg}");
+                                let err_msg = format!("Configuration reload error:\n\n{e}");
+                                tracing::error!(error = %e, "Configuration reload failed");
                                 show_error_dialog("Config Reload Error", &err_msg);
                             }
                         }
@@ -466,25 +496,20 @@ pub fn run_tray<R: RegistryBackend + 'static>(
                         let _ = open_path(&log_dir);
                     } else if menu_event.id == startup_toggle_id {
                         let is_checked = startup_toggle.is_checked();
-                        if is_checked {
-                            match registry.register() {
-                                Ok(()) => {
-                                    tracing::info!("Startup auto-run registered via tray menu");
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to register startup from tray: {e}");
-                                    startup_toggle.set_checked(false);
-                                }
+                        match handler.on_toggle_startup(is_checked) {
+                            Ok(actual_state) => {
+                                startup_toggle.set_checked(actual_state);
+                                tracing::info!(
+                                    enabled = actual_state,
+                                    "Startup auto-run toggled from tray menu"
+                                );
                             }
-                        } else {
-                            match registry.unregister() {
-                                Ok(()) => {
-                                    tracing::info!("Startup auto-run unregistered via tray menu");
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to unregister startup from tray: {e}");
-                                    startup_toggle.set_checked(true);
-                                }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to toggle startup registration from tray"
+                                );
+                                startup_toggle.set_checked(!is_checked);
                             }
                         }
                     } else if menu_event.id == about_id {

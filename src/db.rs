@@ -243,95 +243,90 @@ impl HashStore for SqliteHashStore {
     }
 }
 
+#[derive(Debug, Default)]
+struct MockStoreInner {
+    records: std::collections::HashMap<String, FileRecord>,
+    hashes: std::collections::HashMap<i64, Vec<BlockHash>>,
+    next_id: i64,
+}
+
 /// In-memory implementation of `HashStore` for fast, isolated unit testing.
 #[derive(Debug, Default, Clone)]
 pub struct MockHashStore {
-    records: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FileRecord>>>,
-    hashes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, Vec<BlockHash>>>>,
-    next_id: std::sync::Arc<std::sync::Mutex<i64>>,
+    inner: std::sync::Arc<std::sync::RwLock<MockStoreInner>>,
 }
 
 impl MockHashStore {
     /// Create a new empty in-memory hash store.
     pub fn new() -> Self {
         Self {
-            records: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            hashes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            next_id: std::sync::Arc::new(std::sync::Mutex::new(1)),
+            inner: std::sync::Arc::new(std::sync::RwLock::new(MockStoreInner {
+                records: std::collections::HashMap::new(),
+                hashes: std::collections::HashMap::new(),
+                next_id: 1,
+            })),
         }
     }
 }
 
 impl HashStore for MockHashStore {
     fn get_file(&self, path: &str) -> Result<Option<FileRecord>, SyncError> {
-        let records = self
-            .records
-            .lock()
+        let inner = self
+            .inner
+            .read()
             .map_err(|e| SyncError::LockPoison(e.to_string()))?;
-        Ok(records.get(path).cloned())
+        Ok(inner.records.get(path).cloned())
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
-        let mut records = self
-            .records
-            .lock()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
-        let mut all_hashes = self
-            .hashes
-            .lock()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
-        let mut next_id = self
-            .next_id
-            .lock()
+        let mut inner = self
+            .inner
+            .write()
             .map_err(|e| SyncError::LockPoison(e.to_string()))?;
 
-        let id = if let Some(existing) = records.get(&record.relative_path) {
+        let id = if let Some(existing) = inner.records.get(&record.relative_path) {
             existing.id.unwrap_or(1)
         } else {
-            let assigned = *next_id;
-            *next_id += 1;
+            let assigned = inner.next_id;
+            inner.next_id += 1;
             assigned
         };
 
         let mut updated = record.clone();
         updated.id = Some(id);
-        records.insert(record.relative_path.clone(), updated);
-        all_hashes.insert(id, hashes.to_vec());
+        inner.records.insert(record.relative_path.clone(), updated);
+        inner.hashes.insert(id, hashes.to_vec());
         Ok(())
     }
 
     fn get_block_hashes(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError> {
-        let hashes = self
-            .hashes
-            .lock()
+        let inner = self
+            .inner
+            .read()
             .map_err(|e| SyncError::LockPoison(e.to_string()))?;
-        Ok(hashes.get(&file_id).cloned().unwrap_or_default())
+        Ok(inner.hashes.get(&file_id).cloned().unwrap_or_default())
     }
 
     fn delete_file(&self, path: &str) -> Result<(), SyncError> {
-        let mut records = self
-            .records
-            .lock()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
-        let mut hashes = self
-            .hashes
-            .lock()
+        let mut inner = self
+            .inner
+            .write()
             .map_err(|e| SyncError::LockPoison(e.to_string()))?;
 
-        if let Some(removed) = records.remove(path)
+        if let Some(removed) = inner.records.remove(path)
             && let Some(id) = removed.id
         {
-            hashes.remove(&id);
+            inner.hashes.remove(&id);
         }
         Ok(())
     }
 
     fn list_files(&self) -> Result<Vec<String>, SyncError> {
-        let records = self
-            .records
-            .lock()
+        let inner = self
+            .inner
+            .read()
             .map_err(|e| SyncError::LockPoison(e.to_string()))?;
-        let mut keys: Vec<String> = records.keys().cloned().collect();
+        let mut keys: Vec<String> = inner.records.keys().cloned().collect();
         keys.sort();
         Ok(keys)
     }

@@ -230,6 +230,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "Mutates host Windows Registry Run key; execute only in dedicated integration environments"]
     fn test_startup_registration_toggle() {
         struct StateGuard(bool);
         impl Drop for StateGuard {
