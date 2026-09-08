@@ -24,6 +24,79 @@ pub struct TargetSyncConfig {
     pub propagate_deletions: bool,
 }
 
+impl TargetSyncConfig {
+    /// Source directory getter.
+    pub fn source_dir(&self) -> &Path {
+        &self.source_dir
+    }
+
+    /// Destination directory getter.
+    pub fn dest_dir(&self) -> &Path {
+        &self.dest_dir
+    }
+
+    /// Block size in bytes getter.
+    pub fn block_size_bytes(&self) -> u64 {
+        self.block_size_bytes
+    }
+
+    /// Block sync threshold in bytes getter.
+    pub fn block_sync_threshold_bytes(&self) -> u64 {
+        self.block_sync_threshold_bytes
+    }
+
+    /// Verify writes flag getter.
+    pub fn verify_writes(&self) -> bool {
+        self.verify_writes
+    }
+
+    /// Debounce seconds getter.
+    pub fn debounce_seconds(&self) -> u64 {
+        self.debounce_seconds
+    }
+
+    /// Retry interval in seconds getter.
+    pub fn retry_interval_seconds(&self) -> u64 {
+        self.retry_interval_seconds
+    }
+
+    /// Propagate deletions flag getter.
+    pub fn propagate_deletions(&self) -> bool {
+        self.propagate_deletions
+    }
+
+    /// Resolved source directory path.
+    pub fn resolved_source_dir(&self) -> &Path {
+        &self.source_dir
+    }
+}
+
+impl From<&Config> for TargetSyncConfig {
+    fn from(cfg: &Config) -> Self {
+        let dest = cfg
+            .dest_dir()
+            .map(Path::to_path_buf)
+            .or_else(|| cfg.dest_dirs().and_then(|dirs| dirs.first().cloned()))
+            .unwrap_or_default();
+        Self {
+            source_dir: cfg.resolved_source_dir(),
+            dest_dir: dest,
+            block_size_bytes: cfg.block_size_bytes(),
+            block_sync_threshold_bytes: cfg.block_sync_threshold_bytes(),
+            verify_writes: cfg.verify_writes(),
+            debounce_seconds: cfg.debounce_seconds(),
+            retry_interval_seconds: cfg.retry_interval_seconds(),
+            propagate_deletions: cfg.propagate_deletions(),
+        }
+    }
+}
+
+impl From<Config> for TargetSyncConfig {
+    fn from(cfg: Config) -> Self {
+        Self::from(&cfg)
+    }
+}
+
 /// Runtime configuration for the sync daemon.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {

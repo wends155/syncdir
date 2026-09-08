@@ -3,12 +3,12 @@
 //! Defines the message types that the monitor and tray threads
 //! send to the sync worker, and the trait contract for the sync engine.
 
-use crate::config::Config;
+use crate::config::TargetSyncConfig;
 use crate::db::{BlockHash, FileRecord, HashStore};
 use crate::error::SyncError;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -62,6 +62,57 @@ pub enum ScanOutcome {
 /// Observer for sync worker status changes. Decouples sync from UI.
 pub trait SyncStatusObserver: Send + Sync + 'static {
     fn on_target_status_change(&self, target_index: usize, online: bool);
+    /// Forward source directory connectivity and watcher active status to observers.
+    fn on_watcher_status_change(&self, _source_online: bool, _watcher_active: bool) {}
+}
+
+/// Contiguous range of dirty blocks to coalesce delta writes and reduce seek overhead.
+#[derive(Debug, Default)]
+pub struct DirtyBlockRange {
+    pub start_block: u64,
+    pub block_count: u64,
+    pub data: Vec<u8>,
+}
+
+impl DirtyBlockRange {
+    pub const MAX_COALESCE_BYTES: usize = 16 * 1024 * 1024;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_block<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        block_idx: u64,
+        block_bytes: &[u8],
+        writer: &mut W,
+        block_size: u64,
+    ) -> Result<(), crate::error::SyncError> {
+        let is_contiguous =
+            self.block_count > 0 && block_idx == self.start_block + self.block_count;
+        let fits = self.data.len() + block_bytes.len() <= Self::MAX_COALESCE_BYTES;
+        if !is_contiguous || !fits {
+            self.flush(writer, block_size)?;
+            self.start_block = block_idx;
+        }
+        self.data.extend_from_slice(block_bytes);
+        self.block_count += 1;
+        Ok(())
+    }
+
+    pub fn flush<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        writer: &mut W,
+        block_size: u64,
+    ) -> Result<(), crate::error::SyncError> {
+        if self.block_count > 0 {
+            writer.seek(std::io::SeekFrom::Start(self.start_block * block_size))?;
+            writer.write_all(&self.data)?;
+            self.data.clear();
+            self.block_count = 0;
+        }
+        Ok(())
+    }
 }
 
 /// Read exactly `buf.len()` bytes or until EOF, handling partial reads.
@@ -91,13 +142,16 @@ pub trait SyncEngine {
 /// Delta sync engine backed by a `HashStore` for signature caching.
 pub struct LocalSyncEngine<S: HashStore> {
     pub(crate) db: S,
-    pub(crate) config: Config,
+    pub(crate) config: TargetSyncConfig,
 }
 
 impl<S: HashStore> LocalSyncEngine<S> {
     /// Create a new sync engine with the given database and config.
-    pub fn new(db: S, config: Config) -> Self {
-        Self { db, config }
+    pub fn new(db: S, config: impl Into<TargetSyncConfig>) -> Self {
+        Self {
+            db,
+            config: config.into(),
+        }
     }
 
     /// Hash a file in block-sized chunks, returning (size, mtime, hashes).
@@ -129,11 +183,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         relative_path: &Path,
         timestamp: &str,
     ) -> Result<PathBuf, SyncError> {
-        let dest_dir = self.config.dest_dir().ok_or_else(|| {
-            SyncError::Validation(
-                "Destination directory not configured for archive creation".to_string(),
-            )
-        })?;
+        let dest_dir = &self.config.dest_dir;
 
         let mut components = relative_path.components();
         if let Some(first) = components.next() {
@@ -159,13 +209,16 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 path
             )));
         }
-        let src_path = self.config.resolved_source_dir().join(&rel_path);
-        let dest_dir = self.config.dest_dir().ok_or_else(|| {
-            SyncError::Validation("Destination directory not configured".to_string())
-        })?;
+        let src_path = self.config.source_dir.join(&rel_path);
+        let dest_dir = &self.config.dest_dir;
         let dest_path = dest_dir.join(&rel_path);
 
         let src_meta = fs::metadata(&src_path).map_err(SyncError::Io)?;
+        if src_meta.is_dir() {
+            fs::create_dir_all(&dest_path)?;
+            return Ok(());
+        }
+
         let src_size = src_meta.len() as i64;
         let src_mod = safe_modified_millis(&src_meta)?;
 
@@ -190,7 +243,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let (_, _, src_hashes) = self.calculate_hashes(&src_path)?;
 
         // Small file: full copy
-        if (src_size as u64) < self.config.block_sync_threshold_bytes() {
+        if (src_size as u64) < self.config.block_sync_threshold_bytes {
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -247,34 +300,45 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         };
 
         let mut src_file = File::open(&src_path)?;
-        let block_size = self.config.block_size_bytes();
+        let block_size = self.config.block_size_bytes;
         let mut buffer = vec![0; block_size as usize];
-        let mut verify_buf = if self.config.verify_writes() {
+        let mut verify_buf = if self.config.verify_writes {
             vec![0; block_size as usize]
         } else {
             Vec::new()
         };
+
+        let mut range = DirtyBlockRange::new();
+        let mut modified_block_indices = Vec::new();
 
         for (idx, hash) in src_hashes.iter().enumerate() {
             if old_hashes.get(idx) != Some(hash) {
                 src_file.seek(SeekFrom::Start(idx as u64 * block_size))?;
                 let bytes_read = read_block(&mut src_file, &mut buffer)?;
                 if bytes_read > 0 {
-                    dest_file.seek(SeekFrom::Start(idx as u64 * block_size))?;
-                    dest_file.write_all(&buffer[..bytes_read])?;
-
-                    // Write-verification: read back and check hash
-                    if self.config.verify_writes() {
-                        dest_file.seek(SeekFrom::Start(idx as u64 * block_size))?;
-                        let v_buf = &mut verify_buf[..bytes_read];
-                        dest_file.read_exact(v_buf)?;
-                        let verify_hash = blake3::hash(v_buf);
-                        if verify_hash.as_bytes() != hash {
-                            return Err(SyncError::Validation(
-                                "Write verification failed".to_string(),
-                            ));
-                        }
+                    range.add_block(
+                        idx as u64,
+                        &buffer[..bytes_read],
+                        &mut dest_file,
+                        block_size,
+                    )?;
+                    if self.config.verify_writes {
+                        modified_block_indices.push((idx as u64, bytes_read, *hash));
                     }
+                }
+            }
+        }
+        range.flush(&mut dest_file, block_size)?;
+
+        // Verify all written blocks after destination file is completely flushed
+        if self.config.verify_writes {
+            for (block_idx, bytes_len, expected_hash) in modified_block_indices {
+                dest_file.seek(SeekFrom::Start(block_idx * block_size))?;
+                dest_file.read_exact(&mut verify_buf[..bytes_len])?;
+                if blake3::hash(&verify_buf[..bytes_len]).as_bytes() != &expected_hash {
+                    return Err(SyncError::Validation(
+                        "Write verification failed".to_string(),
+                    ));
                 }
             }
         }
@@ -310,9 +374,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 path
             )));
         }
-        let dest_dir = self.config.dest_dir().ok_or_else(|| {
-            SyncError::Validation("Destination directory not configured".to_string())
-        })?;
+        let dest_dir = &self.config.dest_dir;
         let dest_path = dest_dir.join(&rel_path);
 
         if !dest_dir.exists() {
@@ -322,7 +384,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             )));
         }
 
-        if dest_path.exists() && self.config.propagate_deletions() {
+        if dest_path.exists() && self.config.propagate_deletions {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| {
@@ -349,44 +411,43 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     }
 
     fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
-        let resolved_source = self.config.resolved_source_dir();
+        let resolved_source = &self.config.source_dir;
         if !resolved_source.exists() {
             return Err(SyncError::Validation(
                 "Source directory does not exist".to_string(),
             ));
         }
 
-        if let Some(dest) = self.config.dest_dir() {
-            let dest_reachable = dest.exists() && dest.is_dir();
-            let is_reachable = if !dest_reachable {
-                let alt_path = crate::config::try_resolve_alternate_path(dest);
-                if alt_path.exists() && alt_path.is_dir() {
-                    if alt_path != *dest {
-                        tracing::info!(
-                            target = %dest.display(),
-                            resolved_path = %alt_path.display(),
-                            "Target destination resolved alternate mapped drive/UNC SMB path for full scan."
-                        );
-                    }
-                    true
-                } else {
-                    false
+        let dest = &self.config.dest_dir;
+        let dest_reachable = dest.exists() && dest.is_dir();
+        let is_reachable = if !dest_reachable {
+            let alt_path = crate::config::try_resolve_alternate_path(dest);
+            if alt_path.exists() && alt_path.is_dir() {
+                if alt_path != *dest {
+                    tracing::info!(
+                        target = %dest.display(),
+                        resolved_path = %alt_path.display(),
+                        "Target destination resolved alternate mapped drive/UNC SMB path for full scan."
+                    );
                 }
-            } else {
                 true
-            };
-
-            if !is_reachable {
-                tracing::warn!(
-                    target = %dest.display(),
-                    "Target destination directory does not exist or is unreachable. Skipping full scan."
-                );
-                return Ok(ScanOutcome::DestinationUnreachable);
+            } else {
+                false
             }
+        } else {
+            true
+        };
+
+        if !is_reachable {
+            tracing::warn!(
+                target = %dest.display(),
+                "Target destination directory does not exist or is unreachable. Skipping full scan."
+            );
+            return Ok(ScanOutcome::DestinationUnreachable);
         }
 
         let mut source_files = HashSet::new();
-        scan_dir(&resolved_source, &resolved_source, &mut source_files, 0)?;
+        scan_dir(resolved_source, resolved_source, &mut source_files, 0)?;
 
         // Sync all source files
         let mut synced_count = 0usize;
@@ -406,7 +467,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                     if e.is_network_offline() {
                         tracing::warn!(
                             path = %rel_path,
-                            target = %self.config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                            target = %self.config.dest_dir.display(),
                             error = %e,
                             os_error = ?os_code,
                             remaining = source_files.len() - sync_skip_count - 1,
@@ -417,7 +478,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                     }
                     tracing::warn!(
                         path = %rel_path,
-                        target = %self.config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                        target = %self.config.dest_dir.display(),
                         error = %e,
                         os_error = ?os_code,
                         "Skipped file during full scan"
@@ -430,7 +491,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             tracing::warn!(
                 skipped = sync_skip_count,
                 total = source_files.len(),
-                target = %self.config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                target = %self.config.dest_dir.display(),
                 "Full scan completed with sync errors"
             );
         }
@@ -441,7 +502,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         }
 
         // Detect deletions: files in DB but missing from source
-        if self.config.propagate_deletions() {
+        if self.config.propagate_deletions {
             // Empty source directory safety check:
             if source_files.is_empty() {
                 let tracked = self.db.list_files()?;
@@ -466,7 +527,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                     };
                     tracing::warn!(
                         path = %tracked_path,
-                        target = %self.config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                        target = %self.config.dest_dir.display(),
                         error = %e,
                         os_error = ?os_code,
                         "Skipped deletion during full scan"
@@ -477,7 +538,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
             if delete_skip_count > 0 {
                 tracing::warn!(
                     skipped = delete_skip_count,
-                    target = %self.config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                    target = %self.config.dest_dir.display(),
                     "Full scan completed with deletion errors"
                 );
             }
@@ -576,12 +637,13 @@ pub fn is_safe_relative_path(path: &Path) -> bool {
 #[must_use = "dropping the JoinHandle detaches the sync worker thread"]
 pub fn start_sync_worker<S: HashStore + Send + 'static>(
     target_index: usize,
-    config: Config,
+    config: impl Into<TargetSyncConfig>,
     db: S,
     rx: std::sync::mpsc::Receiver<SyncCommand>,
     observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
     source_online_atomic: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
+    let config: TargetSyncConfig = config.into();
     std::thread::spawn(move || {
         let engine = LocalSyncEngine::new(db, config.clone());
         let mut pending_syncs: HashMap<PathBuf, Instant> = HashMap::new();
@@ -593,7 +655,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
 
         let mut last_status_check = Instant::now()
             .checked_sub(std::time::Duration::from_secs(
-                config.retry_interval_seconds(),
+                config.retry_interval_seconds,
             ))
             .unwrap_or_else(Instant::now);
 
@@ -601,30 +663,27 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
             let now = Instant::now();
 
             if now.duration_since(last_status_check)
-                >= std::time::Duration::from_secs(config.retry_interval_seconds())
+                >= std::time::Duration::from_secs(config.retry_interval_seconds)
             {
                 last_status_check = now;
 
                 let current_source_online =
                     source_online_atomic.load(std::sync::atomic::Ordering::Relaxed);
-                let current_dest_online = config
-                    .dest_dir()
-                    .map(|d| match std::fs::metadata(d) {
-                        Ok(meta) => meta.is_dir(),
-                        Err(ref e) => {
-                            if dest_online {
-                                tracing::warn!(
-                                    target_index = target_index + 1,
-                                    target_path = %d.display(),
-                                    error = %e,
-                                    os_error = ?e.raw_os_error(),
-                                    "Target destination went offline."
-                                );
-                            }
-                            false
+                let current_dest_online = match std::fs::metadata(&config.dest_dir) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(ref e) => {
+                        if dest_online {
+                            tracing::warn!(
+                                target_index = target_index + 1,
+                                target_path = %config.dest_dir.display(),
+                                error = %e,
+                                os_error = ?e.raw_os_error(),
+                                "Target destination went offline."
+                            );
                         }
-                    })
-                    .unwrap_or(false);
+                        false
+                    }
+                };
 
                 source_online = current_source_online;
                 dest_online = current_dest_online;
@@ -633,7 +692,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                     if current_dest_online && last_sent_dest_online == Some(false) {
                         tracing::info!(
                             target_index = target_index + 1,
-                            target_path = %config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                            target_path = %config.dest_dir.display(),
                             "Target destination is back online."
                         );
                     }
@@ -648,13 +707,13 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(SyncCommand::FileModified(path)) => {
                     let deadline =
-                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds());
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
                     pending_syncs.insert(path.clone(), deadline);
                     pending_deletes.remove(&path);
                 }
                 Ok(SyncCommand::FileDeleted(path)) => {
                     let deadline =
-                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds());
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
                     pending_deletes.insert(path.clone(), deadline);
                     pending_syncs.remove(&path);
                 }
@@ -675,13 +734,13 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                                 tracing::warn!(
                                     synced,
                                     failed,
-                                    target_path = %config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                                    target_path = %config.dest_dir.display(),
                                     "Full scan completed with partial sync failures"
                                 );
                             }
                             Ok(ScanOutcome::DestinationUnreachable) => {
                                 tracing::warn!(
-                                    target_path = %config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                                    target_path = %config.dest_dir.display(),
                                     "Full scan destination unreachable. Setting destination status to offline."
                                 );
                                 dest_online = false;
@@ -719,19 +778,19 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                         };
                         tracing::warn!(
                             path = %path.display(),
-                            target = %config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                            target = %config.dest_dir.display(),
                             error = %e,
                             os_error = ?os_code,
                             "Sync failed, scheduling retry"
                         );
                         let retry_at = Instant::now()
-                            + std::time::Duration::from_secs(config.retry_interval_seconds());
+                            + std::time::Duration::from_secs(config.retry_interval_seconds);
                         pending_syncs.insert(path, retry_at);
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "Skipped syncing file: source or destination offline");
                     let deadline =
-                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds());
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
                     pending_syncs.insert(path, deadline);
                 }
             }
@@ -751,19 +810,19 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
                         };
                         tracing::warn!(
                             path = %path.display(),
-                            target = %config.dest_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                            target = %config.dest_dir.display(),
                             error = %e,
                             os_error = ?os_code,
                             "Deletion failed, scheduling retry"
                         );
                         let retry_at = Instant::now()
-                            + std::time::Duration::from_secs(config.retry_interval_seconds());
+                            + std::time::Duration::from_secs(config.retry_interval_seconds);
                         pending_deletes.insert(path, retry_at);
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "Skipped deleting file: destination offline");
                     let deadline =
-                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds());
+                        Instant::now() + std::time::Duration::from_secs(config.debounce_seconds);
                     pending_deletes.insert(path, deadline);
                 }
             }
@@ -774,6 +833,7 @@ pub fn start_sync_worker<S: HashStore + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::db::{MockHashStore, SqliteHashStore};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
@@ -1275,5 +1335,52 @@ mod tests {
             safe_epoch_duration_millis(-500),
             std::time::Duration::from_millis(0)
         );
+    }
+
+    #[test]
+    fn test_dirty_block_range_coalescing() {
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(vec![0u8; 32]);
+        let mut range = DirtyBlockRange::new();
+
+        // Add contiguous blocks: block 0 (4 bytes), block 1 (4 bytes)
+        range.add_block(0, b"AAAA", &mut cursor, 4).unwrap();
+        assert_eq!(range.block_count, 1);
+        assert_eq!(range.start_block, 0);
+
+        range.add_block(1, b"BBBB", &mut cursor, 4).unwrap();
+        assert_eq!(range.block_count, 2);
+        assert_eq!(range.start_block, 0);
+
+        // Add non-contiguous block 4 (should flush blocks 0-1 and start block 4)
+        range.add_block(4, b"EEEE", &mut cursor, 4).unwrap();
+        assert_eq!(range.block_count, 1);
+        assert_eq!(range.start_block, 4);
+
+        // Final flush
+        range.flush(&mut cursor, 4).unwrap();
+        assert_eq!(range.block_count, 0);
+
+        let data = cursor.into_inner();
+        assert_eq!(&data[0..8], b"AAAABBBB");
+        assert_eq!(&data[8..16], &[0u8; 8]); // blocks 2 & 3 untouched
+        assert_eq!(&data[16..20], b"EEEE");
+    }
+
+    #[test]
+    fn test_sync_file_directory_creation() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(source.join("new_folder")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // sync_file on a directory path should create the folder on dest and return Ok(())
+        engine.sync_file("new_folder").unwrap();
+        assert!(dest.join("new_folder").is_dir());
     }
 }
