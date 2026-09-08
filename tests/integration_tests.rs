@@ -15,11 +15,13 @@ fn test_integration_config_db_sync_commands() {
     let dest = dir.path().join("dest");
     std::fs::create_dir(&dest).unwrap();
 
-    let mut config = Config::test_default(source, dest);
-    config.debounce_seconds = 5;
-    config.propagate_deletions = false;
-    config.block_sync_threshold_bytes = 4096;
-    config.block_size_bytes = 1024;
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(5)
+        .propagate_deletions(false)
+        .block_sync_threshold_bytes(4096)
+        .block_size_bytes(1024)
+        .build();
 
     assert!(config.validate().is_ok());
 
@@ -114,8 +116,10 @@ fn test_propagate_deletions_false() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&dest).unwrap();
 
-    let mut config = Config::test_default(source.clone(), dest.clone());
-    config.propagate_deletions = false;
+    let config = Config::builder(source.clone())
+        .dest_dir(dest.clone())
+        .propagate_deletions(false)
+        .build();
 
     let store = SqliteHashStore::new(&db_path, &config).unwrap();
     let engine = LocalSyncEngine::new(store, config);

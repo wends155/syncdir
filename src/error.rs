@@ -11,7 +11,10 @@ pub enum SyncError {
 
     /// SQLite database operation failure.
     #[error("Database error: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(
+        String,
+        #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
+    ),
 
     /// Configuration file parsing failure.
     #[error("Config error: {0}")]
@@ -27,7 +30,10 @@ pub enum SyncError {
 
     /// File watcher failure.
     #[error("Watcher error: {0}")]
-    Watcher(#[from] notify::Error),
+    Watcher(
+        String,
+        #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
+    ),
 
     /// System tray creation or event loop failure.
     #[error("Tray error: {0}")]
@@ -36,6 +42,34 @@ pub enum SyncError {
     /// Windows startup registry operation failure.
     #[error("Registry error: {0}")]
     Registry(String),
+}
+
+impl From<rusqlite::Error> for SyncError {
+    fn from(err: rusqlite::Error) -> Self {
+        SyncError::Db(err.to_string(), Some(Box::new(err)))
+    }
+}
+
+impl From<notify::Error> for SyncError {
+    fn from(err: notify::Error) -> Self {
+        SyncError::Watcher(err.to_string(), Some(Box::new(err)))
+    }
+}
+
+/// Returns `true` if an `io::Error` represents an SMB/network connectivity loss.
+pub fn is_network_offline_io(io_err: &std::io::Error) -> bool {
+    matches!(
+        io_err.raw_os_error(),
+        Some(3)   // ERROR_PATH_NOT_FOUND
+        | Some(15) // ERROR_INVALID_DRIVE
+        | Some(53) // ERROR_BAD_NETPATH
+        | Some(59) // ERROR_UNEXP_NET_ERR
+        | Some(64) // ERROR_NETNAME_DELETED
+        | Some(65) // ERROR_NETWORK_ACCESS_DENIED (network busy)
+        | Some(67) // ERROR_BAD_NET_NAME
+        | Some(121) // ERROR_SEM_TIMEOUT
+        | Some(1326) // ERROR_LOGON_FAILURE
+    )
 }
 
 impl SyncError {
@@ -48,18 +82,7 @@ impl SyncError {
     /// error codes.
     pub fn is_network_offline(&self) -> bool {
         match self {
-            SyncError::Io(io_err) => matches!(
-                io_err.raw_os_error(),
-                Some(3)   // ERROR_PATH_NOT_FOUND
-                | Some(15) // ERROR_INVALID_DRIVE
-                | Some(53) // ERROR_BAD_NETPATH
-                | Some(59) // ERROR_UNEXP_NET_ERR
-                | Some(64) // ERROR_NETNAME_DELETED
-                | Some(65) // ERROR_NETWORK_ACCESS_DENIED (network busy)
-                | Some(67) // ERROR_BAD_NET_NAME
-                | Some(121) // ERROR_SEM_TIMEOUT
-                | Some(1326) // ERROR_LOGON_FAILURE
-            ),
+            SyncError::Io(io_err) => is_network_offline_io(io_err),
             _ => false,
         }
     }
@@ -118,5 +141,27 @@ mod tests {
     fn test_is_network_offline_invalid_drive() {
         let err = SyncError::Io(std::io::Error::from_raw_os_error(15));
         assert!(err.is_network_offline());
+    }
+
+    #[test]
+    fn test_is_network_offline_io_function() {
+        let err = std::io::Error::from_raw_os_error(53);
+        assert!(is_network_offline_io(&err));
+        let err_other = std::io::Error::other("other");
+        assert!(!is_network_offline_io(&err_other));
+    }
+
+    #[test]
+    fn test_from_rusqlite_error() {
+        let sqlite_err = rusqlite::Error::QueryReturnedNoRows;
+        let sync_err: SyncError = sqlite_err.into();
+        assert!(matches!(sync_err, SyncError::Db(_, Some(_))));
+    }
+
+    #[test]
+    fn test_from_notify_error() {
+        let notify_err = notify::Error::generic("watch error");
+        let sync_err: SyncError = notify_err.into();
+        assert!(matches!(sync_err, SyncError::Watcher(_, Some(_))));
     }
 }

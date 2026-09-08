@@ -108,8 +108,7 @@ retry_interval_seconds = 10
 
     // 4. Initialize target databases and workers
     for (idx, dest) in dests.iter().enumerate() {
-        let mut target_config = config.clone();
-        target_config.dest_dir = Some(dest.clone());
+        let target_config = config.with_dest_dir(dest.clone());
 
         // Calculate isolated SQLite database filename using Blake3 hash of the target path
         let dest_str = dest.to_string_lossy();
@@ -195,7 +194,8 @@ retry_interval_seconds = 10
     let watcher_event_proxy = event_proxy.clone();
     std::thread::spawn(move || {
         let mut watcher: Option<syncdir::monitor::DirectoryWatcher> = None;
-        let retry_interval = std::time::Duration::from_secs(watcher_config.retry_interval_seconds);
+        let retry_interval =
+            std::time::Duration::from_secs(watcher_config.retry_interval_seconds());
         let mut last_status_check = std::time::Instant::now()
             .checked_sub(retry_interval)
             .unwrap_or_else(std::time::Instant::now);

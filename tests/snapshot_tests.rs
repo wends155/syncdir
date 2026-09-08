@@ -14,13 +14,20 @@ fn test_config_snapshot_basic() {
 
 #[test]
 fn test_config_snapshot_multi_dest() {
-    let mut config =
-        Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\Backup1"));
-    config.dest_dirs = Some(vec![
-        PathBuf::from(r"D:\Backup1"),
-        PathBuf::from(r"E:\Backup2"),
-        PathBuf::from(r"\\172.16.0.60\scada_data"),
-    ]);
+    let config = Config::builder(PathBuf::from(r"C:\source"))
+        .dest_dir(PathBuf::from(r"D:\Backup1"))
+        .dest_dirs(vec![
+            PathBuf::from(r"D:\Backup1"),
+            PathBuf::from(r"E:\Backup2"),
+            PathBuf::from(r"\\172.16.0.60\scada_data"),
+        ])
+        .debounce_seconds(1)
+        .propagate_deletions(true)
+        .block_sync_threshold_bytes(10)
+        .block_size_bytes(4)
+        .verify_writes(true)
+        .retry_interval_seconds(10)
+        .build();
     assert_snapshot!(format!("{:#?}", config));
 }
 
@@ -38,41 +45,74 @@ fn test_config_validation_error_not_a_directory() {
 
 #[test]
 fn test_config_validation_error_no_dests() {
-    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
-    config.dest_dir = None;
-    config.dest_dirs = None;
+    let config = Config::builder(PathBuf::from(r"C:\source"))
+        .debounce_seconds(1)
+        .propagate_deletions(true)
+        .block_sync_threshold_bytes(10)
+        .block_size_bytes(4)
+        .verify_writes(true)
+        .retry_interval_seconds(10)
+        .build();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
 
 #[test]
 fn test_config_validation_error_zero_debounce() {
-    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
-    config.debounce_seconds = 0;
+    let config = Config::builder(PathBuf::from(r"C:\source"))
+        .dest_dir(PathBuf::from(r"D:\dest"))
+        .debounce_seconds(0)
+        .propagate_deletions(true)
+        .block_sync_threshold_bytes(10)
+        .block_size_bytes(4)
+        .verify_writes(true)
+        .retry_interval_seconds(10)
+        .build();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
 
 #[test]
 fn test_config_validation_error_invalid_relative_source() {
-    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
-    config.source_dir = PathBuf::from("relative/source");
+    let config = Config::builder(PathBuf::from("relative/source"))
+        .dest_dir(PathBuf::from(r"D:\dest"))
+        .debounce_seconds(1)
+        .propagate_deletions(true)
+        .block_sync_threshold_bytes(10)
+        .block_size_bytes(4)
+        .verify_writes(true)
+        .retry_interval_seconds(10)
+        .build();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
 
 #[test]
 fn test_config_validation_error_zero_block_size() {
-    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
-    config.block_size_bytes = 0;
+    let config = Config::builder(PathBuf::from(r"C:\source"))
+        .dest_dir(PathBuf::from(r"D:\dest"))
+        .debounce_seconds(1)
+        .propagate_deletions(true)
+        .block_sync_threshold_bytes(10)
+        .block_size_bytes(0)
+        .verify_writes(true)
+        .retry_interval_seconds(10)
+        .build();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
 
 #[test]
 fn test_config_validation_error_zero_threshold() {
-    let mut config = Config::test_default(PathBuf::from(r"C:\source"), PathBuf::from(r"D:\dest"));
-    config.block_sync_threshold_bytes = 0;
+    let config = Config::builder(PathBuf::from(r"C:\source"))
+        .dest_dir(PathBuf::from(r"D:\dest"))
+        .debounce_seconds(1)
+        .propagate_deletions(true)
+        .block_sync_threshold_bytes(0)
+        .block_size_bytes(4)
+        .verify_writes(true)
+        .retry_interval_seconds(10)
+        .build();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }

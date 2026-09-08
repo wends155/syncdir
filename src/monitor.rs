@@ -43,17 +43,7 @@ impl DirectoryWatcher {
     /// # use syncdir::config::Config;
     /// # use syncdir::monitor::DirectoryWatcher;
     /// # use std::path::PathBuf;
-    /// # let config = Config {
-    /// #     source_dir: PathBuf::from("C:/source"),
-    /// #     dest_dir: Some(PathBuf::from("D:/dest")),
-    /// #     debounce_seconds: 3,
-    /// #     propagate_deletions: true,
-    /// #     block_sync_threshold_bytes: 1024,
-    /// #     block_size_bytes: 512,
-    /// #     verify_writes: true,
-    /// #     retry_interval_seconds: 10,
-    /// #     dest_dirs: None,
-    /// # };
+    /// # let config = Config::test_default(PathBuf::from("C:/source"), PathBuf::from("D:/dest"));
     /// let (tx, rx) = channel();
     /// let watcher = DirectoryWatcher::start(&config, tx)?;
     /// # Ok::<(), syncdir::error::SyncError>(())

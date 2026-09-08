@@ -11,21 +11,130 @@ fn default_retry_interval() -> u64 {
     10
 }
 
+/// Isolated target sync configuration for a specific destination directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetSyncConfig {
+    pub source_dir: PathBuf,
+    pub dest_dir: PathBuf,
+    pub block_size_bytes: u64,
+    pub block_sync_threshold_bytes: u64,
+    pub verify_writes: bool,
+    pub debounce_seconds: u64,
+    pub retry_interval_seconds: u64,
+    pub propagate_deletions: bool,
+}
+
 /// Runtime configuration for the sync daemon.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
-    pub source_dir: PathBuf,
+    source_dir: PathBuf,
     #[serde(default)]
-    pub dest_dir: Option<PathBuf>,
-    pub debounce_seconds: u64,
-    pub propagate_deletions: bool,
-    pub block_sync_threshold_bytes: u64,
-    pub block_size_bytes: u64,
-    pub verify_writes: bool,
+    dest_dir: Option<PathBuf>,
+    debounce_seconds: u64,
+    propagate_deletions: bool,
+    block_sync_threshold_bytes: u64,
+    block_size_bytes: u64,
+    verify_writes: bool,
     #[serde(default = "default_retry_interval")]
-    pub retry_interval_seconds: u64,
+    retry_interval_seconds: u64,
     #[serde(default)]
-    pub dest_dirs: Option<Vec<PathBuf>>,
+    dest_dirs: Option<Vec<PathBuf>>,
+}
+
+/// Builder for creating and customizing [`Config`] instances.
+#[derive(Debug, Clone)]
+pub struct ConfigBuilder {
+    source_dir: PathBuf,
+    dest_dir: Option<PathBuf>,
+    debounce_seconds: u64,
+    propagate_deletions: bool,
+    block_sync_threshold_bytes: u64,
+    block_size_bytes: u64,
+    verify_writes: bool,
+    retry_interval_seconds: u64,
+    dest_dirs: Option<Vec<PathBuf>>,
+}
+
+impl ConfigBuilder {
+    /// Create a new builder with the given source directory and default values.
+    pub fn new(source_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            source_dir: source_dir.into(),
+            dest_dir: None,
+            debounce_seconds: 3,
+            propagate_deletions: true,
+            block_sync_threshold_bytes: 10 * 1024 * 1024,
+            block_size_bytes: 1024 * 1024,
+            verify_writes: true,
+            retry_interval_seconds: default_retry_interval(),
+            dest_dirs: None,
+        }
+    }
+
+    /// Set primary destination directory.
+    pub fn dest_dir(mut self, dest: impl Into<PathBuf>) -> Self {
+        self.dest_dir = Some(dest.into());
+        self
+    }
+
+    /// Set multiple destination directories.
+    pub fn dest_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.dest_dirs = Some(dirs);
+        self
+    }
+
+    /// Set debouncing duration in seconds.
+    pub fn debounce_seconds(mut self, val: u64) -> Self {
+        self.debounce_seconds = val;
+        self
+    }
+
+    /// Set whether file deletions should propagate.
+    pub fn propagate_deletions(mut self, val: bool) -> Self {
+        self.propagate_deletions = val;
+        self
+    }
+
+    /// Set block sync threshold in bytes.
+    pub fn block_sync_threshold_bytes(mut self, val: u64) -> Self {
+        self.block_sync_threshold_bytes = val;
+        self
+    }
+
+    /// Set block size in bytes.
+    pub fn block_size_bytes(mut self, val: u64) -> Self {
+        self.block_size_bytes = val;
+        self
+    }
+
+    /// Set write verification flag.
+    pub fn verify_writes(mut self, val: bool) -> Self {
+        self.verify_writes = val;
+        self
+    }
+
+    /// Set retry interval in seconds.
+    pub fn retry_interval_seconds(mut self, val: u64) -> Self {
+        self.retry_interval_seconds = val;
+        self
+    }
+
+    /// Builds and normalizes paths without failing validation, allowing `config.validate()` to be called.
+    pub fn build(self) -> Config {
+        let mut cfg = Config {
+            source_dir: self.source_dir,
+            dest_dir: self.dest_dir,
+            debounce_seconds: self.debounce_seconds,
+            propagate_deletions: self.propagate_deletions,
+            block_sync_threshold_bytes: self.block_sync_threshold_bytes,
+            block_size_bytes: self.block_size_bytes,
+            verify_writes: self.verify_writes,
+            retry_interval_seconds: self.retry_interval_seconds,
+            dest_dirs: self.dest_dirs,
+        };
+        cfg.normalize_paths();
+        cfg
+    }
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
@@ -67,235 +176,10 @@ fn normalize_dest_path(path: &Path) -> PathBuf {
     normalize_path(path)
 }
 
-/// Query Windows Win32 API `WNetGetConnectionW` to resolve a local drive letter (e.g. "R:")
-/// to its underlying remote UNC share path (e.g. "\\172.16.0.193\share").
-/// Returns `None` on non-Windows platforms, unmapped drives, or API errors.
-#[cfg(target_os = "windows")]
-pub fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
-    use std::os::windows::ffi::OsStrExt;
-    let local_name: Vec<u16> = std::ffi::OsStr::new(drive_prefix)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut buf = vec![0u16; 512];
-    let mut len = buf.len() as u32;
-
-    #[link(name = "mpr")]
-    unsafe extern "system" {
-        fn WNetGetConnectionW(
-            lpLocalName: *const u16,
-            lpRemoteName: *mut u16,
-            lpnLength: *mut u32,
-        ) -> u32;
-    }
-
-    // SAFETY: `local_name` is a null-terminated UTF-16 wide string pointing to a valid drive prefix.
-    // `buf` is pre-allocated with 512 `u16` elements and `len` accurately reflects its capacity.
-    // `WNetGetConnectionW` reads from `local_name` up to its null terminator and writes at most `len` elements to `buf`.
-    let ret = unsafe { WNetGetConnectionW(local_name.as_ptr(), buf.as_mut_ptr(), &mut len) };
-    if ret == 0 {
-        let unc_str = String::from_utf16_lossy(&buf[..len as usize])
-            .trim_matches('\0')
-            .to_string();
-        if !unc_str.is_empty() {
-            return Some(unc_str);
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn resolve_mapped_drive_unc(_drive_prefix: &str) -> Option<String> {
-    None
-}
-
-/// Attempt to convert a path starting with a Windows drive letter into a full UNC network path.
-/// If the path starts with a drive letter and `WNetGetConnectionW` succeeds, returns the combined UNC path.
-/// Otherwise, returns the original normalized path unchanged.
-pub fn try_resolve_unc_path(path: &Path) -> PathBuf {
-    let normalized = normalize_path(path);
-    let s = normalized.to_string_lossy();
-
-    // Check if path starts with a drive letter e.g. "R:\" or "R:foo"
-    if s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
-        let drive_letter = &s[..2]; // e.g. "R:"
-        if let Some(unc_base) = resolve_mapped_drive_unc(drive_letter) {
-            let relative = s[2..].trim_start_matches('\\');
-            if relative.is_empty() {
-                return PathBuf::from(unc_base);
-            } else {
-                return PathBuf::from(format!("{}\\{}", unc_base.trim_end_matches('\\'), relative));
-            }
-        }
-    }
-
-    normalized
-}
-
-/// Establish or refresh a Win32 SMB network connection for a UNC path using `WNetAddConnection2W`.
-/// Leverages stored credentials in Windows Credential Manager or session tokens.
-///
-/// # Errors
-/// Returns `SyncError::Validation` if the path is not a valid UNC path or share,
-/// or `SyncError::Io` if `WNetAddConnection2W` fails.
-#[cfg(target_os = "windows")]
-pub fn establish_smb_connection(unc_path: &Path) -> Result<(), SyncError> {
-    use std::os::windows::ffi::OsStrExt;
-    let s = unc_path.to_string_lossy();
-    if !s.starts_with(r"\\") {
-        return Err(SyncError::Validation(format!(
-            "Path '{}' is not a UNC network path",
-            unc_path.display()
-        )));
-    }
-
-    // Extract root share e.g. "\\172.16.0.193\Files" or "\\172.16.0.193\ABB Industrial IT Data"
-    let parts: Vec<&str> = s[2..].split('\\').collect();
-    if parts.len() < 2 {
-        return Err(SyncError::Validation(format!(
-            "UNC path '{}' does not contain a share name",
-            unc_path.display()
-        )));
-    }
-    let unc_share = format!(r"\\{}\{}", parts[0], parts[1]);
-
-    let unc_share_w: Vec<u16> = std::ffi::OsStr::new(&unc_share)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    // Win32 FFI: field names and struct name must match the Windows API naming convention (NETRESOURCEW).
-    #[allow(non_snake_case, clippy::upper_case_acronyms)]
-    #[repr(C)]
-    struct NETRESOURCEW {
-        dwScope: u32,
-        dwType: u32,
-        dwDisplayType: u32,
-        dwUsage: u32,
-        lpLocalName: *const u16,
-        lpRemoteName: *const u16,
-        lpComment: *const u16,
-        lpProvider: *const u16,
-    }
-
-    #[link(name = "mpr")]
-    unsafe extern "system" {
-        fn WNetAddConnection2W(
-            lpNetResource: *const NETRESOURCEW,
-            lpPassword: *const u16,
-            lpUserName: *const u16,
-            dwFlags: u32,
-        ) -> u32;
-    }
-
-    let nr = NETRESOURCEW {
-        dwScope: 0,
-        dwType: 1, // RESOURCETYPE_DISK
-        dwDisplayType: 0,
-        dwUsage: 0,
-        lpLocalName: std::ptr::null(),
-        lpRemoteName: unc_share_w.as_ptr(),
-        lpComment: std::ptr::null(),
-        lpProvider: std::ptr::null(),
-    };
-
-    // SAFETY: `nr.lpRemoteName` points to a null-terminated UTF-16 wide string (`unc_share_w`)
-    // that remains valid for the duration of this call. All other pointer fields in NETRESOURCEW
-    // and the function arguments are null pointers, which is permitted by WNetAddConnection2W
-    // when using default/cached credentials and establishing an unmapped connection.
-    let ret = unsafe { WNetAddConnection2W(&nr, std::ptr::null(), std::ptr::null(), 0) };
-
-    // 0 = NO_ERROR, 85 = ERROR_ALREADY_ASSIGNED, 1219 = ERROR_SESSION_CREDENTIAL_CONFLICT
-    if ret == 0 || ret == 85 || ret == 1219 {
-        Ok(())
-    } else {
-        Err(SyncError::Io(std::io::Error::from_raw_os_error(ret as i32)))
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn establish_smb_connection(_unc_path: &Path) -> Result<(), SyncError> {
-    Err(SyncError::Validation(
-        "SMB connection is only supported on Windows".into(),
-    ))
-}
-
-/// Reverse-lookup active Win32 mapped drive letters ('A'..='Z') to find a drive letter
-/// mapped to a prefix of the given UNC path.
-pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
-    let normalized = normalize_path(unc_path);
-    let unc_str = normalized.to_string_lossy().to_lowercase();
-    if !unc_str.starts_with(r"\\") {
-        return None;
-    }
-
-    for letter in (b'A'..=b'Z').map(|b| b as char) {
-        let drive_prefix = format!("{}:", letter);
-        if let Some(mapped_unc) = resolve_mapped_drive_unc(&drive_prefix) {
-            let mapped_lower = mapped_unc.trim_end_matches('\\').to_lowercase();
-            if !mapped_lower.is_empty() && unc_str.starts_with(&mapped_lower) {
-                let rest = &unc_str[mapped_lower.len()..];
-                if rest.is_empty() || rest.starts_with('\\') {
-                    let relative = rest.trim_start_matches('\\');
-                    if relative.is_empty() {
-                        return Some(PathBuf::from(format!(r"{}\", drive_prefix)));
-                    } else {
-                        return Some(PathBuf::from(format!(r"{}\{}", drive_prefix, relative)));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Attempt bidirectional resolution of a destination path:
-///
-/// 1. If path is a drive letter (e.g. `R:\...`), attempts `try_resolve_unc_path`.
-/// 2. If path is a UNC share (e.g. `\\172.16.0.193\...`), attempts `establish_smb_connection`
-///    and `find_mapped_drive_for_unc`.
-///
-/// Returns the resolved alternate path if accessible, or original normalized path.
-pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
-    let normalized = normalize_path(path);
-
-    // If path is accessible directly, return normalized
-    if matches!(std::fs::metadata(&normalized), Ok(m) if m.is_dir()) {
-        return normalized;
-    }
-
-    let s = normalized.to_string_lossy();
-
-    // Case 1: Drive letter path (e.g. "R:\...")
-    if s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
-        let unc_path = try_resolve_unc_path(&normalized);
-        if unc_path != normalized {
-            // Attempt establishing SMB session on resolved UNC share
-            let _ = establish_smb_connection(&unc_path);
-            if matches!(std::fs::metadata(&unc_path), Ok(m) if m.is_dir()) {
-                return unc_path;
-            }
-        }
-    }
-
-    // Case 2: UNC path (e.g. "\\172.16.0.193\Files")
-    if s.starts_with(r"\\") {
-        // Attempt SMB session establishment on UNC path
-        let _ = establish_smb_connection(&normalized);
-        if matches!(std::fs::metadata(&normalized), Ok(m) if m.is_dir()) {
-            return normalized;
-        }
-
-        // Try mapped drive reverse resolution
-        if let Some(mapped_drive_path) = find_mapped_drive_for_unc(&normalized)
-            && matches!(std::fs::metadata(&mapped_drive_path), Ok(m) if m.is_dir())
-        {
-            return mapped_drive_path;
-        }
-    }
-
-    normalized
-}
+pub use crate::net::{
+    establish_smb_connection, find_mapped_drive_for_unc, resolve_mapped_drive_unc,
+    try_resolve_alternate_path, try_resolve_unc_path,
+};
 
 impl Config {
     /// Mutate and normalize all path fields (`source_dir`, `dest_dir`, `dest_dirs`) in-place.
@@ -522,22 +406,94 @@ fn escape_backslashes_in_quotes(line: &str) -> String {
 }
 
 impl Config {
+    /// Return builder initialized with source directory.
+    pub fn builder(source_dir: impl Into<PathBuf>) -> ConfigBuilder {
+        ConfigBuilder::new(source_dir)
+    }
+
+    /// Return a clone of this Config with the specified destination directory set.
+    pub fn with_dest_dir(&self, dest: PathBuf) -> Self {
+        let mut cloned = self.clone();
+        cloned.dest_dir = Some(dest);
+        cloned
+    }
+
+    /// Source directory getter.
+    pub fn source_dir(&self) -> &Path {
+        &self.source_dir
+    }
+
+    /// Primary destination directory getter.
+    pub fn dest_dir(&self) -> Option<&Path> {
+        self.dest_dir.as_deref()
+    }
+
+    /// Extra destination directories getter.
+    pub fn dest_dirs(&self) -> Option<&[PathBuf]> {
+        self.dest_dirs.as_deref()
+    }
+
+    /// Debounce seconds getter.
+    pub fn debounce_seconds(&self) -> u64 {
+        self.debounce_seconds
+    }
+
+    /// Propagate deletions flag getter.
+    pub fn propagate_deletions(&self) -> bool {
+        self.propagate_deletions
+    }
+
+    /// Block sync threshold in bytes getter.
+    pub fn block_sync_threshold_bytes(&self) -> u64 {
+        self.block_sync_threshold_bytes
+    }
+
+    /// Block size in bytes getter.
+    pub fn block_size_bytes(&self) -> u64 {
+        self.block_size_bytes
+    }
+
+    /// Write verification flag getter.
+    pub fn verify_writes(&self) -> bool {
+        self.verify_writes
+    }
+
+    /// Retry interval in seconds getter.
+    pub fn retry_interval_seconds(&self) -> u64 {
+        self.retry_interval_seconds
+    }
+
+    /// Generate isolated target sync configurations for each configured destination directory.
+    /// Pre-resolves `source_dir` using `self.resolved_source_dir()`.
+    pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
+        let resolved_src = self.resolved_source_dir();
+        self.resolved_dest_dirs()
+            .into_iter()
+            .map(|dest| TargetSyncConfig {
+                source_dir: resolved_src.clone(),
+                dest_dir: dest,
+                block_size_bytes: self.block_size_bytes,
+                block_sync_threshold_bytes: self.block_sync_threshold_bytes,
+                verify_writes: self.verify_writes,
+                debounce_seconds: self.debounce_seconds,
+                retry_interval_seconds: self.retry_interval_seconds,
+                propagate_deletions: self.propagate_deletions,
+            })
+            .collect()
+    }
+
     /// Create a Config with sensible test defaults for the given source and dest.
     #[doc(hidden)]
-    pub fn test_default(source: PathBuf, dest: PathBuf) -> Self {
-        let mut cfg = Self {
-            source_dir: source,
-            dest_dir: Some(dest),
-            debounce_seconds: 1,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 10,
-            block_size_bytes: 4,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        };
-        cfg.normalize_paths();
-        cfg
+    pub fn test_default(source: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> Self {
+        ConfigBuilder::new(source)
+            .dest_dir(dest)
+            .debounce_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(10)
+            .block_size_bytes(4)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build()
     }
 }
 

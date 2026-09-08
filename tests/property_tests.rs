@@ -37,22 +37,21 @@ proptest! {
         verify_writes in prop::bool::ANY,
         propagate_deletions in prop::bool::ANY,
     ) {
-        let mut config = Config::test_default(
-            PathBuf::from(r"C:\Source"),
-            PathBuf::from(r"D:\Dest"),
-        );
-        config.debounce_seconds = debounce;
-        config.retry_interval_seconds = retry_interval;
-        config.verify_writes = verify_writes;
-        config.propagate_deletions = propagate_deletions;
+        let config = Config::builder(PathBuf::from(r"C:\Source"))
+            .dest_dir(PathBuf::from(r"D:\Dest"))
+            .debounce_seconds(debounce)
+            .retry_interval_seconds(retry_interval)
+            .verify_writes(verify_writes)
+            .propagate_deletions(propagate_deletions)
+            .build();
 
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
 
-        prop_assert_eq!(config.debounce_seconds, parsed.debounce_seconds);
-        prop_assert_eq!(config.retry_interval_seconds, parsed.retry_interval_seconds);
-        prop_assert_eq!(config.verify_writes, parsed.verify_writes);
-        prop_assert_eq!(config.propagate_deletions, parsed.propagate_deletions);
+        prop_assert_eq!(config.debounce_seconds(), parsed.debounce_seconds());
+        prop_assert_eq!(config.retry_interval_seconds(), parsed.retry_interval_seconds());
+        prop_assert_eq!(config.verify_writes(), parsed.verify_writes());
+        prop_assert_eq!(config.propagate_deletions(), parsed.propagate_deletions());
     }
 
     // 3. SMB Timestamp Tolerance Invariant (±2000ms)
@@ -84,11 +83,9 @@ proptest! {
     fn prop_source_path_validation_rejection(
         rel_path in "[a-zA-Z0-9_]{1,10}/[a-zA-Z0-9_]{1,10}",
     ) {
-        let mut config = Config::test_default(
-            PathBuf::from(r"C:\Source"),
-            PathBuf::from(r"D:\Dest"),
-        );
-        config.source_dir = PathBuf::from(rel_path);
+        let config = Config::builder(PathBuf::from(rel_path))
+            .dest_dir(PathBuf::from(r"D:\Dest"))
+            .build();
         prop_assert!(config.validate().is_err());
     }
 }
@@ -138,9 +135,11 @@ proptest! {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&dest).unwrap();
 
-        let mut config = Config::test_default(source.clone(), dest.clone());
-        config.block_size_bytes = 1024;
-        config.block_sync_threshold_bytes = 1024;
+        let config = Config::builder(source.clone())
+            .dest_dir(dest.clone())
+            .block_size_bytes(1024)
+            .block_sync_threshold_bytes(1024)
+            .build();
         let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
         let engine = LocalSyncEngine::new(store, config);
 

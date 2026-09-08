@@ -98,8 +98,8 @@ impl SqliteHashStore {
         let cached_threshold = self.get_meta_value("block_sync_threshold_bytes")?;
         let cached_version = self.get_meta_value("db_version")?;
 
-        let current_block_size = config.block_size_bytes.to_string();
-        let current_threshold = config.block_sync_threshold_bytes.to_string();
+        let current_block_size = config.block_size_bytes().to_string();
+        let current_threshold = config.block_sync_threshold_bytes().to_string();
         let current_version = "3";
 
         // Treat any missing key or mismatch as requiring a full purge
@@ -346,10 +346,11 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn dummy_config(block_size: u64) -> Config {
-        let mut c = Config::test_default(PathBuf::from("."), PathBuf::from("."));
-        c.block_sync_threshold_bytes = block_size * 2;
-        c.block_size_bytes = block_size;
-        c
+        Config::builder(PathBuf::from("."))
+            .dest_dir(PathBuf::from("."))
+            .block_sync_threshold_bytes(block_size * 2)
+            .block_size_bytes(block_size)
+            .build()
     }
 
     #[test]
