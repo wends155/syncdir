@@ -344,3 +344,18 @@ verify_writes = true
         "Config with no destinations should fail validation"
     );
 }
+
+#[test]
+fn test_sync_daemon_shutdown_order() {
+    use syncdir::daemon::SyncDaemon;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("source");
+    let dst = dir.path().join("dest");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+
+    let config = Config::builder(src).dest_dir(dst).build();
+    let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
+    daemon.shutdown();
+}

@@ -17,8 +17,14 @@ pub struct StartupRegistry;
 impl StartupRegistry {
     /// Registry value format shared by register and is_registered.
     fn registry_value() -> Result<String, SyncError> {
+        static CACHED_VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if let Some(val) = CACHED_VALUE.get() {
+            return Ok(val.clone());
+        }
         let exe_path = std::env::current_exe().map_err(SyncError::Io)?;
-        Ok(format!("\"{}\" --autostart", exe_path.to_string_lossy()))
+        let val = format!("\"{}\" --autostart", exe_path.to_string_lossy());
+        CACHED_VALUE.set(val.clone()).ok();
+        Ok(val)
     }
 
     /// Checks whether the syncdir value exists in HKCU run key.
@@ -42,7 +48,7 @@ impl StartupRegistry {
             }
         };
         match key.get_value::<String, _>("syncdir") {
-            Ok(val) => Ok(val == Self::registry_value()?),
+            Ok(val) => Ok(val.eq_ignore_ascii_case(&Self::registry_value()?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(SyncError::registry_with_source(
                 "Failed to read syncdir registry value",

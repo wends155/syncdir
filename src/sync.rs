@@ -1596,4 +1596,32 @@ mod tests {
         // Destination file must NOT be deleted while source is offline
         assert!(dest.join("keep_me.txt").exists());
     }
+
+    #[test]
+    fn test_worker_network_offline_bailout() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst_offline");
+        fs::create_dir_all(&source).unwrap();
+        // dest is deliberately NOT created so it is offline
+
+        let config = Config::builder(source.clone())
+            .dest_dir(dest.clone())
+            .debounce_seconds(0)
+            .retry_interval_seconds(1)
+            .build();
+        let store = MockHashStore::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let _handle = start_sync_worker(0, config, store, rx, None, source_online);
+
+        fs::write(source.join("file1.txt"), b"hello").unwrap();
+        tx.send(SyncCommand::FileModified(PathBuf::from("file1.txt")))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Dest should not exist and worker must not crash
+        assert!(!dest.exists());
+    }
 }

@@ -25,7 +25,22 @@ pub struct TargetSyncConfig {
 }
 
 impl TargetSyncConfig {
+    /// Create a new `TargetSyncConfig` from a `Config` and a specific destination directory.
+    pub fn from_config(config: &Config, dest_dir: PathBuf) -> Self {
+        Self {
+            source_dir: config.source_dir().to_path_buf(),
+            dest_dir,
+            block_size_bytes: config.block_size_bytes(),
+            block_sync_threshold_bytes: config.block_sync_threshold_bytes(),
+            verify_writes: config.verify_writes(),
+            debounce_seconds: config.debounce_seconds(),
+            retry_interval_seconds: config.retry_interval_seconds(),
+            propagate_deletions: config.propagate_deletions(),
+        }
+    }
+
     /// Create a new `TargetSyncConfig`.
+    #[deprecated(note = "Use TargetSyncConfig::from_config(config, dest) instead")]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_dir: PathBuf,
@@ -97,16 +112,7 @@ impl From<&Config> for TargetSyncConfig {
             .map(Path::to_path_buf)
             .or_else(|| cfg.dest_dirs().and_then(|dirs| dirs.first().cloned()))
             .unwrap_or_default();
-        Self {
-            source_dir: cfg.source_dir().to_path_buf(),
-            dest_dir: dest,
-            block_size_bytes: cfg.block_size_bytes(),
-            block_sync_threshold_bytes: cfg.block_sync_threshold_bytes(),
-            verify_writes: cfg.verify_writes(),
-            debounce_seconds: cfg.debounce_seconds(),
-            retry_interval_seconds: cfg.retry_interval_seconds(),
-            propagate_deletions: cfg.propagate_deletions(),
-        }
+        Self::from_config(cfg, dest)
     }
 }
 
@@ -327,19 +333,18 @@ impl Config {
     /// Automatically normalizes single-backslash UNC network paths (`\172...` -> `\\172...`)
     /// and performs case-insensitive path deduplication on Windows.
     pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
         let mut dirs = Vec::new();
         if let Some(ref primary) = self.dest_dir {
             let normalized = normalize_dest_path(primary);
+            seen.insert(normalized.to_string_lossy().to_lowercase());
             dirs.push(normalized);
         }
         if let Some(ref list) = self.dest_dirs {
             for d in list {
                 let normalized = normalize_dest_path(d);
                 let norm_lower = normalized.to_string_lossy().to_lowercase();
-                if !dirs
-                    .iter()
-                    .any(|existing| existing.to_string_lossy().to_lowercase() == norm_lower)
-                {
+                if seen.insert(norm_lower) {
                     dirs.push(normalized);
                 }
             }
@@ -367,11 +372,24 @@ impl Config {
     /// # Errors
     /// Returns `SyncError::Validation` if parameters are invalid.
     pub fn validate(&self) -> Result<(), SyncError> {
+        let is_valid_drive_path = |path_str: &str| -> bool {
+            if path_str.len() < 3 {
+                return false;
+            }
+            let bytes = path_str.as_bytes();
+            bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes[2] == b'\\' || bytes[2] == b'/')
+        };
+        let is_valid_unc_path = |path_str: &str| -> bool {
+            path_str.starts_with(r"\\")
+                && !path_str.starts_with(r"\\.\")
+                && !path_str.starts_with(r"\\?\")
+        };
+
         let src_str = self.source_dir.to_string_lossy();
-        let src_unc = src_str.starts_with("\\\\");
-        let src_drive = src_str.len() >= 2
-            && src_str.as_bytes()[1] == b':'
-            && src_str.as_bytes()[0].is_ascii_alphabetic();
+        let src_unc = is_valid_unc_path(&src_str);
+        let src_drive = is_valid_drive_path(&src_str);
         let src_unix = src_str.starts_with('/');
 
         if !src_unc && !src_drive && !src_unix {
@@ -402,9 +420,8 @@ impl Config {
 
         for dest in &dests {
             let s = dest.to_string_lossy();
-            let is_unc = s.starts_with("\\\\");
-            let is_drive =
-                s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic();
+            let is_unc = is_valid_unc_path(&s);
+            let is_drive = is_valid_drive_path(&s);
             let is_unix_abs = s.starts_with('/');
 
             if is_drive {
@@ -594,19 +611,9 @@ impl Config {
 
     /// Generate isolated target sync configurations for each configured destination directory.
     pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
-        let resolved_src = self.source_dir.clone();
         self.resolved_dest_dirs()
             .into_iter()
-            .map(|dest| TargetSyncConfig {
-                source_dir: resolved_src.clone(),
-                dest_dir: dest,
-                block_size_bytes: self.block_size_bytes,
-                block_sync_threshold_bytes: self.block_sync_threshold_bytes,
-                verify_writes: self.verify_writes,
-                debounce_seconds: self.debounce_seconds,
-                retry_interval_seconds: self.retry_interval_seconds,
-                propagate_deletions: self.propagate_deletions,
-            })
+            .map(|dest| TargetSyncConfig::from_config(self, dest))
             .collect()
     }
 
@@ -1236,6 +1243,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_target_sync_config_new() {
         let target = TargetSyncConfig::new(
             PathBuf::from(r"C:\src"),
@@ -1249,6 +1257,28 @@ mod tests {
         );
         assert_eq!(target.source_dir(), Path::new(r"C:\src"));
         assert_eq!(target.dest_dir(), Path::new(r"C:\dst"));
+        assert_eq!(target.block_size_bytes(), 1024);
+        assert_eq!(target.block_sync_threshold_bytes(), 2048);
+        assert!(target.verify_writes());
+        assert_eq!(target.debounce_seconds(), 5);
+        assert_eq!(target.retry_interval_seconds(), 15);
+        assert!(!target.propagate_deletions());
+    }
+
+    #[test]
+    fn test_target_sync_config_from_config() {
+        let config = Config::builder(r"C:\src")
+            .dest_dir(r"C:\dst")
+            .block_size_bytes(1024)
+            .block_sync_threshold_bytes(2048)
+            .verify_writes(true)
+            .debounce_seconds(5)
+            .retry_interval_seconds(15)
+            .propagate_deletions(false)
+            .build();
+        let target = TargetSyncConfig::from_config(&config, PathBuf::from(r"C:\dst2"));
+        assert_eq!(target.source_dir(), Path::new(r"C:\src"));
+        assert_eq!(target.dest_dir(), Path::new(r"C:\dst2"));
         assert_eq!(target.block_size_bytes(), 1024);
         assert_eq!(target.block_sync_threshold_bytes(), 2048);
         assert!(target.verify_writes());
