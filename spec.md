@@ -24,6 +24,7 @@
 | `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
 | `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid parameters, relative paths, or missing destination directories) |
 | `Config::resolved_source_dir` | `(&self) -> &Path` | `&Path` | — (pure non-blocking getter) |
+| `Config::destinations` | `(&self) -> &DestinationCollection` | `&DestinationCollection` | — |
 | `Config::resolved_dest_dirs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `Config::target_configs` | `(&self) -> Vec<TargetSyncConfig>` | `Vec<TargetSyncConfig>` | — |
 | `Config::builder` | `(source_dir: impl Into<PathBuf>) -> ConfigBuilder` | `ConfigBuilder` | — |
@@ -33,6 +34,17 @@
 | `ConfigBuilder::add_dest_dir` | `(mut self, dir: impl Into<PathBuf>) -> Self` | `ConfigBuilder` | — |
 | `ConfigBuilder::build` | `(self) -> Config` | `Config` | — |
 | `ConfigBuilder::try_build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` |
+| `TargetDir::from_raw` | `(path: impl Into<PathBuf>) -> Self` | `TargetDir` | — |
+| `TargetDir::validate` | `(&self, role: &str) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid drive or UNC syntax) |
+| `TargetDir::as_path` | `(&self) -> &Path` | `&Path` | — |
+| `TargetDir::to_path_buf` | `(&self) -> PathBuf` | `PathBuf` | — |
+| `DestinationCollection::new` | `(destinations: impl IntoIterator<Item = TargetDir>) -> Self` | `DestinationCollection` | — (case-insensitive dedup) |
+| `DestinationCollection::from_raw` | `(primary: Option<PathBuf>, additional: Option<Vec<PathBuf>>) -> Self` | `DestinationCollection` | — |
+| `DestinationCollection::iter` | `(&self) -> impl Iterator<Item = &TargetDir>` | `Iterator` | — |
+| `DestinationCollection::len` | `(&self) -> usize` | `usize` | — |
+| `DestinationCollection::is_empty` | `(&self) -> bool` | `bool` | — |
+| `DestinationCollection::get` | `(&self, idx: usize) -> Option<&TargetDir>` | `Option<&TargetDir>` | — |
+| `DestinationCollection::to_path_bufs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `system_root` | `() -> PathBuf` | `PathBuf` | — |
 | `TargetSyncConfig::new` | `(...) -> Self` | `TargetSyncConfig` | — |
  

@@ -107,11 +107,7 @@ impl TargetSyncConfig {
 
 impl From<&Config> for TargetSyncConfig {
     fn from(cfg: &Config) -> Self {
-        let dest = cfg
-            .dest_dir()
-            .map(Path::to_path_buf)
-            .or_else(|| cfg.dest_dirs().and_then(|dirs| dirs.first().cloned()))
-            .unwrap_or_default();
+        let dest = cfg.dest_dir().map(Path::to_path_buf).unwrap_or_default();
         Self::from_config(cfg, dest)
     }
 }
@@ -122,12 +118,233 @@ impl From<Config> for TargetSyncConfig {
     }
 }
 
+/// Strongly-typed, normalized synchronization root directory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "PathBuf", into = "PathBuf")]
+pub struct TargetDir(PathBuf);
+
+impl TargetDir {
+    /// Construct TargetDir by normalizing path via normalize_path(). Infallible.
+    #[must_use]
+    pub fn from_raw(path: impl Into<PathBuf>) -> Self {
+        Self(normalize_path(&path.into()))
+    }
+
+    /// Validates path syntax for a given role ("source" or "destination").
+    /// Accepts Windows drive letters (C:\), UNC prefixes (\\), and Unix absolute paths (/).
+    pub fn validate(&self, role: &str) -> Result<(), SyncError> {
+        let is_valid_drive_path = |path_str: &str| -> bool {
+            if path_str.len() < 3 {
+                return false;
+            }
+            let bytes = path_str.as_bytes();
+            bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes[2] == b'\\' || bytes[2] == b'/')
+        };
+        let is_valid_unc_path = |path_str: &str| -> bool {
+            path_str.starts_with(r"\\")
+                && !path_str.starts_with(r"\\.\")
+                && !path_str.starts_with(r"\\?\")
+        };
+
+        let s = self.0.to_string_lossy();
+        let is_unc = is_valid_unc_path(&s);
+        let is_drive = is_valid_drive_path(&s);
+        let is_unix_abs = s.starts_with('/');
+
+        if is_drive {
+            tracing::debug!(target_path = %s, "Validated Windows drive path target");
+        }
+
+        if !is_unc && !is_drive && !is_unix_abs {
+            let example_drive = if role == "source" {
+                "C:\\, R:\\"
+            } else {
+                "C:\\, X:\\"
+            };
+            return Err(SyncError::Validation(format!(
+                "Invalid {role} path '{s}': must start with a drive letter (e.g. {example_drive}) or UNC network prefix (e.g. \\\\server\\share)"
+            )));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn to_path_buf(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl std::ops::Deref for TargetDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TargetDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TargetDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
+impl From<PathBuf> for TargetDir {
+    fn from(p: PathBuf) -> Self {
+        Self::from_raw(p)
+    }
+}
+
+impl From<&Path> for TargetDir {
+    fn from(p: &Path) -> Self {
+        Self::from_raw(p)
+    }
+}
+
+impl From<&str> for TargetDir {
+    fn from(s: &str) -> Self {
+        Self::from_raw(s)
+    }
+}
+
+impl From<TargetDir> for PathBuf {
+    fn from(td: TargetDir) -> Self {
+        td.0
+    }
+}
+
+/// Deduplicated, ordered collection of target destination directories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationCollection {
+    destinations: Vec<TargetDir>,
+}
+
+impl DestinationCollection {
+    /// Create a collection from an iterator of TargetDir, deduplicating case-insensitively while preserving order.
+    #[must_use]
+    pub fn new(destinations: impl IntoIterator<Item = TargetDir>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for dest in destinations {
+            let key = dest.as_path().to_string_lossy().to_lowercase();
+            if seen.insert(key) {
+                result.push(dest);
+            }
+        }
+        Self {
+            destinations: result,
+        }
+    }
+
+    /// Construct from legacy optional primary and additional destination paths.
+    #[must_use]
+    pub fn from_raw(primary: Option<PathBuf>, additional: Option<Vec<PathBuf>>) -> Self {
+        let mut items = Vec::new();
+        if let Some(p) = primary {
+            items.push(TargetDir::from_raw(p));
+        }
+        if let Some(adds) = additional {
+            for a in adds {
+                items.push(TargetDir::from_raw(a));
+            }
+        }
+        Self::new(items)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TargetDir> {
+        self.destinations.iter()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.destinations.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.destinations.is_empty()
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[TargetDir] {
+        &self.destinations
+    }
+
+    #[must_use]
+    pub fn to_path_bufs(&self) -> Vec<PathBuf> {
+        self.destinations
+            .iter()
+            .map(TargetDir::to_path_buf)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn get(&self, idx: usize) -> Option<&TargetDir> {
+        self.destinations.get(idx)
+    }
+}
+
+impl std::ops::Index<usize> for DestinationCollection {
+    type Output = TargetDir;
+    fn index(&self, idx: usize) -> &Self::Output {
+        &self.destinations[idx]
+    }
+}
+
+impl FromIterator<TargetDir> for DestinationCollection {
+    fn from_iter<T: IntoIterator<Item = TargetDir>>(iter: T) -> Self {
+        Self::new(iter)
+    }
+}
+
+impl IntoIterator for DestinationCollection {
+    type Item = TargetDir;
+    type IntoIter = std::vec::IntoIter<TargetDir>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.destinations.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a DestinationCollection {
+    type Item = &'a TargetDir;
+    type IntoIter = std::slice::Iter<'a, TargetDir>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.destinations.iter()
+    }
+}
+
 /// Runtime configuration for the sync daemon.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawConfig", into = "RawConfig")]
 pub struct Config {
+    source_dir: TargetDir,
+    destinations: DestinationCollection,
+    debounce_seconds: u64,
+    propagate_deletions: bool,
+    block_sync_threshold_bytes: u64,
+    block_size_bytes: u64,
+    verify_writes: bool,
+    retry_interval_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawConfig {
     source_dir: PathBuf,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     dest_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dest_dirs: Option<Vec<PathBuf>>,
     debounce_seconds: u64,
     propagate_deletions: bool,
     block_sync_threshold_bytes: u64,
@@ -135,8 +352,49 @@ pub struct Config {
     verify_writes: bool,
     #[serde(default = "default_retry_interval")]
     retry_interval_seconds: u64,
-    #[serde(default)]
-    dest_dirs: Option<Vec<PathBuf>>,
+}
+
+impl From<RawConfig> for Config {
+    fn from(raw: RawConfig) -> Self {
+        Self {
+            source_dir: TargetDir::from_raw(raw.source_dir),
+            destinations: DestinationCollection::from_raw(raw.dest_dir, raw.dest_dirs),
+            debounce_seconds: raw.debounce_seconds,
+            propagate_deletions: raw.propagate_deletions,
+            block_sync_threshold_bytes: raw.block_sync_threshold_bytes,
+            block_size_bytes: raw.block_size_bytes,
+            verify_writes: raw.verify_writes,
+            retry_interval_seconds: raw.retry_interval_seconds,
+        }
+    }
+}
+
+impl From<Config> for RawConfig {
+    fn from(cfg: Config) -> Self {
+        let dest_dir = cfg.destinations.iter().next().map(TargetDir::to_path_buf);
+        let dest_dirs = if cfg.destinations.len() > 1 {
+            Some(
+                cfg.destinations
+                    .iter()
+                    .skip(1)
+                    .map(TargetDir::to_path_buf)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Self {
+            source_dir: cfg.source_dir.to_path_buf(),
+            dest_dir,
+            dest_dirs,
+            debounce_seconds: cfg.debounce_seconds,
+            propagate_deletions: cfg.propagate_deletions,
+            block_sync_threshold_bytes: cfg.block_sync_threshold_bytes,
+            block_size_bytes: cfg.block_size_bytes,
+            verify_writes: cfg.verify_writes,
+            retry_interval_seconds: cfg.retry_interval_seconds,
+        }
+    }
 }
 
 /// Builder for creating and customizing [`Config`] instances.
@@ -229,19 +487,16 @@ impl ConfigBuilder {
 
     /// Builds and normalizes paths without failing validation, allowing `config.validate()` to be called.
     pub fn build(self) -> Config {
-        let mut cfg = Config {
-            source_dir: self.source_dir,
-            dest_dir: self.dest_dir,
+        Config {
+            source_dir: TargetDir::from_raw(self.source_dir),
+            destinations: DestinationCollection::from_raw(self.dest_dir, self.dest_dirs),
             debounce_seconds: self.debounce_seconds,
             propagate_deletions: self.propagate_deletions,
             block_sync_threshold_bytes: self.block_sync_threshold_bytes,
             block_size_bytes: self.block_size_bytes,
             verify_writes: self.verify_writes,
             retry_interval_seconds: self.retry_interval_seconds,
-            dest_dirs: self.dest_dirs,
-        };
-        cfg.normalize_paths();
-        cfg
+        }
     }
 
     /// Builds and validates the configuration, returning an error if validation fails.
@@ -287,69 +542,128 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn normalize_dest_path(path: &Path) -> PathBuf {
-    normalize_path(path)
-}
-
 pub use crate::net::{
     establish_smb_connection, find_mapped_drive_for_unc, resolve_mapped_drive_unc,
     try_resolve_alternate_path, try_resolve_unc_path,
 };
 
 impl Config {
-    /// Mutate and normalize all path fields (`source_dir`, `dest_dir`, `dest_dirs`) in-place.
-    pub fn normalize_paths(&mut self) {
-        self.source_dir = normalize_path(&self.source_dir);
-        if let Some(ref mut d) = self.dest_dir {
-            *d = normalize_path(d);
-        }
-        if let Some(ref mut dirs) = self.dest_dirs {
-            for d in dirs.iter_mut() {
-                *d = normalize_path(d);
-            }
-        }
+    /// Mutate and normalize all path fields in-place.
+    #[deprecated(note = "Paths are normalized automatically upon construction")]
+    pub fn normalize_paths(&mut self) {}
+
+    /// Return builder initialized with source directory.
+    pub fn builder(source_dir: impl Into<PathBuf>) -> ConfigBuilder {
+        ConfigBuilder::new(source_dir)
+    }
+
+    /// Return a clone of this Config with the specified destination directory set.
+    pub fn with_dest_dir(&self, dest: PathBuf) -> Self {
+        let mut cloned = self.clone();
+        cloned.destinations = DestinationCollection::from_raw(Some(dest), None);
+        cloned
+    }
+
+    /// Source directory getter.
+    pub fn source_dir(&self) -> &Path {
+        self.source_dir.as_path()
+    }
+
+    /// Return strongly-typed source TargetDir.
+    pub fn source_target_dir(&self) -> &TargetDir {
+        &self.source_dir
     }
 
     /// Return the normalized source directory path.
     pub fn resolved_source_dir(&self) -> &Path {
-        &self.source_dir
+        self.source_dir.as_path()
+    }
+
+    /// Return strongly-typed destination collection.
+    pub fn destinations(&self) -> &DestinationCollection {
+        &self.destinations
+    }
+
+    /// Return a merged, deduplicated list of all configured destination directories.
+    pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
+        self.destinations.to_path_bufs()
+    }
+
+    /// Primary destination directory getter.
+    pub fn dest_dir(&self) -> Option<&Path> {
+        self.destinations.iter().next().map(TargetDir::as_path)
+    }
+
+    /// Extra destination directories getter.
+    pub fn dest_dirs(&self) -> Option<Vec<PathBuf>> {
+        if self.destinations.is_empty() {
+            None
+        } else {
+            Some(self.destinations.to_path_bufs())
+        }
+    }
+
+    /// Debounce seconds getter.
+    pub fn debounce_seconds(&self) -> u64 {
+        self.debounce_seconds
+    }
+
+    /// Propagate deletions flag getter.
+    pub fn propagate_deletions(&self) -> bool {
+        self.propagate_deletions
+    }
+
+    /// Block sync threshold in bytes getter.
+    pub fn block_sync_threshold_bytes(&self) -> u64 {
+        self.block_sync_threshold_bytes
+    }
+
+    /// Block size in bytes getter.
+    pub fn block_size_bytes(&self) -> u64 {
+        self.block_size_bytes
+    }
+
+    /// Write verification flag getter.
+    pub fn verify_writes(&self) -> bool {
+        self.verify_writes
+    }
+
+    /// Retry interval in seconds getter.
+    pub fn retry_interval_seconds(&self) -> u64 {
+        self.retry_interval_seconds
     }
 
     /// Resolve network paths (UNC shares / mapped drives) in-place for source and destinations.
     pub fn resolve_network_paths(&mut self) {
-        self.source_dir = try_resolve_alternate_path(&self.source_dir);
-        if let Some(ref mut d) = self.dest_dir {
-            *d = try_resolve_alternate_path(d);
-        }
-        if let Some(ref mut dirs) = self.dest_dirs {
-            for d in dirs.iter_mut() {
-                *d = try_resolve_alternate_path(d);
-            }
-        }
+        self.source_dir =
+            TargetDir::from_raw(try_resolve_alternate_path(self.source_dir.as_path()));
+        self.destinations = DestinationCollection::new(
+            self.destinations
+                .iter()
+                .map(|d| TargetDir::from_raw(try_resolve_alternate_path(d.as_path()))),
+        );
     }
 
-    /// Return a merged, deduplicated list of all configured destination directories.
-    /// Includes `dest_dir` first (if set), then appends any unique entries from `dest_dirs`.
-    /// Automatically normalizes single-backslash UNC network paths (`\172...` -> `\\172...`)
-    /// and performs case-insensitive path deduplication on Windows.
-    pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
-        let mut seen = std::collections::HashSet::new();
-        let mut dirs = Vec::new();
-        if let Some(ref primary) = self.dest_dir {
-            let normalized = normalize_dest_path(primary);
-            seen.insert(normalized.to_string_lossy().to_lowercase());
-            dirs.push(normalized);
-        }
-        if let Some(ref list) = self.dest_dirs {
-            for d in list {
-                let normalized = normalize_dest_path(d);
-                let norm_lower = normalized.to_string_lossy().to_lowercase();
-                if seen.insert(norm_lower) {
-                    dirs.push(normalized);
-                }
-            }
-        }
-        dirs
+    /// Generate isolated target sync configurations for each configured destination directory.
+    pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
+        self.resolved_dest_dirs()
+            .into_iter()
+            .map(|dest| TargetSyncConfig::from_config(self, dest))
+            .collect()
+    }
+
+    /// Create a Config with sensible test defaults for the given source and dest.
+    #[doc(hidden)]
+    pub fn test_default(source: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> Self {
+        ConfigBuilder::new(source)
+            .dest_dir(dest)
+            .debounce_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(10)
+            .block_size_bytes(4)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build()
     }
 
     /// Load configuration from a TOML file at the given path.
@@ -361,8 +675,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, SyncError> {
         let content = std::fs::read_to_string(path)?;
         let processed = preprocess_config_toml(&content);
-        let mut config: Config = toml::from_str(&processed)?;
-        config.normalize_paths();
+        let config: Config = toml::from_str(&processed)?;
         Ok(config)
     }
 
@@ -372,32 +685,7 @@ impl Config {
     /// # Errors
     /// Returns `SyncError::Validation` if parameters are invalid.
     pub fn validate(&self) -> Result<(), SyncError> {
-        let is_valid_drive_path = |path_str: &str| -> bool {
-            if path_str.len() < 3 {
-                return false;
-            }
-            let bytes = path_str.as_bytes();
-            bytes[0].is_ascii_alphabetic()
-                && bytes[1] == b':'
-                && (bytes[2] == b'\\' || bytes[2] == b'/')
-        };
-        let is_valid_unc_path = |path_str: &str| -> bool {
-            path_str.starts_with(r"\\")
-                && !path_str.starts_with(r"\\.\")
-                && !path_str.starts_with(r"\\?\")
-        };
-
-        let src_str = self.source_dir.to_string_lossy();
-        let src_unc = is_valid_unc_path(&src_str);
-        let src_drive = is_valid_drive_path(&src_str);
-        let src_unix = src_str.starts_with('/');
-
-        if !src_unc && !src_drive && !src_unix {
-            return Err(SyncError::Validation(format!(
-                "Invalid source path '{}': must start with a drive letter (e.g. C:\\, R:\\) or UNC network prefix (e.g. \\\\server\\share)",
-                src_str
-            )));
-        }
+        self.source_dir.validate("source")?;
 
         if !self.source_dir.exists() {
             tracing::warn!(
@@ -410,33 +698,15 @@ impl Config {
             ));
         }
 
-        let dests = self.resolved_dest_dirs();
-        if dests.is_empty() {
+        if self.destinations.is_empty() {
             return Err(SyncError::Validation(
                 "At least one destination directory must be specified (via dest_dir or dest_dirs)"
                     .into(),
             ));
         }
 
-        for dest in &dests {
-            let s = dest.to_string_lossy();
-            let is_unc = is_valid_unc_path(&s);
-            let is_drive = is_valid_drive_path(&s);
-            let is_unix_abs = s.starts_with('/');
-
-            if is_drive {
-                tracing::debug!(
-                    target_path = %s,
-                    "Validated Windows drive path target (local or mapped drive)"
-                );
-            }
-
-            if !is_unc && !is_drive && !is_unix_abs {
-                return Err(SyncError::Validation(format!(
-                    "Invalid destination path '{}': must start with a drive letter (e.g. C:\\, X:\\) or UNC network prefix (e.g. \\\\server\\share)",
-                    s
-                )));
-            }
+        for dest in self.destinations.iter() {
+            dest.validate("destination")?;
         }
 
         if self.debounce_seconds == 0 {
@@ -551,87 +821,6 @@ fn escape_backslashes_in_quotes(line: &str) -> String {
     result
 }
 
-impl Config {
-    /// Return builder initialized with source directory.
-    pub fn builder(source_dir: impl Into<PathBuf>) -> ConfigBuilder {
-        ConfigBuilder::new(source_dir)
-    }
-
-    /// Return a clone of this Config with the specified destination directory set.
-    pub fn with_dest_dir(&self, dest: PathBuf) -> Self {
-        let mut cloned = self.clone();
-        cloned.dest_dir = Some(normalize_path(&dest));
-        cloned
-    }
-
-    /// Source directory getter.
-    pub fn source_dir(&self) -> &Path {
-        &self.source_dir
-    }
-
-    /// Primary destination directory getter.
-    pub fn dest_dir(&self) -> Option<&Path> {
-        self.dest_dir.as_deref()
-    }
-
-    /// Extra destination directories getter.
-    pub fn dest_dirs(&self) -> Option<&[PathBuf]> {
-        self.dest_dirs.as_deref()
-    }
-
-    /// Debounce seconds getter.
-    pub fn debounce_seconds(&self) -> u64 {
-        self.debounce_seconds
-    }
-
-    /// Propagate deletions flag getter.
-    pub fn propagate_deletions(&self) -> bool {
-        self.propagate_deletions
-    }
-
-    /// Block sync threshold in bytes getter.
-    pub fn block_sync_threshold_bytes(&self) -> u64 {
-        self.block_sync_threshold_bytes
-    }
-
-    /// Block size in bytes getter.
-    pub fn block_size_bytes(&self) -> u64 {
-        self.block_size_bytes
-    }
-
-    /// Write verification flag getter.
-    pub fn verify_writes(&self) -> bool {
-        self.verify_writes
-    }
-
-    /// Retry interval in seconds getter.
-    pub fn retry_interval_seconds(&self) -> u64 {
-        self.retry_interval_seconds
-    }
-
-    /// Generate isolated target sync configurations for each configured destination directory.
-    pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
-        self.resolved_dest_dirs()
-            .into_iter()
-            .map(|dest| TargetSyncConfig::from_config(self, dest))
-            .collect()
-    }
-
-    /// Create a Config with sensible test defaults for the given source and dest.
-    #[doc(hidden)]
-    pub fn test_default(source: impl Into<PathBuf>, dest: impl Into<PathBuf>) -> Self {
-        ConfigBuilder::new(source)
-            .dest_dir(dest)
-            .debounce_seconds(1)
-            .propagate_deletions(true)
-            .block_sync_threshold_bytes(10)
-            .block_size_bytes(4)
-            .verify_writes(true)
-            .retry_interval_seconds(10)
-            .build()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,17 +836,15 @@ mod tests {
         let dest = temp.path().join("dest");
         std::fs::create_dir(&dest).unwrap();
 
-        let config = Config {
-            source_dir: source,
-            dest_dir: Some(dest),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        };
+        let config = Config::builder(source)
+            .dest_dir(dest)
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
         assert!(config.validate().is_ok());
     }
 
@@ -667,17 +854,15 @@ mod tests {
         let dest = temp.path().join("dest");
         std::fs::create_dir(&dest).unwrap();
 
-        let config = Config {
-            source_dir: temp.path().join("nonexistent"),
-            dest_dir: Some(dest),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        };
+        let config = Config::builder(temp.path().join("nonexistent"))
+            .dest_dir(dest)
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
         // Soft validation: missing source directory logs a warning but validation passes
         assert!(config.validate().is_ok());
     }
@@ -688,17 +873,15 @@ mod tests {
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
 
-        let config = Config {
-            source_dir: source,
-            dest_dir: Some(temp.path().join("dest")),
-            debounce_seconds: 0,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        };
+        let config = Config::builder(source)
+            .dest_dir(temp.path().join("dest"))
+            .debounce_seconds(0)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
         assert!(config.validate().is_err());
     }
 
@@ -708,17 +891,15 @@ mod tests {
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
 
-        let config = Config {
-            source_dir: source,
-            dest_dir: Some(temp.path().join("dest")),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 0,
-            dest_dirs: None,
-        };
+        let config = Config::builder(source)
+            .dest_dir(temp.path().join("dest"))
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(0)
+            .build();
         assert!(config.validate().is_err());
     }
 
@@ -751,11 +932,11 @@ mod tests {
         let processed = preprocess_config_toml(toml_str);
         let config: Config = toml::from_str(&processed).unwrap();
         assert_eq!(
-            config.source_dir.to_string_lossy(),
+            config.source_dir().to_string_lossy(),
             r#"Y:\Mill Processing\COMMON\MAINTENANCE"#
         );
         assert_eq!(
-            config.dest_dir.unwrap().to_string_lossy(),
+            config.dest_dir().unwrap().to_string_lossy(),
             r#"Z:\Backup\Folder"#
         );
     }
@@ -790,17 +971,16 @@ mod tests {
 
     #[test]
     fn test_config_resolved_dest_dirs() {
-        let config = Config {
-            source_dir: PathBuf::from("C:\\src"),
-            dest_dir: Some(PathBuf::from("D:\\dst1")),
-            dest_dirs: Some(vec![PathBuf::from("D:\\dst1"), PathBuf::from("E:\\dst2")]),
-            debounce_seconds: 1,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 10,
-            block_size_bytes: 4,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-        };
+        let config = Config::builder("C:\\src")
+            .dest_dir(PathBuf::from("D:\\dst1"))
+            .dest_dirs(vec![PathBuf::from("D:\\dst1"), PathBuf::from("E:\\dst2")])
+            .debounce_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(10)
+            .block_size_bytes(4)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0], PathBuf::from("D:\\dst1"));
@@ -821,11 +1001,11 @@ mod tests {
         "#;
         let processed = preprocess_config_toml(input);
         let config: Config = toml::from_str(&processed).unwrap();
-        assert_eq!(config.source_dir.to_string_lossy(), r"C:\source");
-        assert_eq!(config.dest_dir.unwrap().to_string_lossy(), r"D:\Backup");
-        let extras = config.dest_dirs.unwrap();
-        assert_eq!(extras[0].to_string_lossy(), r"Y:\Mill Processing\COMMON");
-        assert_eq!(extras[1].to_string_lossy(), r"Z:\Archive\Folder");
+        assert_eq!(config.source_dir().to_string_lossy(), r"C:\source");
+        assert_eq!(config.dest_dir().unwrap().to_string_lossy(), r"D:\Backup");
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved[1].to_string_lossy(), r"Y:\Mill Processing\COMMON");
+        assert_eq!(resolved[2].to_string_lossy(), r"Z:\Archive\Folder");
     }
 
     #[test]
@@ -841,7 +1021,7 @@ mod tests {
         "#;
         let processed = preprocess_config_toml(input);
         let config: Config = toml::from_str(&processed).unwrap();
-        assert!(config.dest_dir.is_none());
+        assert_eq!(config.destinations().len(), 2);
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0], PathBuf::from(r"D:\Backup1"));
@@ -855,17 +1035,14 @@ mod tests {
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
 
-        let config = Config {
-            source_dir: source,
-            dest_dir: None,
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        };
+        let config = Config::builder(source)
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
         assert!(config.validate().is_err());
     }
 
@@ -894,17 +1071,16 @@ mod tests {
 
     #[test]
     fn test_resolved_dest_dirs_normalizes_single_backslash_unc() {
-        let config = Config {
-            source_dir: PathBuf::from("C:\\src"),
-            dest_dir: Some(PathBuf::from(r"\172.16.0.60\scada_data")),
-            dest_dirs: Some(vec![PathBuf::from(r"\172.16.0.130\Files")]),
-            debounce_seconds: 1,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 10,
-            block_size_bytes: 4,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-        };
+        let config = Config::builder("C:\\src")
+            .dest_dir(PathBuf::from(r"\172.16.0.60\scada_data"))
+            .dest_dirs(vec![PathBuf::from(r"\172.16.0.130\Files")])
+            .debounce_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(10)
+            .block_size_bytes(4)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].to_string_lossy(), r"\\172.16.0.60\scada_data");
@@ -918,17 +1094,15 @@ mod tests {
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
 
-        let config = Config {
-            source_dir: source,
-            dest_dir: Some(PathBuf::from("relative/folder/path")),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-            dest_dirs: None,
-        };
+        let config = Config::builder(source)
+            .dest_dir(PathBuf::from("relative/folder/path"))
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
         assert!(config.validate().is_err());
     }
 
@@ -1014,17 +1188,16 @@ mod tests {
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
 
-        let config = Config {
-            source_dir: source,
-            dest_dir: Some(PathBuf::from("X:/Control IT Data/Files/")),
-            dest_dirs: Some(vec![PathBuf::from(r"Z:\Backup\OPC\")]),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-        };
+        let config = Config::builder(source)
+            .dest_dir(PathBuf::from("X:/Control IT Data/Files/"))
+            .dest_dirs(vec![PathBuf::from(r"Z:\Backup\OPC\")])
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
 
         assert!(config.validate().is_ok());
         let resolved = config.resolved_dest_dirs();
@@ -1035,17 +1208,15 @@ mod tests {
 
     #[test]
     fn test_config_validation_invalid_source_relative() {
-        let config = Config {
-            source_dir: PathBuf::from("relative/path/source"),
-            dest_dir: Some(PathBuf::from(r"C:\Backup")),
-            dest_dirs: None,
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-        };
+        let config = Config::builder("relative/path/source")
+            .dest_dir(PathBuf::from(r"C:\Backup"))
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
 
         let err = config.validate().unwrap_err();
         assert!(
@@ -1054,48 +1225,42 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_normalize_paths_source_and_dest() {
-        let mut config = Config {
-            source_dir: PathBuf::from("C:/Source/Folder/"),
-            dest_dir: Some(PathBuf::from("D:/Dest/Folder/")),
-            dest_dirs: Some(vec![PathBuf::from("E:/Backup/Folder/")]),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-        };
+        let mut config = Config::builder("C:/Source/Folder/")
+            .dest_dir("D:/Dest/Folder/")
+            .dest_dirs(vec![PathBuf::from("E:/Backup/Folder/")])
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
 
         config.normalize_paths();
-        assert_eq!(config.source_dir.to_string_lossy(), r"C:\Source\Folder");
-        assert_eq!(
-            config.dest_dir.unwrap().to_string_lossy(),
-            r"D:\Dest\Folder"
-        );
-        assert_eq!(
-            config.dest_dirs.unwrap()[0].to_string_lossy(),
-            r"E:\Backup\Folder"
-        );
+        assert_eq!(config.source_dir().to_string_lossy(), r"C:\Source\Folder");
+        let dests = config.resolved_dest_dirs();
+        assert_eq!(dests[0].to_string_lossy(), r"D:\Dest\Folder");
+        assert_eq!(dests[1].to_string_lossy(), r"E:\Backup\Folder");
     }
 
     #[test]
     fn test_resolved_dest_dirs_case_insensitive_dedup() {
-        let config = Config {
-            source_dir: PathBuf::from(r"C:\Source"),
-            dest_dir: Some(PathBuf::from(r"Z:\Backup\OPC")),
-            dest_dirs: Some(vec![
+        let config = Config::builder(r"C:\Source")
+            .dest_dir(PathBuf::from(r"Z:\Backup\OPC"))
+            .dest_dirs(vec![
                 PathBuf::from(r"z:\backup\opc"),
                 PathBuf::from(r"Z:\BACKUP\OPC\"),
                 PathBuf::from(r"Y:\Different\Backup"),
-            ]),
-            debounce_seconds: 3,
-            propagate_deletions: true,
-            block_sync_threshold_bytes: 1024,
-            block_size_bytes: 512,
-            verify_writes: true,
-            retry_interval_seconds: 10,
-        };
+            ])
+            .debounce_seconds(3)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .verify_writes(true)
+            .retry_interval_seconds(10)
+            .build();
 
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
@@ -1130,14 +1295,15 @@ mod tests {
         "#;
         let processed = preprocess_config_toml(input);
         let config: Config = toml::from_str(&processed).unwrap();
-        let extras = config.dest_dirs.unwrap();
-        assert_eq!(extras.len(), 3);
-        assert_eq!(extras[0].to_string_lossy(), r"Y:\Mill Processing\COMMON");
-        assert_eq!(extras[1].to_string_lossy(), r"Z:\Archive\Folder");
-        assert_eq!(extras[2].to_string_lossy(), r"X:\Backup\Files");
+        let resolved = config.resolved_dest_dirs();
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].to_string_lossy(), r"Y:\Mill Processing\COMMON");
+        assert_eq!(resolved[1].to_string_lossy(), r"Z:\Archive\Folder");
+        assert_eq!(resolved[2].to_string_lossy(), r"X:\Backup\Files");
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_preprocess_dest_dirs_mixed_quotes_and_commas() {
         let input = r#"
             source_dir = "C:/source"
@@ -1285,5 +1451,49 @@ mod tests {
         assert_eq!(target.debounce_seconds(), 5);
         assert_eq!(target.retry_interval_seconds(), 15);
         assert!(!target.propagate_deletions());
+    }
+
+    #[test]
+    fn test_target_dir_normalization_and_validation() {
+        let t1 = TargetDir::from_raw("X:/folder/subfolder/");
+        assert_eq!(t1.as_path().to_string_lossy(), r"X:\folder\subfolder");
+        assert!(t1.validate("source").is_ok());
+
+        let t2 = TargetDir::from_raw("\"Z:\\data\\files\\\"");
+        assert_eq!(t2.as_path().to_string_lossy(), r"Z:\data\files");
+        assert!(t2.validate("destination").is_ok());
+
+        let t3 = TargetDir::from_raw(r"\172.16.0.193\share\");
+        assert_eq!(t3.as_path().to_string_lossy(), r"\\172.16.0.193\share");
+        assert!(t3.validate("source").is_ok());
+
+        let t4 = TargetDir::from_raw("R:");
+        assert_eq!(t4.as_path().to_string_lossy(), r"R:\");
+        assert!(t4.validate("destination").is_ok());
+
+        let rel = TargetDir::from_raw("relative/source");
+        assert!(rel.validate("source").is_err());
+        let err_msg = rel.validate("source").unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid source path"));
+    }
+
+    #[test]
+    fn test_destination_collection_dedup_and_order() {
+        let col = DestinationCollection::from_raw(
+            Some(PathBuf::from(r"D:\Backup1")),
+            Some(vec![
+                PathBuf::from(r"d:\backup1"), // duplicate, different case
+                PathBuf::from(r"E:\Backup2"),
+                PathBuf::from(r"\\172.16.0.60\scada_data"),
+            ]),
+        );
+        assert_eq!(col.len(), 3);
+        assert_eq!(col[0], TargetDir::from_raw(r"D:\Backup1"));
+        assert_eq!(col.get(1).unwrap(), &TargetDir::from_raw(r"E:\Backup2"));
+        assert_eq!(col[2], TargetDir::from_raw(r"\\172.16.0.60\scada_data"));
+        let paths = col.to_path_bufs();
+        assert_eq!(paths[0], PathBuf::from(r"D:\Backup1"));
+        assert_eq!(paths[1], PathBuf::from(r"E:\Backup2"));
+        assert_eq!(paths[2], PathBuf::from(r"\\172.16.0.60\scada_data"));
     }
 }

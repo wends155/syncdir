@@ -3,21 +3,26 @@ source: tests/snapshot_tests.rs
 expression: "format!(\"{:#?}\", config)"
 ---
 Config {
-    source_dir: "C:\\source",
-    dest_dir: Some(
-        "D:\\Backup1",
+    source_dir: TargetDir(
+        "C:\\source",
     ),
+    destinations: DestinationCollection {
+        destinations: [
+            TargetDir(
+                "D:\\Backup1",
+            ),
+            TargetDir(
+                "E:\\Backup2",
+            ),
+            TargetDir(
+                "\\\\172.16.0.60\\scada_data",
+            ),
+        ],
+    },
     debounce_seconds: 1,
     propagate_deletions: true,
     block_sync_threshold_bytes: 10,
     block_size_bytes: 4,
     verify_writes: true,
     retry_interval_seconds: 10,
-    dest_dirs: Some(
-        [
-            "D:\\Backup1",
-            "E:\\Backup2",
-            "\\\\172.16.0.60\\scada_data",
-        ],
-    ),
 }
