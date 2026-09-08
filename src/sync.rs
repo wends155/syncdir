@@ -530,7 +530,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let dest = &self.config.dest_dir;
         let dest_reachable = dest.exists() && dest.is_dir();
         let (active_dest, is_reachable) = if !dest_reachable {
-            let alt_path = crate::config::try_resolve_alternate_path(dest);
+            let alt_path = crate::net::try_resolve_alternate_path(dest);
             if alt_path.exists() && alt_path.is_dir() {
                 if alt_path != *dest {
                     tracing::info!(

@@ -86,6 +86,9 @@ pub fn is_network_offline_io(io_err: &std::io::Error) -> bool {
         | Some(65) // ERROR_NETWORK_ACCESS_DENIED (network busy)
         | Some(67) // ERROR_BAD_NET_NAME
         | Some(121) // ERROR_SEM_TIMEOUT
+        | Some(1222) // ERROR_NO_NETWORK
+        | Some(1231) // ERROR_NETWORK_UNREACHABLE
+        | Some(1232) // ERROR_HOST_UNREACHABLE
         | Some(1326) // ERROR_LOGON_FAILURE
     )
 }
@@ -251,6 +254,22 @@ mod tests {
         assert!(is_network_offline_io(&err));
         let err_other = std::io::Error::other("other");
         assert!(!is_network_offline_io(&err_other));
+    }
+
+    #[test]
+    fn test_is_network_offline_io_win32_network_unreachable_codes() {
+        assert!(is_network_offline_io(&std::io::Error::from_raw_os_error(
+            1222
+        )));
+        assert!(is_network_offline_io(&std::io::Error::from_raw_os_error(
+            1231
+        )));
+        assert!(is_network_offline_io(&std::io::Error::from_raw_os_error(
+            1232
+        )));
+        assert!(!is_network_offline_io(&std::io::Error::from_raw_os_error(
+            2
+        )));
     }
 
     #[test]

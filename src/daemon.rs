@@ -162,9 +162,6 @@ impl SyncDaemon {
         app_dir: &Path,
         observer: Option<Arc<dyn SyncStatusObserver>>,
     ) -> Result<Self, SyncError> {
-        let mut config = config;
-        config.resolve_network_paths();
-
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let mut worker_handles = Vec::new();
 

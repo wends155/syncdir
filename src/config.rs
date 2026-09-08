@@ -4,6 +4,7 @@
 //! exist and runtime parameters are sane.
 
 use crate::error::SyncError;
+use crate::path_util::normalize_path;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -507,45 +508,22 @@ impl ConfigBuilder {
     }
 }
 
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
-    let mut s = path.to_string_lossy().trim().trim_matches('"').to_string();
-
-    // Convert forward slashes to backslashes
-    s = s.replace('/', "\\");
-
-    // Ensure Windows drive letter root paths (e.g. "R:" or "X:") have a trailing backslash ("R:\")
-    if s.len() == 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
-        s.push('\\');
+/// Returns true if `target` is identical to `base` or is a descendant of `base`.
+///
+/// Uses Windows case-insensitive component comparison.
+#[must_use]
+pub fn is_same_or_descendant(base: &Path, target: &Path) -> bool {
+    let base_comps: Vec<_> = base.components().collect();
+    let target_comps: Vec<_> = target.components().collect();
+    if target_comps.len() < base_comps.len() {
+        return false;
     }
-
-    // Repair single-backslash UNC network paths (\172... -> \\172...)
-    if s.starts_with('\\') && !s.starts_with("\\\\") {
-        let repaired = format!("\\{}", s);
-        tracing::warn!(
-            raw = %s,
-            normalized = %repaired,
-            "Normalized single-backslash path to UNC network path"
-        );
-        s = repaired;
-    }
-
-    // Trim redundant trailing backslashes while preserving root drive paths like C:\ or X:\
-    while s.ends_with('\\') && s.len() > 3 {
-        let is_root_drive =
-            s.len() == 3 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic();
-        if is_root_drive {
-            break;
-        }
-        s.pop();
-    }
-
-    PathBuf::from(s)
+    base_comps.iter().zip(target_comps.iter()).all(|(b, t)| {
+        b.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&t.as_os_str().to_string_lossy())
+    })
 }
-
-pub use crate::net::{
-    establish_smb_connection, find_mapped_drive_for_unc, resolve_mapped_drive_unc,
-    try_resolve_alternate_path, try_resolve_unc_path,
-};
 
 impl Config {
     /// Mutate and normalize all path fields in-place.
@@ -633,17 +611,6 @@ impl Config {
         self.retry_interval_seconds
     }
 
-    /// Resolve network paths (UNC shares / mapped drives) in-place for source and destinations.
-    pub fn resolve_network_paths(&mut self) {
-        self.source_dir =
-            TargetDir::from_raw(try_resolve_alternate_path(self.source_dir.as_path()));
-        self.destinations = DestinationCollection::new(
-            self.destinations
-                .iter()
-                .map(|d| TargetDir::from_raw(try_resolve_alternate_path(d.as_path()))),
-        );
-    }
-
     /// Generate isolated target sync configurations for each configured destination directory.
     pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
         self.resolved_dest_dirs()
@@ -707,6 +674,15 @@ impl Config {
 
         for dest in self.destinations.iter() {
             dest.validate("destination")?;
+            if is_same_or_descendant(self.source_dir.as_path(), dest.as_path())
+                || is_same_or_descendant(dest.as_path(), self.source_dir.as_path())
+            {
+                return Err(SyncError::Validation(format!(
+                    "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
+                    dest.display(),
+                    self.source_dir.display()
+                )));
+            }
         }
 
         if self.debounce_seconds == 0 {
@@ -724,9 +700,20 @@ impl Config {
                 "block_size_bytes must be greater than zero".into(),
             ));
         }
+        if self.block_size_bytes > 64 * 1024 * 1024 {
+            return Err(SyncError::Validation(
+                "block_size_bytes must not exceed 64MB".into(),
+            ));
+        }
         if self.block_sync_threshold_bytes == 0 {
             return Err(SyncError::Validation(
                 "block_sync_threshold_bytes must be greater than zero".into(),
+            ));
+        }
+        if self.block_sync_threshold_bytes < self.block_size_bytes {
+            return Err(SyncError::Validation(
+                "block_sync_threshold_bytes must be greater than or equal to block_size_bytes"
+                    .into(),
             ));
         }
         Ok(())
@@ -798,23 +785,33 @@ fn preprocess_config_toml(content: &str) -> String {
 fn escape_backslashes_in_quotes(line: &str) -> String {
     let mut result = String::with_capacity(line.len() * 2);
     let mut in_quotes = false;
+    let mut is_start_of_quote = false;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '"' {
             in_quotes = !in_quotes;
+            is_start_of_quote = in_quotes;
             result.push('"');
         } else if c == '\\' && in_quotes {
-            if chars.peek() == Some(&'\\') {
-                result.push('\\');
-                result.push('\\');
-                result.push('\\');
-                result.push('\\');
+            let mut count = 1;
+            while chars.peek() == Some(&'\\') {
+                count += 1;
                 chars.next();
-            } else {
-                result.push('\\');
-                result.push('\\');
             }
+            if is_start_of_quote && count == 2 {
+                result.push_str(r"\\\\");
+            } else if count == 1 {
+                result.push_str(r"\\");
+            } else {
+                for _ in 0..count {
+                    result.push('\\');
+                }
+            }
+            is_start_of_quote = false;
         } else {
+            if in_quotes {
+                is_start_of_quote = false;
+            }
             result.push(c);
         }
     }
@@ -824,6 +821,7 @@ fn escape_backslashes_in_quotes(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::*;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -846,6 +844,112 @@ mod tests {
             .retry_interval_seconds(10)
             .build();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_nested_and_identical_paths() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let nested_dest = src.join("nested_dest");
+        let outside_dest = temp.path().join("dest");
+        let nested_src = outside_dest.join("nested_src");
+
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&nested_dest).unwrap();
+        std::fs::create_dir_all(&outside_dest).unwrap();
+        std::fs::create_dir_all(&nested_src).unwrap();
+
+        // 1. Identical paths
+        let cfg_identical = Config::builder(src.clone()).dest_dir(src.clone()).build();
+        assert!(
+            cfg_identical.validate().is_err(),
+            "Identical source and destination directory must fail validation"
+        );
+
+        // 2. Destination nested inside source
+        let cfg_dest_in_src = Config::builder(src.clone()).dest_dir(nested_dest).build();
+        assert!(
+            cfg_dest_in_src.validate().is_err(),
+            "Destination directory nested within source directory must fail validation"
+        );
+
+        // 3. Source nested inside destination
+        let cfg_src_in_dest = Config::builder(nested_src).dest_dir(outside_dest).build();
+        assert!(
+            cfg_src_in_dest.validate().is_err(),
+            "Source directory nested within destination directory must fail validation"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_block_size_and_threshold_limits() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        // 1. block_size_bytes > 64MB rejected
+        let cfg_oversized_block = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(65 * 1024 * 1024)
+            .block_sync_threshold_bytes(65 * 1024 * 1024)
+            .build();
+        assert!(
+            cfg_oversized_block.validate().is_err(),
+            "block_size_bytes exceeding 64MB must fail validation"
+        );
+
+        // 2. block_size_bytes == 64MB accepted
+        let cfg_boundary_block = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(64 * 1024 * 1024)
+            .block_sync_threshold_bytes(64 * 1024 * 1024)
+            .build();
+        assert!(
+            cfg_boundary_block.validate().is_ok(),
+            "block_size_bytes at boundary 64MB must pass validation"
+        );
+
+        // 3. block_sync_threshold_bytes < block_size_bytes rejected
+        let cfg_invalid_threshold = Config::builder(src)
+            .dest_dir(dst)
+            .block_size_bytes(1024 * 1024)
+            .block_sync_threshold_bytes(512 * 1024)
+            .build();
+        assert!(
+            cfg_invalid_threshold.validate().is_err(),
+            "block_sync_threshold_bytes smaller than block_size_bytes must fail validation"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_config_toml_escaped_unc_not_double_expanded() {
+        let input = r#"
+        source_dir = "\\\\server\\share\\data"
+        dest_dirs = [
+            "\\\\nas\\backup1\\sub",
+            "\\\\nas\\backup2"
+        ]
+        debounce_seconds = 3
+        propagate_deletions = true
+        block_sync_threshold_bytes = 10485760
+        block_size_bytes = 1048576
+        verify_writes = true
+    "#;
+
+        let processed = preprocess_config_toml(input);
+        let config: Config = toml::from_str(&processed).expect("Config TOML parsing must succeed");
+
+        assert_eq!(
+            config.source_dir(),
+            Path::new(r"\\server\share\data"),
+            "Pre-escaped UNC source path must not be doubled to 4 backslashes"
+        );
+
+        let dests = config.resolved_dest_dirs();
+        assert_eq!(dests[0], PathBuf::from(r"\\nas\backup1\sub"));
+        assert_eq!(dests[1], PathBuf::from(r"\\nas\backup2"));
     }
 
     #[test]
