@@ -34,6 +34,13 @@ It enforces the Planning Gate and Think Phase of the TARS protocol.
 >    - `global/skills/plan-reviewer/SKILL.md` — skill to spawn the plan reviewer subagent
 >    - `global/skills/library-researcher/SKILL.md` — (Optional) skill for external library research
 >    - `global/skills/history-researcher/SKILL.md` — (Optional) skill for codebase evolution and historical context research
+>    - `global/skills/api-planner/SKILL.md` — (Optional) skill for API design & interface contracts
+>    - `global/skills/type-planner/SKILL.md` — (Optional) skill for type hierarchy & domain modeling
+>    - `global/skills/module-planner/SKILL.md` — (Optional) skill for module topology & file hierarchy
+>    - `global/skills/test-planner/SKILL.md` — (Optional) skill for test strategy & TDD scaffolding
+>    - `global/skills/concurrency-planner/SKILL.md` — (Optional) skill for async boundaries & concurrency
+>    - `global/skills/security-planner/SKILL.md` — (Optional) skill for security architecture & defensive constraints
+>    - `global/skills/perf-planner/SKILL.md` — (Optional) skill for performance constraints & optimization
 > 2. Run these auto-runnable commands:
 // turbo
 >    - `git log -n 20 --oneline`
@@ -46,7 +53,7 @@ It enforces the Planning Gate and Think Phase of the TARS protocol.
 ## Phases
 
 > [!NOTE]
-> **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode), the Architect executes Phases 1 and 4 inline — performing the reconnaissance and plan review tasks directly rather than delegating to subagents. The phase structure remains the same; only the executor changes.
+> **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode), the Architect executes Phases 1, 2.5, and 4 inline — performing reconnaissance, specialist domain planning, and plan review tasks directly rather than delegating to subagents. The phase structure remains the same; only the executor changes.
 
 ### 0. Scope Triage
 
@@ -91,11 +98,65 @@ Read the Reconnaissance Report (and Idiom/Library/History Reports if spawned).
   3. **Blast radius analysis** — Using the Recon report, map structural consumers and downstream impact. Populate the Blast Radius Table (see `ipr.md`).
   4. **Interface contract risks** — Will any signature changes break downstream callers?
   5. **Confidence check** — After the above, does the plan still make sense or does scope need adjustment?
+  6. **Sub-Planner Distillation** *(M/L tier — if multi-agent available)*:
+     Based on the synthesis above, determine which sub-planner domains are relevant to this plan.
+     For each activated domain, compose a focused, scoped prompt containing ONLY what that specialist needs:
+     - **api-planner**: Specific public symbols being added/changed, error domain, backward-compat constraints.
+     - **type-planner**: New domain concepts to model, existing related types, migration needs.
+     - **module-planner**: Affected module scope, cross-module dependencies, new files to introduce.
+     - **test-planner**: Functions to test (name + signature), external dependencies to mock, integration boundaries.
+     - **concurrency-planner**: Async boundaries, concurrency primitives, shared-state requirements, task topology.
+     - **security-planner**: Trust boundaries, auth model, input surfaces, upstream security findings.
+     - **perf-planner**: Hot paths, algorithmic choices, caching opportunities, upstream performance findings.
+
+     Record these as a `Distilled Sub-Planner Context` block in memory before proceeding to Phase 2.5.
 
 > [!CAUTION]
 > If blast radius analysis reveals cross-package impact, the **Deprecation Protocol** defined in `ipr.md` applies. The plan MUST include a Deprecation Schedule section.
 
+### 2.5 Domain Specialist Planning *(M/L tier — conditional)*
+
+> [!NOTE]
+> **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode),
+> skip this phase. The Architect covers all design domains inline during Phase 2
+> Structured Reasoning and Phase 3 drafting.
+
+**Gate:** Skip for S-tier plans. For M/L tier, activate sub-planners based on Phase 2 assessment.
+
+**Activation is intent-based, not tier-based.** The Architect decides which domains are relevant during Phase 2's Distillation step. Only activate a sub-planner when the plan involves that domain's concern:
+
+| Sub-Planner | Skill | Activate When |
+|---|---|---|
+| `api-planner` | `global/skills/api-planner/SKILL.md` | Plan adds or modifies public signatures, endpoints, or trait definitions |
+| `type-planner` | `global/skills/type-planner/SKILL.md` | Plan adds new types, modifies type definitions, or introduces new domain concepts |
+| `module-planner` | `global/skills/module-planner/SKILL.md` | Affected files touch across different domains or modules; cross-module deps detected |
+| `test-planner` | `global/skills/test-planner/SKILL.md` | Plan adds or modifies functions that require test coverage |
+| `concurrency-planner` | `global/skills/concurrency-planner/SKILL.md` | Plan involves async/await, task spawning, channels, mutexes, or parallel pipelines |
+| `security-planner` | `global/skills/security-planner/SKILL.md` | Plan involves auth, input validation, crypto, trust boundaries, or upstream security findings |
+| `perf-planner` | `global/skills/perf-planner/SKILL.md` | Plan involves hot paths, algorithm choices, caching, or upstream performance findings |
+
+For each activated domain:
+1. Load its skill using `view_file`.
+2. Call `define_subagent` per § 1 of the skill.
+3. Call `invoke_subagent` using the **Distilled Sub-Planner Context** prompt prepared in Phase 2 — NOT the raw recon report.
+   - Include `Repository Workspace: <path>` (explicit workspace root path).
+   - Include boundary reminder: `"Confine all searches strictly to the repository workspace; never search parent or user directories."`
+   - Include: `"Format findings strictly following the report template provided in your system prompt."`
+
+> 🤖 Announce each spawned subagent per `GEMINI.md §10`:
+> `🤖 Spawning subagent [Role] with model: flash (Gemini 3.8 Flash High)`
+
+**🛑 Turn Boundary Fence:** Invoking the final sub-planner MUST be the last tool call of this turn.
+Stop calling tools. The system will deliver all specialist reports via reactive wakeup.
+
+**Wait:** Do NOT proceed to Phase 3 until ALL spawned sub-planner reports are received.
+
 ### 3. Draft the Plan
+
+> 📋 **Consolidate Specialist Fragments First:** Before drafting, incorporate the
+> sub-planner reports directly into their target plan sections. Do NOT re-derive
+> what specialists already produced. Override a fragment only if it contradicts
+> `architecture.md` — and document the override reason inline.
 
 > 📘 **Skill:** [`scaffold-plan`](../../.gemini/skills/scaffold-plan/SKILL.md) — load to extract the exact markdown template scaffolding.
 
