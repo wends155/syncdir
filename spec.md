@@ -419,14 +419,15 @@ THEN `WNetAddConnection2W` authenticates against Windows Credential Manager
 
 | Type | Signature / Variants | Notes |
 |------|----------------------|-------|
+| `SyncError` | `#[non_exhaustive] enum` | Crate-wide unified error type |
 | `SyncError::Io` | `(#[from] std::io::Error)` | Standard I/O errors |
 | `SyncError::Db` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | SQLite database errors |
 | `SyncError::Config` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | TOML parse or validation errors |
 | `SyncError::Validation` | `(String)` | Semantic configuration validation errors |
-| `SyncError::LockPoison` | `(String)` | Mutex poisoning errors |
+| `SyncError::LockPoison` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Mutex poisoning errors |
 | `SyncError::Watcher` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Directory watcher errors |
-| `SyncError::Tray` | `(String)` | GUI / Tray notification errors |
-| `SyncError::Registry` | `(String)` | Windows registry errors |
+| `SyncError::Tray` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | GUI / Tray notification errors |
+| `SyncError::Registry` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Windows registry errors |
 | `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps Win32 network error codes (53, 59, 64, 65, 67, 121, 1326) |
 
 ---

@@ -121,11 +121,14 @@ syncdir/
 * **Verification Command**: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
 
 ## 8. Error Handling Strategy
-* We use `thiserror` to define a single project-wide `SyncError` enum.
+* We use `thiserror` to define a single project-wide `SyncError` enum with `#[non_exhaustive]`.
 * Swallowing errors is strictly prohibited. If a sync fails (e.g. network share disconnects), it logs the warning and schedules a retry.
 * Error propagation uses the standard `?` operator.
+* **Causal Error Chains**: `SyncError` variants (`Db`, `Config`, `LockPoison`, `Watcher`, `Tray`, `Registry`) preserve causal error sources via `(String, #[source] Option<Box<dyn std::error::Error + Send + Sync>>)`. Dual constructors (`name` and `name_with_source`) exist for all multi-parameter variants.
+* **Lock Poisoning Generalization**: `SyncError::LockPoison` represents general mutex poisoning across all modules rather than being coupled to database locks.
+* **Startup Registry Error Handling**: Operations discriminate `std::io::ErrorKind::NotFound` from unexpected errors (e.g., access denied), preserving typed Win32 error causality.
+* **Prevention Linting**: An ast-grep rule (`error-stringification-in-map-err`) enforces that errors inside `.map_err()` closures use `_with_source` constructors rather than lossy stringification.
 * **Network Disconnect Classification**: `SyncError::is_network_offline()` inspects `std::io::Error::raw_os_error()` for Win32 SMB disconnect codes (53 `ERROR_BAD_NETPATH`, 59 `ERROR_UNEXP_NET_ERR`, 64 `ERROR_NETNAME_DELETED`, 67 `ERROR_BAD_NET_NAME`).
-* **Registry Errors**: `SyncError::Registry(String)` cleanly isolates Windows Startup Registry failures from generic configuration parsing errors.
 * **Panic-Free Architecture**: Production code contains zero `.unwrap()` or `.expect()` calls. Methods like `get_archive_path()` return `Result<PathBuf, SyncError>` propagating `SyncError::Validation` when `dest_dir` is unconfigured.
 * **Timestamp Safety**: File modification timestamps are normalized via `safe_modified_millis()` (clamping pre-1970 timestamps to 0 with warning logs) and restored via `safe_epoch_duration_millis()` (preventing wrapping integer underflow on `src_mod as u64`).
 

@@ -16,6 +16,19 @@ It is the entry point of the TARS cycle — the step that comes before `/plan-ma
 > The Issue Report produced here is the **input artifact** for `/plan-making`.
 > Focus on diagnosis, not solutions — proposed fixes belong in the planning phase.
 
+## Workflow Persona
+
+When executing this workflow, adopt the mindset of a **Lead Diagnostic Architect** coordinating
+an issue intake and diagnostic pipeline. Your role is to parse the issue, triage the analytical
+scope, orchestrate specialized diagnostic subagents for standard and deep investigations, and
+synthesize findings into an authoritative diagnostic report. You delegate codebase investigation
+for `medium`, `high`, and `critical` issues to specialized subagents (`issue-investigator` and
+`codebase-recon`) running on efficient models. For `low` severity issues or in single-agent
+fallback mode, you investigate inline using the lightweight depth defined in `issue-rules.md §3`.
+You do NOT perform manual codebase excavation during medium/high/critical investigations —
+scope triage and synthesis are your exclusive roles in those paths. You focus your reasoning
+on scope triage, diagnostic synthesis, and severity calibration.
+
 ## Trigger
 
 User invokes: `/issue <description>`
@@ -36,49 +49,45 @@ User invokes: `/issue <description>`
 
 ### 1. Parse & Classify
 
-Extract the following from the user's description using the classification rubric in `issue-rules.md` §1:
+Extract the following from the user's description per the Classification Rubric in
+`issue-rules.md §1`:
 
-| Field         | Action                                                       |
-|---------------|--------------------------------------------------------------|
-| **Type**      | Classify: `bug`, `feature`, `chore`, `docs`, or `question`  |
-| **Component** | Identify the affected area (e.g., TUI, API, CLI, Database)  |
-| **Severity**  | Estimate: `critical`, `high`, `medium`, `low`                |
-| **Summary**   | One-line restatement of the issue                            |
+| Field | Value |
+|-------|-------|
+| **Type** | `bug` / `feature` / `chore` / `docs` / `question` (per `issue-rules.md §1`) |
+| **Component** | Affected module, workflow, or system area |
+| **Severity** | `critical` / `high` / `medium` / `low` (apply rubric in `issue-rules.md §1`) |
+| **Summary** | One-line restatement of the issue |
 
-If the description is too vague to classify, **ask clarifying questions immediately**
-before proceeding to Step 2.
+If Type is `question` or `docs`, default Severity to `low`.
+If the description is too vague to classify, **ask clarifying questions immediately** before
+proceeding.
 
-### 2. Load Context
+### 2. Scope Triage *(Zero-Tool Decision Gate)*
 
-Gather background information:
+> [!IMPORTANT]
+> **This is a zero-tool decision gate.** Do NOT run any tools, file reads, or code searches
+> during this step. Route based solely on the severity classification from Step 1.
 
-> [!TIP]
-> Load context using native agent tools (zero-prompt):
-> 1. Read `architecture.md` and `context.md` with `view_file` (if they exist).
-> 2. Run these auto-runnable commands:
-// turbo
->    - `git log -n 20 --oneline`
-// turbo
->    - `make search-todos`
-
-- **`architecture.md`**: Identify relevant modules, patterns, and frameworks.
-- **`context.md`**: Check for prior decisions, known bugs, or related history.
-- **`git log -n 20`**: Review recent commits for changes in the affected area.
-- **Existing issues/TODOs**: Search for related `TODO`, `FIXME`, `HACK` comments in the codebase.
-
-### 2.5 Scope Triage
-
-Before investigating, assess the investigation approach:
-- **medium/high/critical severity** → Spawn subagents in parallel (Step 3).
-- **low severity** → Architect investigates inline (lightweight — affected files only).
-- Determine which subagents to spawn:
-  - **issue-investigator**: Spawn for all medium/high/critical issues. Handles diagnostic research, root cause analysis, test coverage, and issue localization.
-  - **codebase-recon**: Spawn for all medium/high/critical issues. Handles blast radius analysis, call graph mapping (callers/callees), and dependency impact.
+| Severity | Path |
+|----------|------|
+| `critical` / `high` / `medium` | **Subagent dispatch** — spawn BOTH subagents in parallel in Step 3. |
+| `low` | **Inline investigation** — load targeted context in Step 2.5, then investigate inline in Step 3. |
 
 > [!NOTE]
-> **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode),
-> the Architect executes Step 3 inline — performing the investigation directly.
-> The step structure remains the same; only the executor changes.
+> **Graceful Fallback:** When `invoke_subagent` is unavailable (single-agent mode), the Architect
+> executes Step 3 inline for all severities, following `issue-rules.md §3` depth guidance.
+
+### 2.5 Targeted Context Load *(Low Severity & Single-Agent Fallback Only)*
+
+Skip this step entirely if subagent dispatch was selected in Step 2.
+
+Load minimal targeted context before beginning inline investigation:
+1. Read `architecture.md` and `context.md` with `view_file` (if present).
+2. Run `git log -n 10 --oneline` to surface recent changes in the affected area.
+
+Do NOT run global marker searches or any global codebase search at this stage.
+Module-scoped marker searches occur during Step 3 inline investigation.
 
 ### 3. Investigate
 
@@ -92,7 +101,15 @@ Spawn both subagents **in parallel**. Follow the respective skill instructions f
 1. Load and follow the `issue-investigator` skill.
 2. Call `define_subagent` if `issue_investigator` is not yet defined.
 3. Call `invoke_subagent` adhering to the mandatory prompt contract:
-   - Pass the **severity level**, **affected component**, **keywords** from the issue description, and any context gathered in Step 2.
+   - Pass the **severity level**, **affected component**, **keywords** from the issue description,
+     and any context gathered from the issue description and **Step 1 (Parse & Classify)**.
+     If any `File:Line:Function Signature` coordinates are known from the user's description or
+     a prior report, list each as: `<file path>:<line>:<Type::method_name()>` (or entity sentinel
+     such as `struct <Name>`, `(Module)`, `(Config)`). Always include `File:Line:Function Signature`
+     for every **known** target.
+   - **Unknown Targets:** If no file coordinates are known (unlocalized symptom), explicitly specify:
+     `Target: (Unknown — diagnose from symptom and component)`. Do NOT search the codebase to
+     locate coordinates before dispatching; discovery is the subagent's responsibility.
    - Include `Repository Workspace: <path>` (explicit workspace root path).
    - Include boundary reminder: `"Confine all searches strictly to the repository workspace; never search parent or user directories."`
    - Include report formatting reminder: `"Format findings strictly following the report template provided in your system prompt."`
@@ -104,7 +121,14 @@ Spawn both subagents **in parallel**. Follow the respective skill instructions f
 1. Load and follow the `codebase-recon` skill.
 2. Call `define_subagent` if `codebase_recon` is not yet defined.
 3. Call `invoke_subagent` adhering to the mandatory prompt contract:
-   - Pass the **affected component/area** and instruct it to focus on blast radius mapping, `get_callers`/`get_callees`/`get_call_graph` around the issue area.
+   - Pass the **affected component/area** and instruct it to focus on blast radius mapping,
+     `get_callers`/`get_callees`/`get_call_graph` around the issue area.
+     If any `File:Line:Function Signature` coordinates are known from the user's description or
+     a prior report, list each as: `<file path>:<line>:<Type::method_name()>` (or entity sentinel
+     such as `struct <Name>`, `(Module)`, `(Config)`). Always include `File:Line:Function Signature`
+     for every **known** target.
+   - **Unknown Targets:** If no file coordinates are known, explicitly specify:
+     `Target: (Unknown — diagnose from symptom and component)`. Do NOT search before dispatching.
    - Include `Repository Workspace: <path>` (explicit workspace root path).
    - Include boundary reminder: `"Confine all searches strictly to the repository workspace; never search parent or user directories."`
    - Include report formatting reminder: `"Format findings strictly following the report template provided in your system prompt."`
@@ -114,20 +138,30 @@ Both subagents are spawned in the **same `invoke_subagent` call block** (paralle
 
 4. **Stop calling tools** and wait for both subagents to return their reports.
 
-#### Inline Investigation *(low severity or single-agent fallback)*
+#### Inline Investigation *(Low Severity or Single-Agent Fallback)*
 
-When investigating inline, search the codebase to understand the problem area:
+When investigating inline, use the following **token-efficient search hierarchy** (in priority order):
 
-- **Identify affected files**: `grep` / `ripgrep` for keywords related to the issue.
-- **Read relevant code**: Outline the affected functions/modules.
-- **Map dependencies**: What calls into or depends on the affected code?
-- **Query knowledge-rag**: Search for dependency API docs or patterns related to the issue (e.g., `search_knowledge "crate:notify event debounce"`). Use indexed context before resorting to web search.
-- **Look for obvious causes**: Missing error handling, logic errors, race conditions, etc.
-- **Check tests**: Are there existing tests covering this area? Are they passing?
+1. **Symbol / Code Discovery:** Use Narsil MCP (`search_code`, `find_symbols`,
+   `get_symbol_definition`) if available.
+2. **File Discovery:** Use `find_by_name` scoped to candidate subdirectories.
+3. **Scoped Text Search:** Use `grep_search` restricted to candidate subtrees.
+   Start with `MatchPerLine: false` (filename-only) before full-text matches.
+   Cap results to 20 matches maximum.
+4. **Targeted Reading:** Use `view_file` with explicit `StartLine`/`EndLine` slices.
+   Do not read whole files.
+5. **Domain Context:** Use Knowledge-RAG (`search_knowledge`) for domain/architectural
+   context before web search.
 
-Scale investigation depth per `issue-rules.md` §3.
+Scale investigation depth per `issue-rules.md §3`. When complete, proceed directly to
+**Step 4** — Step 3.5 is for subagent mode only (see bypass note there).
 
-### 3.5 Architect Diagnostic Synthesis
+### 3.5 Architect Diagnostic Synthesis *(Subagent Mode Only)*
+
+> [!NOTE]
+> **Inline Bypass:** If investigation was conducted inline (low severity or single-agent fallback
+> at Step 3), skip this step entirely and proceed directly to **Step 4**.
+> Your inline findings are the synthesis input.
 
 Read **both** reports returned by the subagents:
 - **Issue Investigation Report** → Root cause analysis, issue location (module/file/function), test coverage, related history.
@@ -157,9 +191,6 @@ Write the structured report to `<artifacts>/issue_report.md` using the `write_to
 > Do **not** include proposed solutions, fixes, or implementation suggestions.
 > See `issue-rules.md` §4 for full diagnostic constraints.
 
-> [!NOTE]
-> Once the artifact is written, you **MUST** provide a clickable markdown link to it in your final chat response (e.g., `[Issue Report](file:///absolute/path/to/issue_report.md)`).
-
 ### 5. Pause for Refinement
 
 End the report with:
@@ -176,11 +207,16 @@ End the report with:
 
 ## Rules
 
-1. **No code edits** — this is an investigation-only workflow.
-2. **No planning** — do not propose solutions or implementation steps.
-3. **Always pause** — the user must explicitly say "Plan" to move forward.
-4. **Ask early** — if the issue is ambiguous, ask questions in Step 1, not Step 4.
-5. **Stay focused** — investigate just enough to produce a clear report; avoid rabbit holes.
-6. **Use subagents** — when `invoke_subagent` is available, delegate investigation to `issue-investigator` and `codebase-recon` subagents in parallel for medium/high/critical issues. When Narsil or Sequential Thinking MCP are available in single-agent fallback, prefer them over manual grep/search.
+Adhere to **`issue-rules.md §4`** for all diagnostic constraints (no solutions or code edits,
+no planning, ask early, token & search efficiency, bounded inspection).
+
+Workflow-level rules:
+1. **Always pause** — the user must explicitly reply with **"Plan"** before proceeding to
+   `/plan-making`. Present the Issue Report and wait for approval.
+2. **Use subagents** — for `medium`/`high`/`critical` severity issues, delegate investigation
+   to `issue-investigator` and `codebase-recon` in parallel (Step 3). For `low` severity or
+   single-agent fallback, investigate inline per `issue-rules.md §3`.
+3. **Sequential Thinking gate** — in single-agent fallback, use `sequentialthinking` MCP only
+   for `critical`/`high` severity. Skip for `medium`/`low` per `issue-rules.md §3`.
 
 

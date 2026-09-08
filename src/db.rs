@@ -120,7 +120,7 @@ impl SqliteHashStore {
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SyncError> {
         self.conn
             .lock()
-            .map_err(|e| SyncError::LockPoison(format!("DB lock poisoned: {e}")))
+            .map_err(|_| SyncError::lock_poison("DB lock poisoned"))
     }
 
     fn init_schema(&self) -> Result<(), SyncError> {
@@ -271,10 +271,19 @@ impl HashStore for SqliteHashStore {
         let mut rows = stmt.query(params![file_id])?;
         let mut hashes = Vec::new();
         while let Some(row) = rows.next()? {
-            let hash_blob: Vec<u8> = row.get(0)?;
-            let hash: BlockHash = hash_blob
-                .try_into()
-                .map_err(|_| SyncError::validation("Invalid block hash length in database"))?;
+            let val_ref = row.get_ref(0)?;
+            let hash_blob = val_ref
+                .as_blob()
+                .map_err(|e| SyncError::db_with_source("Failed to read block hash blob", e))?;
+            let hash: BlockHash = hash_blob.try_into().map_err(|e| {
+                SyncError::db_with_source(
+                    format!(
+                        "Invalid block hash length: {} bytes (expected 32)",
+                        hash_blob.len()
+                    ),
+                    e,
+                )
+            })?;
             hashes.push(hash);
         }
         Ok(hashes)
@@ -328,7 +337,7 @@ impl HashStore for MockHashStore {
         let inner = self
             .inner
             .read()
-            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock hash store lock poisoned"))?;
         Ok(inner.records.get(&key).cloned())
     }
 
@@ -337,7 +346,7 @@ impl HashStore for MockHashStore {
         let mut inner = self
             .inner
             .write()
-            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock hash store lock poisoned"))?;
 
         let id = if let Some(existing) = inner.records.get(&key) {
             existing.id.unwrap_or(1)
@@ -358,7 +367,7 @@ impl HashStore for MockHashStore {
         let inner = self
             .inner
             .read()
-            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock hash store lock poisoned"))?;
         Ok(inner.hashes.get(&file_id).cloned().unwrap_or_default())
     }
 
@@ -367,7 +376,7 @@ impl HashStore for MockHashStore {
         let mut inner = self
             .inner
             .write()
-            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock hash store lock poisoned"))?;
 
         if let Some(removed) = inner.records.remove(&key)
             && let Some(id) = removed.id
@@ -381,7 +390,7 @@ impl HashStore for MockHashStore {
         let inner = self
             .inner
             .read()
-            .map_err(|e| SyncError::lock_poison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock hash store lock poisoned"))?;
         let mut keys: Vec<String> = inner.records.keys().cloned().collect();
         keys.sort();
         Ok(keys.into_iter().map(PathBuf::from).collect())

@@ -42,8 +42,9 @@ impl<R: RegistryBackend> DaemonTrayHandler<R> {
 
 impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTrayHandler<R> {
     fn on_sync_now(&self) -> Result<(), SyncError> {
-        let _ = self.command_tx.send(SyncCommand::TriggerFullScan);
-        Ok(())
+        self.command_tx
+            .send(SyncCommand::TriggerFullScan)
+            .map_err(|e| SyncError::tray_with_source("Sync worker channel disconnected", e))
     }
 
     fn on_reload_config(&self) -> Result<bool, SyncError> {
@@ -63,7 +64,10 @@ impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTra
     }
 
     fn is_startup_enabled(&self) -> bool {
-        self.registry.is_registered().unwrap_or(false)
+        self.registry.is_registered().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to query startup registration; defaulting to false");
+            false
+        })
     }
 }
 

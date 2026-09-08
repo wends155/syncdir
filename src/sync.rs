@@ -648,8 +648,8 @@ pub fn is_safe_relative_path(path: &Path) -> bool {
                 if s.contains(':') {
                     return false;
                 }
-                let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
-                if RESERVED.contains(&stem.as_str()) {
+                let stem = s.split('.').next().unwrap_or("");
+                if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
                     return false;
                 }
             }

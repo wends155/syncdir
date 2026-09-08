@@ -213,7 +213,13 @@ pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
         let unc_path = try_resolve_unc_path(&normalized);
         if unc_path != normalized {
             // Attempt establishing SMB session on resolved UNC share
-            let _ = establish_smb_connection(&unc_path);
+            if let Err(e) = establish_smb_connection(&unc_path) {
+                tracing::debug!(
+                    target = %unc_path.display(),
+                    error = %e,
+                    "SMB session establishment failed during drive letter resolution"
+                );
+            }
             if matches!(std::fs::metadata(&unc_path), Ok(m) if m.is_dir()) {
                 return unc_path;
             }
@@ -223,7 +229,13 @@ pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
     // Case 2: UNC path (e.g. "\\172.16.0.193\Files")
     if s.starts_with(r"\\") {
         // Attempt SMB session establishment on UNC path
-        let _ = establish_smb_connection(&normalized);
+        if let Err(e) = establish_smb_connection(&normalized) {
+            tracing::debug!(
+                target = %normalized.display(),
+                error = %e,
+                "SMB session establishment failed during UNC path resolution"
+            );
+        }
         if matches!(std::fs::metadata(&normalized), Ok(m) if m.is_dir()) {
             return normalized;
         }

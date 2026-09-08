@@ -1,0 +1,18 @@
+id: error-stringification-in-map-err
+message: "Use _with_source constructor to preserve error causality instead of stringifying errors."
+note: "Calling .to_string() or format!() inside .map_err() destroys the error chain. Use SyncError::*_with_source() instead."
+severity: warning
+language: rust
+rule:
+  all:
+    - inside:
+        pattern: $X.map_err($$$)
+    - any:
+        - pattern: SyncError::$VARIANT($ERR.to_string())
+        - pattern: SyncError::$VARIANT(format!($$$ARGS))
+    - not:
+        pattern: SyncError::Validation($$$)
+    - not:
+        pattern: SyncError::validation($$$)
+ignores:
+  - "tests/**"

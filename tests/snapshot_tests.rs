@@ -142,13 +142,19 @@ fn test_sync_error_display_validation() {
 
 #[test]
 fn test_sync_error_display_tray() {
-    let err = SyncError::Tray("Failed to create tray icon".to_string());
+    let err = SyncError::tray("Failed to create tray icon");
     assert_snapshot!(err.to_string());
 }
 
 #[test]
 fn test_sync_error_display_registry() {
-    let err = SyncError::Registry("Failed to open Run registry key".to_string());
+    let err = SyncError::registry("Failed to open Run registry key");
+    assert_snapshot!(err.to_string());
+}
+
+#[test]
+fn test_sync_error_display_lock_poison() {
+    let err = SyncError::lock_poison("memory cache");
     assert_snapshot!(err.to_string());
 }
 

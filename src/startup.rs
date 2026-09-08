@@ -21,23 +21,33 @@ impl StartupRegistry {
         Ok(format!("\"{}\" --autostart", exe_path.to_string_lossy()))
     }
 
-    /// Checks if the startup registration exists and matches the current exe.
+    /// Checks whether the syncdir value exists in HKCU run key.
     ///
     /// # Errors
-    /// Returns `SyncError::Io` if retrieving the current executable path fails.
+    /// * Returns `SyncError::Registry` if the registry key cannot be opened
+    ///   or read for reasons other than `ErrorKind::NotFound` (e.g., access denied).
+    /// * Returns `SyncError::Io` if retrieving the current executable path fails.
     pub fn is_registered() -> Result<bool, SyncError> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let run_key =
-            hkcu.open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_READ);
-        match run_key {
-            Ok(key) => {
-                let val: String = match key.get_value("syncdir") {
-                    Ok(v) => v,
-                    Err(_) => return Ok(false),
-                };
-                Ok(val == Self::registry_value()?)
+        let key = match hkcu
+            .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_READ)
+        {
+            Ok(k) => k,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(SyncError::registry_with_source(
+                    "Failed to open Run registry key",
+                    e,
+                ));
             }
-            Err(_) => Ok(false),
+        };
+        match key.get_value::<String, _>("syncdir") {
+            Ok(val) => Ok(val == Self::registry_value()?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(SyncError::registry_with_source(
+                "Failed to read syncdir registry value",
+                e,
+            )),
         }
     }
 
@@ -49,23 +59,41 @@ impl StartupRegistry {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = hkcu
             .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-            .map_err(|e| SyncError::Registry(format!("Failed to open Run registry key: {e}")))?;
+            .map_err(|e| SyncError::registry_with_source("Failed to open Run registry key", e))?;
         key.set_value("syncdir", &Self::registry_value()?)
-            .map_err(|e| SyncError::Registry(format!("Failed to write registry value: {e}")))?;
+            .map_err(|e| SyncError::registry_with_source("Failed to write registry value", e))?;
         Ok(())
     }
 
     /// Removes the syncdir value from HKCU run key.
     ///
-    /// Silently succeeds if the value does not exist.
+    /// Silently succeeds if the value or key does not exist.
+    ///
+    /// # Errors
+    /// Returns `SyncError::Registry` if the registry key cannot be opened
+    /// or the value cannot be deleted for reasons other than `ErrorKind::NotFound`.
     pub fn unregister() -> Result<(), SyncError> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(key) =
-            hkcu.open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_WRITE)
+        let key = match hkcu
+            .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_WRITE)
         {
-            let _ = key.delete_value("syncdir");
+            Ok(k) => k,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(SyncError::registry_with_source(
+                    "Failed to open Run registry key for deletion",
+                    e,
+                ));
+            }
+        };
+        match key.delete_value("syncdir") {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(SyncError::registry_with_source(
+                "Failed to delete syncdir registry value",
+                e,
+            )),
         }
-        Ok(())
     }
 }
 
@@ -115,7 +143,7 @@ impl RegistryBackend for MockStartupRegistry {
         let val = self
             .registered
             .lock()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock registry lock poisoned"))?;
         Ok(*val)
     }
 
@@ -123,7 +151,7 @@ impl RegistryBackend for MockStartupRegistry {
         let mut val = self
             .registered
             .lock()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock registry lock poisoned"))?;
         *val = true;
         Ok(())
     }
@@ -132,7 +160,7 @@ impl RegistryBackend for MockStartupRegistry {
         let mut val = self
             .registered
             .lock()
-            .map_err(|e| SyncError::LockPoison(e.to_string()))?;
+            .map_err(|_| SyncError::lock_poison("Mock registry lock poisoned"))?;
         *val = false;
         Ok(())
     }

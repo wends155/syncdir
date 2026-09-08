@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 /// All fallible operations in syncdir return this error type.
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SyncError {
     /// Filesystem I/O failure.
@@ -27,9 +28,12 @@ pub enum SyncError {
     #[error("Validation error: {0}")]
     Validation(String),
 
-    /// Database connection lock was poisoned.
-    #[error("Database lock error: {0}")]
-    LockPoison(String),
+    /// Lock was poisoned.
+    #[error("Lock poisoned: {0}")]
+    LockPoison(
+        String,
+        #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
+    ),
 
     /// File watcher failure.
     #[error("Watcher error: {0}")]
@@ -40,11 +44,17 @@ pub enum SyncError {
 
     /// System tray creation or event loop failure.
     #[error("Tray error: {0}")]
-    Tray(String),
+    Tray(
+        String,
+        #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
+    ),
 
     /// Windows startup registry operation failure.
     #[error("Registry error: {0}")]
-    Registry(String),
+    Registry(
+        String,
+        #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
+    ),
 }
 
 impl From<rusqlite::Error> for SyncError {
@@ -112,9 +122,17 @@ impl SyncError {
         SyncError::Db(msg.into(), Some(Box::new(source)))
     }
 
-    /// Create a `SyncError::LockPoison` error.
+    /// Create a `SyncError::LockPoison` without a source cause.
     pub fn lock_poison(msg: impl Into<String>) -> Self {
-        SyncError::LockPoison(msg.into())
+        SyncError::LockPoison(msg.into(), None)
+    }
+
+    /// Create a `SyncError::LockPoison` with an underlying source error cause.
+    pub fn lock_poison_with_source<E: std::error::Error + Send + Sync + 'static>(
+        msg: impl Into<String>,
+        source: E,
+    ) -> Self {
+        SyncError::LockPoison(msg.into(), Some(Box::new(source)))
     }
 
     /// Create a `SyncError::Watcher` without a source cause.
@@ -130,14 +148,30 @@ impl SyncError {
         SyncError::Watcher(msg.into(), Some(Box::new(source)))
     }
 
-    /// Create a `SyncError::Tray` error.
+    /// Create a `SyncError::Tray` without a source cause.
     pub fn tray(msg: impl Into<String>) -> Self {
-        SyncError::Tray(msg.into())
+        SyncError::Tray(msg.into(), None)
     }
 
-    /// Create a `SyncError::Registry` error.
+    /// Create a `SyncError::Tray` with an underlying source error cause.
+    pub fn tray_with_source<E: std::error::Error + Send + Sync + 'static>(
+        msg: impl Into<String>,
+        source: E,
+    ) -> Self {
+        SyncError::Tray(msg.into(), Some(Box::new(source)))
+    }
+
+    /// Create a `SyncError::Registry` without a source cause.
     pub fn registry(msg: impl Into<String>) -> Self {
-        SyncError::Registry(msg.into())
+        SyncError::Registry(msg.into(), None)
+    }
+
+    /// Create a `SyncError::Registry` with an underlying source error cause.
+    pub fn registry_with_source<E: std::error::Error + Send + Sync + 'static>(
+        msg: impl Into<String>,
+        source: E,
+    ) -> Self {
+        SyncError::Registry(msg.into(), Some(Box::new(source)))
     }
 
     /// Returns `true` if the error represents an SMB/network connectivity loss.
@@ -253,7 +287,7 @@ mod tests {
         assert_eq!(err.to_string(), "Database error: db error");
 
         let err = SyncError::lock_poison("lock poisoned");
-        assert_eq!(err.to_string(), "Database lock error: lock poisoned");
+        assert_eq!(err.to_string(), "Lock poisoned: lock poisoned");
 
         let err = SyncError::watcher("watcher error");
         assert_eq!(err.to_string(), "Watcher error: watcher error");
@@ -263,5 +297,39 @@ mod tests {
 
         let err = SyncError::registry("reg error");
         assert_eq!(err.to_string(), "Registry error: reg error");
+    }
+
+    #[test]
+    fn test_tray_with_source_preserves_chain() {
+        use std::error::Error;
+        let io_err = std::io::Error::other("underlying");
+        let err = SyncError::tray_with_source("tray failed", io_err);
+        assert!(err.source().is_some());
+        assert_eq!(err.to_string(), "Tray error: tray failed");
+    }
+
+    #[test]
+    fn test_registry_with_source_preserves_chain() {
+        use std::error::Error;
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let err = SyncError::registry_with_source("registry failed", io_err);
+        assert!(err.source().is_some());
+        assert_eq!(err.to_string(), "Registry error: registry failed");
+    }
+
+    #[test]
+    fn test_lock_poison_with_source_preserves_chain() {
+        use std::error::Error;
+        let poison = std::sync::PoisonError::new(());
+        let err = SyncError::lock_poison_with_source("lock failed", poison);
+        assert!(err.source().is_some());
+        assert_eq!(err.to_string(), "Lock poisoned: lock failed");
+    }
+
+    #[test]
+    fn test_lock_poison_without_source() {
+        use std::error::Error;
+        let err = SyncError::lock_poison("lock failed");
+        assert!(err.source().is_none());
     }
 }

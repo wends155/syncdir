@@ -50,8 +50,13 @@ It enforces the Planning Gate and Think Phase of the TARS protocol.
 
 ### 0. Scope Triage
 
-Investigate the request before writing anything:
-- If a Report was produced by `/issue`, `/audit`, or `/feature`, read it briefly for scope triage.
+- If a Report was produced by `/issue`, `/audit`, `/review`, or `/feature` **and was explicitly cited** by the user or invoking workflow, read it with `view_file`. Then perform **Report Distillation**:
+  1. Extract all `File:Line:Function Signature` (or entity sentinel) targets from the report's affected files, findings matrix, or component list.
+  2. Extract the core problem/intent summary, adapting by report type: root cause + severity (for `/issue`); health assessment + findings summary (for `/review`); fidelity gaps (for `/audit`); scope/requirements (for `/feature`).
+  3. Record as a `Distilled Context` block, partitioned into domain-specific sub-blocks:
+     - `Distilled Recon Context`: all seed `File:Line:Function Signature` (or entity sentinel) targets for `codebase-recon`.
+     - `Distilled Historical Context`: seed targets for `history-researcher`.
+     - Problem/intent summaries retained for Phase 2 Architect structured reasoning.
 - Identify the rough tier (S-tier for 1-3 trivial files; M/L-tier for complex changes).
 - Determine which subagents to spawn in Phase 1:
   - **codebase-recon**: Spawn for all M/L-tier plans. (Skip for trivial S-tier).
@@ -67,10 +72,10 @@ Spawn the necessary subagents **in parallel**. Follow the respective `.gemini/sk
 - Include report formatting reminder: `"Format findings strictly following the report template provided in your system prompt."`
 
 Subagent targets:
-- **codebase-recon**: Pass the affected scope (crate/module path, list of files/functions) and any relevant context from a prior `/issue` report.
+- **codebase-recon**: Pass the affected scope (crate/module path) and — if a `Distilled Recon Context` was produced — all its `File:Line:Function Signature` (or entity sentinel) entries as blast-radius seed symbols.
 - **rust-idiom-researcher** (optional): Pass the affected modules.
 - **library-researcher** (optional): Pass the specific libraries/concepts to research.
-- **history-researcher** (optional): Pass the affected files/modules and any known ADR references.
+- **history-researcher** (optional): Pass the specific `File:Line:Function Signature` (or entity sentinel) entries from the `Distilled Historical Context` block as investigation seed symbols, plus any ADR references.
 
 **Wait:** Stop calling tools and wait for all spawned subagents to return their structured reports.
 

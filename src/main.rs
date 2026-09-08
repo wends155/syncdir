@@ -105,7 +105,7 @@ retry_interval_seconds = 10
     let event_loop =
         winit::event_loop::EventLoopBuilder::<syncdir::tray::UserEvent>::with_user_event()
             .build()
-            .map_err(|e| SyncError::Tray(format!("Failed to create event loop: {e}")))?;
+            .map_err(|e| SyncError::tray_with_source("Failed to create event loop", e))?;
     let event_proxy = event_loop.create_proxy();
 
     let destinations: Vec<DestinationState> = config

@@ -186,7 +186,8 @@ fn generate_status_icon(status: EngineStatus) -> Result<Icon, SyncError> {
             }
         }
     }
-    Icon::from_rgba(rgba, size, size).map_err(|e| SyncError::Tray(e.to_string()))
+    Icon::from_rgba(rgba, size, size)
+        .map_err(|e| SyncError::tray_with_source("Failed to create icon from RGBA buffer", e))
 }
 
 static ICON_CACHE: std::sync::OnceLock<std::collections::HashMap<EngineStatus, Icon>> =
@@ -211,7 +212,7 @@ fn get_cached_icon(status: EngineStatus) -> Result<Icon, SyncError> {
     cache
         .get(&status)
         .cloned()
-        .ok_or_else(|| SyncError::Tray(format!("No icon cached for {:?}", status)))
+        .ok_or_else(|| SyncError::tray(format!("No icon cached for {:?}", status)))
 }
 
 fn generate_default_icon() -> Result<Icon, SyncError> {
@@ -375,22 +376,22 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
 
     let menu = Menu::new();
     menu.append(&open_config)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
     menu.append(&reload_config)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
     menu.append(&view_logs)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
     menu.append(&sync_now)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
     menu.append(&startup_toggle)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
 
     // Add per-destination items
     let mut dest_menu_items = Vec::new();
     if !dests.is_empty() {
         let separator = PredefinedMenuItem::separator();
         menu.append(&separator)
-            .map_err(|e| SyncError::Tray(e.to_string()))?;
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
 
         for (i, d) in dests.iter().enumerate() {
             let is_online = initial_dest_online.get(i).copied().unwrap_or(false);
@@ -399,18 +400,18 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
             let label = format!("{} {} ({})", indicator, d.display(), status_str);
             let item = MenuItem::new(&label, false, None); // Read-only / disabled
             menu.append(&item)
-                .map_err(|e| SyncError::Tray(e.to_string()))?;
+                .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
             dest_menu_items.push(item);
         }
     }
 
     let separator_exit = PredefinedMenuItem::separator();
     menu.append(&separator_exit)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
     menu.append(&about)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
     menu.append(&exit)
-        .map_err(|e| SyncError::Tray(e.to_string()))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
 
     let icon = generate_default_icon()?;
     let tray_icon = TrayIconBuilder::new()
@@ -418,7 +419,7 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
         .with_tooltip("syncdir — Folder Sync")
         .with_icon(icon)
         .build()
-        .map_err(|e| SyncError::Tray(format!("Failed to create tray icon: {e}")))?;
+        .map_err(|e| SyncError::tray_with_source("Failed to create tray icon", e))?;
 
     // Set menu event handler to forward menu events to the event loop
     let proxy = event_loop.create_proxy();
@@ -455,7 +456,13 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
                             tracing::info!("Manual sync triggered from tray menu");
                         }
                     } else if menu_event.id == open_config_id {
-                        let _ = open_path(&config_path);
+                        if let Err(e) = open_path(&config_path) {
+                            tracing::error!(
+                                error = %e,
+                                path = %config_path.display(),
+                                "Failed to open config file"
+                            );
+                        }
                     } else if menu_event.id == reload_config_id {
                         tracing::info!("Reload Config requested via tray menu.");
                         match handler.on_reload_config() {
@@ -477,7 +484,13 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
                             }
                         }
                     } else if menu_event.id == view_logs_id {
-                        let _ = open_path(&log_dir);
+                        if let Err(e) = open_path(&log_dir) {
+                            tracing::error!(
+                                error = %e,
+                                path = %log_dir.display(),
+                                "Failed to open log directory"
+                            );
+                        }
                     } else if menu_event.id == startup_toggle_id {
                         let is_checked = startup_toggle.is_checked();
                         match handler.on_toggle_startup(is_checked) {
@@ -545,7 +558,7 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
                 );
             }
         })
-        .map_err(|e| SyncError::Tray(format!("Event loop error: {e}")))?;
+        .map_err(|e| SyncError::tray_with_source("Event loop error", e))?;
 
     Ok(exit_reason.get())
 }
