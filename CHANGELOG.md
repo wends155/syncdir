@@ -5,6 +5,36 @@ All notable changes to the `syncdir` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.14] - 2026-09-08
+
+### Fixed
+- **Cold Boot Timer Underflow**:
+  - Replaced `checked_sub(retry_interval).unwrap_or_else(Instant::now)` in `SyncDaemon::start` and `start_sync_worker` with `Option<Instant>` initialized to `None`, eliminating the up to 10-second initial startup delay for presence checks.
+- **Ordered Daemon Shutdown & Deadlock Prevention**:
+  - Partitioned `SyncDaemon` thread handles into `watcher_handle`, `broadcaster_handle`, and `worker_handles`.
+  - Enforced strict FIFO shutdown sequence (`watcher` -> `broadcaster` -> `workers`) to prevent deadlock when joining worker threads.
+- **Fallible Tray Action Contracts & Swallowed Errors**:
+  - Refactored `TrayActionHandler::is_startup_enabled` to return `Result<bool, SyncError>` instead of a bare `bool`, avoiding silent swallowing of Windows registry access errors.
+  - Refactored `TrayActionHandler::on_reload_config` to return `Result<(), SyncError>` with asynchronous background validation reporting to winit via `UserEvent::ConfigReloadResult`.
+  - Added default trait methods `on_open_config()` and `on_view_logs()` returning `Result<(), SyncError>`, decoupling UI path handling from `run_tray`.
+- **Static Analysis AST Scoping in ast-grep**:
+  - Updated `.ast-grep/rules/unwrap-in-production.yml` with structural relational matchers (`mod_item` with `tests?` identifier, `function_item` with `test_` identifier and `stopBy: end`), eliminating 238 false positives while strictly flagging unwraps in production code.
+
+### Improved
+- **Sync Engine Memory & Queue Efficiency**:
+  - Introduced `SyncWorkerContext<E>` grouping parameters into a dedicated context structure.
+  - Replaced consecutive boolean parameters with explicit `SourceState` and `WatcherState` enums.
+  - Reused 64KB delta-sync scratch buffers across chunk transfers in `sync_file_to_dest`, avoiding high-frequency memory reallocations.
+  - Replaced repeated retain/clone cycles in worker queues with single-pass `HashMap::retain` in-place deadline mutation and early `network_offline_detected` short-circuiting.
+  - Added NTFS junction filtering in `scan_dir` using `symlink_metadata(entry.path())` to skip junction loops and symbolic directories.
+- **Config & Registry Safety**:
+  - Prohibited device namespace paths (`\\.\` and `\\?\`) in path normalization and validation.
+  - Optimized destination directory deduplication with case-insensitive `HashSet` filtering.
+  - Added `DaemonHandle` encapsulation with `trigger_full_scan(&self) -> Result<(), SyncError>`.
+  - Enforced `#[must_use]` on `SyncDaemon` and `SyncDaemon::start`.
+
+---
+
 ## [v0.1.13] - 2026-08-02
 
 ### Added
