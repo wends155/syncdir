@@ -15,7 +15,7 @@
 //! - **Resilient Windows Networking**: Bidirectional UNC $\longleftrightarrow$ mapped drive translation and
 //!   session authentication via Win32 `WNetAddConnection2W` and `WNetGetConnectionW`.
 //! - **Daemon Orchestration**: Clean lifecycle management via [`SyncDaemon`] and windowless system tray
-//!   integration via [`run_tray`].
+//!   integration via [`tray::run_tray`].
 //!
 //! ## Core Modules
 //!

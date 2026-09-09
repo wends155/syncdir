@@ -1376,6 +1376,7 @@ pub struct ReachabilityMonitor {
 }
 
 impl ReachabilityMonitor {
+    /// Create a new reachability monitor for a target directory.
     pub fn new(
         target_index: usize,
         configured_dest: PathBuf,
@@ -1395,14 +1396,17 @@ impl ReachabilityMonitor {
         }
     }
 
+    /// Return the active resolved destination directory path.
     pub fn active_dest(&self) -> &Path {
         &self.active_dest
     }
 
+    /// Return true if the destination is currently determined to be online.
     pub fn is_dest_online(&self) -> bool {
         self.dest_online
     }
 
+    /// Check if enough time has elapsed to warrant another reachability check.
     pub fn should_check_reachability(&self, now: Instant) -> bool {
         match self.last_status_check {
             None => true,
@@ -1410,6 +1414,7 @@ impl ReachabilityMonitor {
         }
     }
 
+    /// Probe destination reachability and resolve alternate UNC paths if necessary.
     pub fn check_reachability(
         &mut self,
         now: Instant,
@@ -1457,6 +1462,7 @@ impl ReachabilityMonitor {
         }
     }
 
+    /// Mark the target destination offline immediately and notify observers.
     pub fn mark_offline(&mut self, observer: Option<&std::sync::Arc<dyn SyncStatusObserver>>) {
         self.dest_online = false;
         if self.last_sent_status != Some(ConnectivityState::Offline) {
@@ -1467,6 +1473,7 @@ impl ReachabilityMonitor {
         }
     }
 
+    /// Mark the target destination online immediately and notify observers.
     pub fn mark_online(&mut self, observer: Option<&std::sync::Arc<dyn SyncStatusObserver>>) {
         self.dest_online = true;
         if self.last_sent_status != Some(ConnectivityState::Online) {
@@ -1487,6 +1494,7 @@ pub struct SyncWorkerState {
 }
 
 impl SyncWorkerState {
+    /// Initialize worker scratch buffer and archive prune timers.
     pub fn new(block_size_bytes: u64) -> Self {
         Self {
             scratch: vec![0u8; block_size_bytes as usize],
@@ -1496,20 +1504,24 @@ impl SyncWorkerState {
         }
     }
 
+    /// Check if enough time has passed to trigger the hourly archive prune.
     pub fn should_prune_archive(&self, now: Instant) -> bool {
         now.duration_since(self.last_archive_prune) >= self.hourly_prune_interval
     }
 
+    /// Record timestamp of the most recent archive pruning.
     pub fn record_prune(&mut self, now: Instant) {
         self.last_archive_prune = now;
     }
 
+    /// Increment and return consecutive failure count for a path.
     pub fn record_failure(&mut self, path: &Path) -> u32 {
         let entry = self.failure_tracker.entry(path.to_path_buf()).or_insert(0);
         *entry += 1;
         *entry
     }
 
+    /// Reset failure count upon successful synchronization.
     pub fn reset_failure(&mut self, path: &Path) {
         self.failure_tracker.remove(path);
     }
