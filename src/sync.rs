@@ -285,8 +285,20 @@ pub trait SyncEngine: Send + Sync {
     fn prune_archive(&self, _dest_dir: &Path) -> Result<(), SyncError> {
         Ok(())
     }
+    /// Perform a full directory scan and sync all changed files cooperatively cancellable.
+    fn run_cancellable_full_scan(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ScanOutcome, SyncError>;
+
     /// Perform a full directory scan and sync all changed files.
-    fn run_full_scan(&self) -> Result<ScanOutcome, SyncError>;
+    ///
+    /// Backward-compatible default delegates to static never-cancelled token.
+    fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+        static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        self.run_cancellable_full_scan(&NEVER_CANCELLED)
+    }
 }
 
 type SyncErrorFactory = std::sync::Arc<dyn Fn() -> SyncError + Send + Sync>;
@@ -441,7 +453,13 @@ impl SyncEngine for MockSyncEngine {
         Ok(())
     }
 
-    fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+    fn run_cancellable_full_scan(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ScanOutcome, SyncError> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(SyncError::Cancelled);
+        }
         *self.full_scans.lock().unwrap() += 1;
         let err_fn = self.sync_error_fn.lock().unwrap().clone();
         if let Some(f) = err_fn {
@@ -1148,7 +1166,14 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         self.prune_destination_archive(dest_dir)
     }
 
-    fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+    fn run_cancellable_full_scan(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ScanOutcome, SyncError> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(SyncError::Cancelled);
+        }
+
         let resolved_source = self.config.source_dir();
         if !resolved_source.exists() {
             return Err(SyncError::validation("Source directory does not exist"));
@@ -1190,12 +1215,13 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
         let mut source_files: HashSet<PathBuf> = HashSet::new();
         let mut scan_complete = true;
-        scan_dir(
+        scan_dir_cancellable(
             resolved_source,
             resolved_source,
             &mut source_files,
             &mut scan_complete,
             0,
+            cancel,
         )?;
 
         let cached_records = self.db.list_all_records()?;
@@ -1206,6 +1232,9 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let mut sync_skip_count = 0usize;
         let mut scratch = vec![0u8; self.config.block_size_bytes() as usize];
         for rel_path in &source_files {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(SyncError::Cancelled);
+            }
             let normalized_key = PathBuf::from(rel_path.to_string_lossy().replace('\\', "/"));
             match self.sync_file_to_dest_buffered_with_record(
                 rel_path,
@@ -1280,6 +1309,9 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                     .collect();
 
                 for tracked_path in cached_records.keys() {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(SyncError::Cancelled);
+                    }
                     #[cfg(windows)]
                     let is_present = source_lookup.contains(
                         &tracked_path
@@ -1347,13 +1379,17 @@ fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true)
 }
 
-fn scan_dir(
+fn scan_dir_cancellable(
     dir: &Path,
     source_root: &Path,
     files: &mut HashSet<PathBuf>,
     scan_complete: &mut bool,
     depth: usize,
-) -> Result<(), std::io::Error> {
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), SyncError> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(SyncError::Cancelled);
+    }
     const MAX_DEPTH: usize = 64;
     if depth > MAX_DEPTH {
         tracing::warn!(path = %dir.display(), "Max directory depth exceeded, skipping");
@@ -1367,9 +1403,12 @@ fn scan_dir(
             *scan_complete = false;
             return Ok(());
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(SyncError::Io(e)),
     };
     for entry in entries {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(SyncError::Cancelled);
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1377,7 +1416,7 @@ fn scan_dir(
                 *scan_complete = false;
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(SyncError::Io(e)),
         };
         if is_reparse_or_symlink(&entry) {
             tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in scan");
@@ -1390,11 +1429,11 @@ fn scan_dir(
                 *scan_complete = false;
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(SyncError::Io(e)),
         };
         let path = entry.path();
         if file_type.is_dir() {
-            scan_dir(&path, source_root, files, scan_complete, depth + 1)?;
+            scan_dir_cancellable(&path, source_root, files, scan_complete, depth + 1, cancel)?;
         } else if file_type.is_file()
             && let Ok(rel) = path.strip_prefix(source_root)
         {
@@ -1402,6 +1441,29 @@ fn scan_dir(
         }
     }
     Ok(())
+}
+
+pub(crate) fn scan_dir(
+    dir: &Path,
+    source_root: &Path,
+    files: &mut HashSet<PathBuf>,
+    scan_complete: &mut bool,
+    depth: usize,
+) -> Result<(), std::io::Error> {
+    static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    match scan_dir_cancellable(
+        dir,
+        source_root,
+        files,
+        scan_complete,
+        depth,
+        &NEVER_CANCELLED,
+    ) {
+        Ok(()) => Ok(()),
+        Err(SyncError::Io(e)) => Err(e),
+        Err(_) => Err(std::io::Error::other("scan_dir failed")),
+    }
 }
 
 #[doc(hidden)]
@@ -1758,6 +1820,7 @@ pub struct SyncWorkerContext<E: SyncEngine> {
     pub observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
     pub source_connectivity: SourceConnectivityTracker,
     pub resolver: std::sync::Arc<dyn crate::net::NetworkResolver>,
+    pub cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<E: SyncEngine> SyncWorkerContext<E> {
@@ -1778,6 +1841,7 @@ impl<E: SyncEngine> SyncWorkerContext<E> {
             observer,
             source_connectivity: source_connectivity.into(),
             resolver: std::sync::Arc::new(crate::net::Win32NetworkResolver),
+            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1787,6 +1851,15 @@ impl<E: SyncEngine> SyncWorkerContext<E> {
         resolver: std::sync::Arc<dyn crate::net::NetworkResolver>,
     ) -> Self {
         self.resolver = resolver;
+        self
+    }
+
+    /// Set a custom cancellation token.
+    pub fn with_cancellation(
+        mut self,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.cancellation = cancellation;
         self
     }
 
@@ -1833,6 +1906,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
         observer,
         source_connectivity,
         resolver,
+        cancellation,
     } = context;
 
     const MAX_PENDING_QUEUE: usize = 50_000;
@@ -1851,6 +1925,13 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
             let retry_dur = std::time::Duration::from_secs(config.retry_interval_seconds());
 
             loop {
+                if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        target_index = target_index + 1,
+                        "Sync worker shutting down via cancellation signal."
+                    );
+                    break;
+                }
                 let now = Instant::now();
 
                 let was_offline = !reachability.is_dest_online();
@@ -1867,7 +1948,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                                 target_index = target_index + 1,
                                 "Triggering catch-up full scan following destination reconnect."
                             );
-                            match engine.run_full_scan() {
+                            match engine.run_cancellable_full_scan(&cancellation) {
                                 Ok(ScanOutcome::DestinationUnreachable) => {
                                     tracing::warn!(
                                         "Catch-up scan determined destination is unreachable"
@@ -1875,6 +1956,10 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                                     reachability.mark_offline(observer.as_ref());
                                 }
                                 Ok(_) => {}
+                                Err(SyncError::Cancelled) => {
+                                    tracing::info!("Catch-up scan cancelled");
+                                    break;
+                                }
                                 Err(e) => {
                                     tracing::error!(error = %e, "Catch-up full scan on reconnect failed");
                                 }
@@ -1898,7 +1983,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     }
                     Ok(SyncCommand::TriggerFullScan) => {
                         if source_connectivity.is_online() {
-                            match engine.run_full_scan() {
+                            match engine.run_cancellable_full_scan(&cancellation) {
                                 Ok(ScanOutcome::Success { synced }) => {
                                     tracing::info!(synced, "Full scan completed successfully");
                                     reachability.mark_online(observer.as_ref());
@@ -1923,6 +2008,10 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                                         "Full scan aborted: destination is unreachable"
                                     );
                                     reachability.mark_offline(observer.as_ref());
+                                }
+                                Err(SyncError::Cancelled) => {
+                                    tracing::info!("Full scan cancelled");
+                                    break;
                                 }
                                 Err(e) => {
                                     tracing::error!(error = %e, "Full scan execution failed");
@@ -1949,6 +2038,9 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                 // Drain and process ready syncs
                 let ready_syncs = queue.drain_ready_syncs(now);
                 for path in ready_syncs {
+                    if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     if network_offline_detected
                         || !source_connectivity.is_online()
                         || !reachability.is_dest_online()
@@ -2038,6 +2130,9 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                 // Drain and process ready deletes
                 let ready_deletes = queue.drain_ready_deletes(now);
                 for path in ready_deletes {
+                    if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     if network_offline_detected
                         || !source_connectivity.is_online()
                         || !reachability.is_dest_online()
@@ -2819,6 +2914,38 @@ mod tests {
     }
 
     #[test]
+    fn test_run_cancellable_full_scan_interruption() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        for i in 0..20 {
+            fs::write(
+                src.join(format!("file_{}.txt", i)),
+                format!("content {}", i),
+            )
+            .unwrap();
+        }
+
+        let config = Config::test_default(src, dst);
+        let engine = LocalSyncEngine::new(MockHashStore::new(), config);
+
+        let cancel_token = std::sync::atomic::AtomicBool::new(true);
+        let result = engine.run_cancellable_full_scan(&cancel_token);
+
+        assert!(
+            result.is_err(),
+            "Full scan should abort when cancel token is set"
+        );
+        match result.unwrap_err() {
+            SyncError::Cancelled => {}
+            other => panic!("Expected SyncError::Cancelled, got: {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_sync_file_directory_creation() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("src");
@@ -3170,7 +3297,10 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(SyncError::validation("Permanent validation failure"))
         }
-        fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+        fn run_cancellable_full_scan(
+            &self,
+            _cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<ScanOutcome, SyncError> {
             Ok(ScanOutcome::Success { synced: 0 })
         }
     }

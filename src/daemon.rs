@@ -144,6 +144,7 @@ pub struct SyncDaemon {
     broadcaster_handle: Option<JoinHandle<()>>,
     worker_handles: Vec<JoinHandle<()>>,
     shutdown_flag: Arc<AtomicBool>,
+    cancellation: Arc<AtomicBool>,
     command_tx: Sender<SyncCommand>,
 }
 
@@ -347,6 +348,7 @@ impl SyncDaemon {
         Self::validate_target_loops(&config, &resolver)?;
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(AtomicBool::new(false));
         let mut worker_handles = Vec::new();
 
         let source_connectivity = crate::sync::SourceConnectivityTracker::new(false);
@@ -372,7 +374,8 @@ impl SyncDaemon {
                 w_rx,
                 observer.clone(),
                 source_connectivity.clone(),
-            );
+            )
+            .with_cancellation(cancellation.clone());
             let worker_handle = start_sync_worker(worker_ctx)?;
             worker_handles.push(worker_handle);
         }
@@ -399,6 +402,7 @@ impl SyncDaemon {
             broadcaster_handle: Some(broadcaster_handle),
             worker_handles,
             shutdown_flag,
+            cancellation,
             command_tx: tx,
         })
     }
@@ -431,6 +435,8 @@ impl SyncDaemon {
     fn perform_shutdown(&mut self) {
         if !self.shutdown_flag.swap(true, Ordering::Relaxed) {
             tracing::info!("Shutting down SyncDaemon and all worker threads...");
+            // Signal cancellation token to all workers immediately
+            self.cancellation.store(true, Ordering::Relaxed);
             // Step 1: Join watcher thread first so no new events are generated
             if let Some(handle) = self.watcher_handle.take() {
                 let _ = handle.join();
