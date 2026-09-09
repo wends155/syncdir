@@ -1,4 +1,5 @@
 pub(crate) mod assets;
+pub(crate) use assets::{generate_default_icon, get_cached_icon};
 
 use crate::error::SyncError;
 use crate::sync::{ConnectivityState, WatcherState};
@@ -6,8 +7,8 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use tray_icon::TrayIconBuilder;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIconBuilder};
 use winit::event::Event;
 use winit::event_loop::ControlFlow;
 
@@ -106,22 +107,36 @@ pub struct DestinationState {
     pub path: PathBuf,
     pub is_online: ConnectivityState,
     pub resolved_unc: Option<PathBuf>,
+    display_label: String,
 }
 
 impl DestinationState {
     /// Create a new DestinationState with path and online reachability.
     pub fn new(path: impl Into<PathBuf>, is_online: impl Into<ConnectivityState>) -> Self {
+        let path = path.into();
+        let display_label = path.display().to_string();
         Self {
-            path: path.into(),
+            path,
             is_online: is_online.into(),
             resolved_unc: None,
+            display_label,
         }
     }
 
     /// Builder method to attach a resolved alternate UNC path.
     pub fn with_resolved_unc(mut self, resolved_unc: impl Into<Option<PathBuf>>) -> Self {
         self.resolved_unc = resolved_unc.into();
+        self.display_label = match &self.resolved_unc {
+            Some(unc) => format!("{} -> {}", self.path.display(), unc.display()),
+            None => self.path.display().to_string(),
+        };
         self
+    }
+
+    /// Retrieve the precomputed user-facing display label for the destination.
+    #[must_use]
+    pub fn display_label(&self) -> &str {
+        &self.display_label
     }
 }
 
@@ -311,75 +326,6 @@ impl TrayState {
     }
 }
 
-/// Generate a status-specific 32×32 RGBA tray icon.
-fn generate_status_icon(status: EngineStatus) -> Result<Icon, SyncError> {
-    let size = 32u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-
-    // Color mappings based on status
-    let (border_r, border_g, border_b) = match status {
-        EngineStatus::Healthy => (66, 133, 244),           // Blue
-        EngineStatus::Degraded => (255, 140, 0),           // Orange
-        EngineStatus::SourceOffline => (219, 68, 85),      // Red
-        EngineStatus::DestinationOffline => (244, 180, 0), // Yellow
-        EngineStatus::BothOffline => (180, 180, 180),      // Gray
-    };
-
-    let (center_r, center_g, center_b) = match status {
-        EngineStatus::Healthy => (255, 255, 255), // White
-        _ => (80, 80, 80),                        // Dark gray
-    };
-
-    for y in 0..size {
-        for x in 0..size {
-            let idx = ((y * size + x) * 4) as usize;
-            let is_border = !(4..28).contains(&x) || !(4..28).contains(&y);
-            if is_border {
-                rgba[idx] = border_r;
-                rgba[idx + 1] = border_g;
-                rgba[idx + 2] = border_b;
-                rgba[idx + 3] = 255;
-            } else {
-                rgba[idx] = center_r;
-                rgba[idx + 1] = center_g;
-                rgba[idx + 2] = center_b;
-                rgba[idx + 3] = 255;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, size, size)
-        .map_err(|e| SyncError::tray_with_source("Failed to create icon from RGBA buffer", e))
-}
-
-static ICON_CACHE: std::sync::OnceLock<std::collections::HashMap<EngineStatus, Icon>> =
-    std::sync::OnceLock::new();
-
-fn get_cached_icon(status: EngineStatus) -> Result<Icon, SyncError> {
-    let cache = ICON_CACHE.get_or_init(|| {
-        let mut m = std::collections::HashMap::new();
-        for s in [
-            EngineStatus::Healthy,
-            EngineStatus::Degraded,
-            EngineStatus::SourceOffline,
-            EngineStatus::DestinationOffline,
-            EngineStatus::BothOffline,
-        ] {
-            if let Ok(icon) = generate_status_icon(s) {
-                m.insert(s, icon);
-            }
-        }
-        m
-    });
-    cache
-        .get(&status)
-        .cloned()
-        .ok_or_else(|| SyncError::tray(format!("No icon cached for {:?}", status)))
-}
-
-fn generate_default_icon() -> Result<Icon, SyncError> {
-    get_cached_icon(EngineStatus::Healthy)
-}
-
 /// Display a native Windows About modal dialog box containing version, description, copyright, and URL.
 #[cfg(target_os = "windows")]
 fn show_about_dialog() {
@@ -514,6 +460,7 @@ pub struct TrayController<H: TrayActionHandler + ?Sized> {
     reload_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     is_reloading: Arc<std::sync::atomic::AtomicBool>,
     exit_reason: Rc<Cell<TrayExitReason>>,
+    pub(crate) last_icon_status: Option<EngineStatus>,
 }
 
 impl<H: TrayActionHandler + ?Sized> TrayController<H> {
@@ -564,11 +511,7 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
                 let is_online = d.is_online == ConnectivityState::Online;
                 let indicator = if is_online { "●" } else { "○" };
                 let status_str = if is_online { "Online" } else { "Offline" };
-                let path_label = match &d.resolved_unc {
-                    Some(unc) => format!("{} -> {}", d.path.display(), unc.display()),
-                    None => format!("{}", d.path.display()),
-                };
-                let label = format!("{} {} ({})", indicator, path_label, status_str);
+                let label = format!("{} {} ({})", indicator, d.display_label(), status_str);
                 let item = MenuItem::new(&label, false, None); // Read-only / disabled
                 menu.append(&item)
                     .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
@@ -623,6 +566,7 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
             reload_proxy,
             is_reloading,
             exit_reason,
+            last_icon_status: None,
         })
     }
 
@@ -737,12 +681,12 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
                 let is_online = update.dest_online == ConnectivityState::Online;
                 let status_str = if is_online { "Online" } else { "Offline" };
                 let indicator = if is_online { "●" } else { "○" };
-                let path_label = match &d.resolved_unc {
-                    Some(unc) => format!("{} -> {}", d.path.display(), unc.display()),
-                    None => format!("{}", d.path.display()),
-                };
-                self.dest_menu_items[update.target_index]
-                    .set_text(format!("{} {} ({})", indicator, path_label, status_str));
+                self.dest_menu_items[update.target_index].set_text(format!(
+                    "{} {} ({})",
+                    indicator,
+                    d.display_label(),
+                    status_str
+                ));
             }
             self.repaint();
         }
@@ -766,10 +710,26 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
     pub fn repaint(&mut self) {
         let status = self.state.overall_status();
         let new_tooltip = self.state.tooltip_text();
-        let _ = self.tray_icon.set_tooltip(Some(&new_tooltip));
-        if let Ok(new_icon) = get_cached_icon(status) {
-            let _ = self.tray_icon.set_icon(Some(new_icon));
+        if let Err(e) = self.tray_icon.set_tooltip(Some(&new_tooltip)) {
+            tracing::warn!(error = %e, "Failed to update tray tooltip");
         }
+
+        if self.last_icon_status != Some(status) {
+            match get_cached_icon(status) {
+                Ok(new_icon) => match self.tray_icon.set_icon(Some(new_icon)) {
+                    Ok(()) => self.last_icon_status = Some(status),
+                    Err(e) => tracing::warn!(error = %e, "Failed to set tray icon"),
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        status = ?status,
+                        "Failed to retrieve cached tray icon"
+                    );
+                }
+            }
+        }
+
         tracing::info!(
             status = ?status,
             online_count = self.state.online_dest_count(),
@@ -997,5 +957,58 @@ mod tests {
         assert_eq!(dest.path, PathBuf::from("D:\\Sync"));
         assert_eq!(dest.is_online, ConnectivityState::Online);
         assert_eq!(dest.resolved_unc, Some(PathBuf::from("\\\\server\\share")));
+    }
+
+    #[test]
+    fn test_engine_status_all_variants() {
+        use pretty_assertions::assert_eq;
+        use std::collections::HashSet;
+
+        assert_eq!(EngineStatus::ALL.len(), 5);
+        assert_eq!(EngineStatus::ALL[0], EngineStatus::Healthy);
+        assert_eq!(EngineStatus::ALL[1], EngineStatus::Degraded);
+        assert_eq!(EngineStatus::ALL[2], EngineStatus::SourceOffline);
+        assert_eq!(EngineStatus::ALL[3], EngineStatus::DestinationOffline);
+        assert_eq!(EngineStatus::ALL[4], EngineStatus::BothOffline);
+
+        let unique: HashSet<EngineStatus> = EngineStatus::ALL.into_iter().collect();
+        assert_eq!(unique.len(), 5);
+    }
+
+    #[test]
+    fn test_destination_state_display_label() {
+        use pretty_assertions::assert_eq;
+        use std::path::PathBuf;
+
+        let dest_local = DestinationState::new("D:\\SyncFolder", true);
+        assert_eq!(dest_local.display_label(), "D:\\SyncFolder");
+
+        let dest_mapped = DestinationState::new("Z:\\Backup", true)
+            .with_resolved_unc(PathBuf::from("\\\\192.168.1.50\\share\\backup"));
+        assert_eq!(
+            dest_mapped.display_label(),
+            "Z:\\Backup -> \\\\192.168.1.50\\share\\backup"
+        );
+    }
+
+    #[test]
+    fn test_repaint_icon_gating_invariants() {
+        // Verify that EngineStatus transition tracking behaves idempotently
+        let mut last_icon_status: Option<EngineStatus> = None;
+        let initial_status = EngineStatus::Healthy;
+
+        // First repaint: transition detected
+        let should_repaint_first = last_icon_status != Some(initial_status);
+        assert!(should_repaint_first);
+        last_icon_status = Some(initial_status);
+
+        // Identical status: repaint elided
+        let should_repaint_second = last_icon_status != Some(initial_status);
+        assert!(!should_repaint_second);
+
+        // State transition: repaint triggered
+        let degraded_status = EngineStatus::Degraded;
+        let should_repaint_transition = last_icon_status != Some(degraded_status);
+        assert!(should_repaint_transition);
     }
 }

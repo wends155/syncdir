@@ -64,6 +64,7 @@ pub static STATUS_RGBA: [[u8; ICON_BUFFER_LEN]; EngineStatus::COUNT] = [
 /// Retrieve a reference to the static compile-time RGBA buffer for a status.
 #[inline]
 #[must_use]
+#[allow(dead_code)]
 pub fn status_rgba(status: EngineStatus) -> &'static [u8; ICON_BUFFER_LEN] {
     &STATUS_RGBA[status.index()]
 }
@@ -139,7 +140,7 @@ mod tests {
         let mut center_count = 0usize;
         for y in 0..32 {
             for x in 0..32 {
-                let is_border = x < 4 || x >= 28 || y < 4 || y >= 28;
+                let is_border = !(4..28).contains(&x) || !(4..28).contains(&y);
                 let idx = (y * 32 + x) * 4;
                 if is_border {
                     border_count += 1;
