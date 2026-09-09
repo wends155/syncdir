@@ -801,6 +801,43 @@ pub(crate) struct FileSyncTask<'a> {
     pub cached_id: Option<i64>,
 }
 
+/// RAII guard for temporary staging files during atomic small-file sync.
+/// Automatically removes the temporary file on drop unless disarmed.
+#[derive(Debug)]
+pub(crate) struct TempFileGuard {
+    path: PathBuf,
+    disarmed: bool,
+}
+
+impl TempFileGuard {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            disarmed: false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Global atomic counter for unique temporary staging file generation across threads.
+static TEMP_FILE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Global atomic counter for unique archive path generation across threads and timestamps.
 static ARCHIVE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -883,13 +920,27 @@ impl<S: HashStore> LocalSyncEngine<S> {
         if let Some(parent) = task.dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
+
+        let nonce = TEMP_FILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10_000;
+        let file_stem = task
+            .dest_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let temp_name = format!("{file_stem}.{nonce:04x}.syncdir_tmp");
+        let temp_path = match task.dest_path.parent() {
+            Some(parent) => parent.join(temp_name),
+            None => PathBuf::from(temp_name),
+        };
+        let mut temp_guard = TempFileGuard::new(temp_path.clone());
+
         let mut src_file = File::open(task.src_path)?;
-        let mut dest_file = OpenOptions::new()
+        let mut temp_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(task.dest_path)?;
+            .open(&temp_path)?;
 
         let mut hasher = blake3::Hasher::new();
         let mut total_bytes_copied: u64 = 0;
@@ -908,27 +959,45 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 Err(e) => return Err(SyncError::Io(e)),
             };
             hasher.update(&buf[..n]);
-            dest_file.write_all(&buf[..n])?;
+            temp_file.write_all(&buf[..n])?;
             total_bytes_copied += n as u64;
+        }
+
+        // Post-stream metadata re-verification (TOCTOU protection)
+        let post_meta = src_file.metadata()?;
+        let post_len = post_meta.len();
+        let post_mod = safe_modified_millis(&post_meta)?;
+        if post_len != total_bytes_copied || post_mod != task.src_mod {
+            tracing::warn!(
+                path = %task.rel_path.display(),
+                expected_len = total_bytes_copied,
+                post_len,
+                expected_mod = task.src_mod,
+                post_mod,
+                "Source small file modified concurrently during streaming; aborting sync"
+            );
+            return Err(SyncError::write_verification_failed(
+                task.dest_path.to_path_buf(),
+            ));
         }
 
         match self.config.verification_mode() {
             VerificationMode::Disabled => {}
             VerificationMode::MetadataAndFlush => {
-                let dest_meta = dest_file.metadata()?;
-                if dest_meta.len() != total_bytes_copied {
+                let temp_meta = temp_file.metadata()?;
+                if temp_meta.len() != total_bytes_copied {
                     return Err(SyncError::write_verification_failed(
                         task.dest_path.to_path_buf(),
                     ));
                 }
-                dest_file.sync_all()?;
+                temp_file.sync_all()?;
             }
             VerificationMode::Sampled | VerificationMode::Full => {
                 let src_hash = hasher.finalize();
-                dest_file.seek(SeekFrom::Start(0))?;
+                temp_file.seek(SeekFrom::Start(0))?;
                 let mut dest_hasher = blake3::Hasher::new();
                 loop {
-                    let n = match dest_file.read(buf) {
+                    let n = match temp_file.read(buf) {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -941,14 +1010,20 @@ impl<S: HashStore> LocalSyncEngine<S> {
                         task.dest_path.to_path_buf(),
                     ));
                 }
-                dest_file.sync_all()?;
+                temp_file.sync_all()?;
             }
         }
 
-        dest_file.set_times(
+        temp_file.set_times(
             fs::FileTimes::new()
                 .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod)),
         )?;
+
+        // Close file handle explicitly on Windows before rename
+        drop(temp_file);
+
+        fs::rename(&temp_path, task.dest_path)?;
+        temp_guard.disarm();
 
         let record = FileRecord {
             id: task.cached_id,
@@ -960,7 +1035,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             path = %task.rel_path.display(),
             target = %task.dest_dir.display(),
             size = total_bytes_copied,
-            "Synced file to destination"
+            "Synced file to destination via atomic staging"
         );
         Ok((record, Vec::new()))
     }
@@ -4873,5 +4948,108 @@ mod tests {
         let outcome = engine.run_full_scan().unwrap();
         assert!(matches!(outcome, ScanOutcome::Success { synced: 1 }));
         assert!(alt_dst.join("hello.txt").exists());
+    }
+
+    #[test]
+    fn test_sync_small_file_atomic_staging_no_partial_destination() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(512)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        // Pre-create destination file with original content
+        let dst_file = dst.join("target.txt");
+        fs::write(&dst_file, b"ORIGINAL_DESTINATION_CONTENT").unwrap();
+
+        // 1. Verify TempFileGuard behavior directly
+        let tmp_path = dst.join("manual.syncdir_tmp");
+        fs::write(&tmp_path, b"temporary data").unwrap();
+        {
+            let _guard = TempFileGuard::new(tmp_path.clone());
+            assert!(tmp_path.exists());
+        }
+        assert!(
+            !tmp_path.exists(),
+            "Undisarmed TempFileGuard must remove file on drop"
+        );
+
+        let tmp_path2 = dst.join("disarmed.syncdir_tmp");
+        fs::write(&tmp_path2, b"temporary data 2").unwrap();
+        {
+            let mut guard = TempFileGuard::new(tmp_path2.clone());
+            guard.disarm();
+        }
+        assert!(
+            tmp_path2.exists(),
+            "Disarmed TempFileGuard must preserve file on drop"
+        );
+        fs::remove_file(&tmp_path2).unwrap();
+
+        // 2. Failure scenario: pass a stale src_mod timestamp (simulating concurrent mutation)
+        let src_file = src.join("target.txt");
+        fs::write(&src_file, b"NEW_CONTENT_THAT_SHOULD_FAIL").unwrap();
+        let task_failing = FileSyncTask {
+            rel_path: Path::new("target.txt"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dst,
+            src_size: 28,
+            src_mod: 999_999, // Stale mtime to trigger post-stream verification failure
+            cached_id: None,
+        };
+        let mut scratch = vec![0u8; 512];
+        let fail_res = engine.sync_small_file_core(&task_failing, &mut scratch);
+        assert!(
+            fail_res.is_err(),
+            "sync_small_file_core must fail when source mtime mismatch occurs"
+        );
+        // Destination MUST be preserved with original content (not overwritten or truncated)
+        assert_eq!(
+            fs::read(&dst_file).unwrap(),
+            b"ORIGINAL_DESTINATION_CONTENT",
+            "Destination file must remain untouched when sync fails"
+        );
+
+        // 3. Success scenario: valid metadata
+        let src_meta = fs::metadata(&src_file).unwrap();
+        let task_valid = FileSyncTask {
+            rel_path: Path::new("target.txt"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dst,
+            src_size: src_meta.len() as i64,
+            src_mod: safe_modified_millis(&src_meta).unwrap(),
+            cached_id: None,
+        };
+        let success_res = engine.sync_small_file_core(&task_valid, &mut scratch);
+        assert!(
+            success_res.is_ok(),
+            "sync_small_file_core should succeed with valid metadata: {success_res:?}"
+        );
+        assert_eq!(
+            fs::read(&dst_file).unwrap(),
+            b"NEW_CONTENT_THAT_SHOULD_FAIL",
+            "Destination file must have updated content after successful staged rename"
+        );
+
+        // 4. Verify no .syncdir_tmp orphans remain in destination directory
+        let tmp_orphans: Vec<_> = fs::read_dir(&dst)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".syncdir_tmp"))
+            .collect();
+        assert_eq!(
+            tmp_orphans.len(),
+            0,
+            "No .syncdir_tmp orphan files should remain in destination"
+        );
     }
 }
