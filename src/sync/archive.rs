@@ -1,0 +1,517 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::db::HashStore;
+use crate::error::SyncError;
+
+use super::engine::LocalSyncEngine;
+use super::path_safety::{
+    is_reparse_or_symlink, is_safe_relative_path, verify_destination_not_reparse,
+};
+
+/// Global atomic counter for unique archive path generation across threads and timestamps.
+static ARCHIVE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn prune_archive(
+    archive_dir: &Path,
+    max_age_days: u64,
+    max_bytes: u64,
+) -> Result<(), SyncError> {
+    if !archive_dir.exists() {
+        return Ok(());
+    }
+    let max_age = std::time::Duration::from_secs(max_age_days * 24 * 3600);
+    let now = SystemTime::now();
+
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+
+    fn collect_files(
+        dir: &Path,
+        files: &mut Vec<(PathBuf, u64, SystemTime)>,
+        total_bytes: &mut u64,
+        depth: usize,
+    ) -> std::io::Result<()> {
+        const MAX_ARCHIVE_DEPTH: usize = 32;
+        if depth > MAX_ARCHIVE_DEPTH {
+            tracing::warn!(path = %dir.display(), "Max archive directory depth exceeded, skipping");
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if is_reparse_or_symlink(&entry) {
+                tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in archive");
+                continue;
+            }
+            let ft = entry.file_type()?;
+            let path = entry.path();
+            if ft.is_dir() {
+                collect_files(&path, files, total_bytes, depth + 1)?;
+            } else if ft.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                let len = meta.len();
+                let mod_time = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                *total_bytes += len;
+                files.push((path, len, mod_time));
+            }
+        }
+        Ok(())
+    }
+
+    let _ = collect_files(archive_dir, &mut files, &mut total_bytes, 0);
+
+    // Evict files older than max_age_days
+    files.retain(|(path, len, mod_time)| {
+        if let Ok(age) = now.duration_since(*mod_time)
+            && age > max_age
+            && fs::remove_file(path).is_ok()
+        {
+            total_bytes = total_bytes.saturating_sub(*len);
+            return false;
+        }
+        true
+    });
+
+    // If total_bytes still exceeds max_bytes, evict oldest first
+    if total_bytes > max_bytes {
+        files.sort_by_key(|(_, _, m)| *m);
+        for (path, len, _) in files {
+            if total_bytes <= max_bytes {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(len);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+impl<S: HashStore> LocalSyncEngine<S> {
+    /// Build the archive path: `<dest>/.syncdir_archive/<ts>_<relative_path>`.
+    pub(crate) fn get_archive_path(
+        &self,
+        dest_dir: &Path,
+        relative_path: &Path,
+        timestamp: &str,
+    ) -> Result<PathBuf, SyncError> {
+        let mut components = relative_path.components();
+        if let Some(first) = components.next() {
+            let first_str = first.as_os_str().to_string_lossy();
+            let prefixed = format!("{}_{}", timestamp, first_str);
+            let mut archive_rel = PathBuf::from(prefixed);
+            for rest in components {
+                archive_rel.push(rest);
+            }
+            Ok(dest_dir.join(".syncdir_archive").join(archive_rel))
+        } else {
+            Ok(dest_dir.join(".syncdir_archive"))
+        }
+    }
+
+    /// Handle deletion of a file on a specific destination directory.
+    pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
+        if !is_safe_relative_path(rel_path) {
+            return Err(SyncError::validation(format!(
+                "Unsafe path traversal detected: {}",
+                rel_path.display()
+            )));
+        }
+        let dest_path = dest_dir.join(rel_path);
+
+        if !dest_dir.exists() {
+            return Err(SyncError::Io(std::io::Error::from_raw_os_error(53)));
+        }
+
+        // Verify destination path does not traverse reparse points
+        verify_destination_not_reparse(dest_dir, rel_path)?;
+
+        match fs::metadata(&dest_path) {
+            Ok(_) => {
+                if self.config.propagate_deletions() {
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!("System clock error: {e}")))
+                        })?
+                        .as_millis();
+
+                    let nonce =
+                        ARCHIVE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10_000;
+                    let token = format!("{timestamp}_{nonce:04}");
+
+                    let mut archive_path = self.get_archive_path(dest_dir, rel_path, &token)?;
+                    let mut counter = 1u32;
+                    while archive_path.exists() {
+                        archive_path = self.get_archive_path(
+                            dest_dir,
+                            rel_path,
+                            &format!("{token}_{counter}"),
+                        )?;
+                        counter += 1;
+                    }
+
+                    if let Some(parent) = archive_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::rename(&dest_path, &archive_path)?;
+                }
+                self.db.delete_file(rel_path)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.db.delete_file(rel_path)?;
+            }
+            Err(e) => {
+                return Err(SyncError::Io(e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Prune old and excess files in the destination archive.
+    pub fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
+        let archive_dir = dest_dir.join(".syncdir_archive");
+        prune_archive(&archive_dir, 30, 10 * 1024 * 1024 * 1024)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, TargetSyncConfig};
+    use crate::db::{FileRecord, MockHashStore, SqliteHashStore};
+    use crate::sync::SyncEngine;
+    use tempfile::tempdir;
+
+    fn test_config(source: std::path::PathBuf, dest: std::path::PathBuf) -> Config {
+        Config::builder(source)
+            .dest_dir(dest)
+            .debounce_seconds(1)
+            .retry_interval_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(10)
+            .block_size_bytes(4)
+            .build()
+    }
+
+    #[cfg(windows)]
+    fn create_test_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        link.display(),
+                        target.display()
+                    ),
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(std::io::Error::other("Failed to create test junction"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_deletion_archive() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = test_config(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(&db_path, &config).unwrap();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // Sync a file first
+        fs::write(source.join("doomed.txt"), b"bye").unwrap();
+        engine.sync_file(Path::new("doomed.txt")).unwrap();
+        assert!(dest.join("doomed.txt").exists());
+
+        // Delete it
+        engine.delete_file(Path::new("doomed.txt")).unwrap();
+
+        // Original dest file should be gone
+        assert!(!dest.join("doomed.txt").exists());
+
+        // Should be in .syncdir_archive
+        let archive = dest.join(".syncdir_archive");
+        assert!(archive.exists());
+        let entries: Vec<_> = fs::read_dir(&archive)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let archived_name = entries[0].file_name().to_string_lossy().to_string();
+        assert!(archived_name.ends_with("_doomed.txt"));
+
+        // DB record should be gone
+        assert!(
+            engine
+                .db
+                .get_file(Path::new("doomed.txt"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_nested_directory_deletion_archive() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(source.join("subdir")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(&db_path, &config).unwrap();
+        let engine = LocalSyncEngine::new(store, config);
+
+        // Sync a nested file
+        fs::write(source.join("subdir").join("deep.txt"), b"nested content").unwrap();
+        engine.sync_file(Path::new("subdir/deep.txt")).unwrap();
+        assert!(dest.join("subdir").join("deep.txt").exists());
+
+        // Delete it
+        engine.delete_file(Path::new("subdir/deep.txt")).unwrap();
+
+        // Original should be gone
+        assert!(!dest.join("subdir").join("deep.txt").exists());
+
+        // Should be in .syncdir_archive with nested path preserved
+        let archive = dest.join(".syncdir_archive");
+        assert!(archive.exists());
+        let entries: Vec<_> = fs::read_dir(&archive)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let archived_entry = &entries[0];
+        let nested = archived_entry.path().join("deep.txt");
+        assert!(
+            nested.exists(),
+            "Archived nested file should preserve directory structure"
+        );
+    }
+
+    #[test]
+    fn test_prune_archive_retention() {
+        let temp = tempdir().unwrap();
+        let archive = temp.path().join(".syncdir_archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let f1 = archive.join("old.txt");
+        let f2 = archive.join("new.txt");
+        std::fs::write(&f1, vec![0u8; 100]).unwrap();
+        std::fs::write(&f2, vec![0u8; 200]).unwrap();
+
+        // Prune with max_bytes = 150
+        prune_archive(&archive, 365, 150).unwrap();
+        let total_remaining: u64 = std::fs::read_dir(&archive)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(total_remaining <= 150);
+    }
+
+    #[test]
+    fn test_prune_archive_depth_limit_32() {
+        let temp = tempdir().unwrap();
+        let archive = temp.path().join(".syncdir_archive");
+        let mut deep = archive.clone();
+        for i in 0..35 {
+            deep = deep.join(format!("level_{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let deep_file = deep.join("deep.txt");
+        std::fs::write(&deep_file, vec![0u8; 1000]).unwrap();
+
+        prune_archive(&archive, 365, 100).unwrap();
+        assert!(deep_file.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_prune_archive_ignores_symlinks_and_junctions() {
+        let temp = tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("important.txt");
+        std::fs::write(&outside_file, vec![0u8; 500]).unwrap();
+
+        let archive = temp.path().join(".syncdir_archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let link = archive.join("junction_link");
+
+        if create_test_junction(&outside, &link).is_ok() {
+            prune_archive(&archive, 365, 100).unwrap();
+            assert!(outside_file.exists());
+        }
+    }
+
+    #[test]
+    fn test_archive_path_nonce_uniqueness_concurrent() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let engine = std::sync::Arc::new(LocalSyncEngine::new(MockHashStore::new(), target_cfg));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(50));
+        let mut handles = Vec::new();
+
+        for i in 0..50 {
+            let engine = engine.clone();
+            let barrier = barrier.clone();
+            let dst = dst.clone();
+            handles.push(std::thread::spawn(move || {
+                let file_name = format!("file_{i}.txt");
+                let file_path = dst.join(&file_name);
+                std::fs::write(&file_path, format!("content {i}")).unwrap();
+                barrier.wait();
+                engine
+                    .delete_file_from_dest(Path::new(&file_name), &dst)
+                    .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let archive_dir = dst.join(".syncdir_archive");
+        let archived_entries: Vec<_> = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+
+        assert_eq!(
+            archived_entries.len(),
+            50,
+            "All 50 files must be archived into distinct files without collisions"
+        );
+
+        for entry in archived_entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let parts: Vec<&str> = name.split('_').collect();
+            assert!(
+                parts.len() >= 3,
+                "Archive filename '{name}' must have format '<ts>_<nonce>_<filename>'"
+            );
+            assert_eq!(
+                parts[1].len(),
+                4,
+                "Nonce component '{}' must be 4 digits",
+                parts[1]
+            );
+            assert!(
+                parts[1].chars().all(|c| c.is_ascii_digit()),
+                "Nonce component '{}' must be numeric",
+                parts[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_conditional_db_deletion_on_dest_state() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        // Case 1: Destination file exists but has an exclusive lock
+        let locked_file = dst.join("locked.txt");
+        std::fs::write(&locked_file, "secret").unwrap();
+        let rec1 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("locked.txt"),
+            file_size: 6,
+            last_modified: 100,
+        };
+        store.save_file(&rec1, &[]).unwrap();
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _exclusive_handle = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked_file)
+                .unwrap();
+
+            let res = engine.delete_file_from_dest(Path::new("locked.txt"), &dst);
+            assert!(
+                res.is_err(),
+                "delete_file_from_dest must fail on locked/inaccessible destination"
+            );
+            assert!(
+                store.get_file(Path::new("locked.txt")).unwrap().is_some(),
+                "DB record must be retained when destination is locked/inaccessible"
+            );
+        }
+
+        // Case 2: Destination file is genuinely absent (NotFound)
+        let rec2 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("absent.txt"),
+            file_size: 10,
+            last_modified: 200,
+        };
+        store.save_file(&rec2, &[]).unwrap();
+        assert!(store.get_file(Path::new("absent.txt")).unwrap().is_some());
+
+        let res = engine.delete_file_from_dest(Path::new("absent.txt"), &dst);
+        assert!(
+            res.is_ok(),
+            "delete_file_from_dest must succeed when file is NotFound"
+        );
+        assert!(
+            store.get_file(Path::new("absent.txt")).unwrap().is_none(),
+            "DB record must be deleted when destination file is confirmed NotFound"
+        );
+
+        // Case 3: Destination file exists with propagate_deletions = false
+        let unprop_file = dst.join("unprop.txt");
+        std::fs::write(&unprop_file, "data").unwrap();
+        let config_no_prop = Config::builder(src)
+            .dest_dir(dst.clone())
+            .propagate_deletions(false)
+            .build();
+        let target_cfg_no_prop = TargetSyncConfig::from_config(&config_no_prop, dst.clone());
+        let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
+        let rec3 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("unprop.txt"),
+            file_size: 4,
+            last_modified: 300,
+        };
+        store.save_file(&rec3, &[]).unwrap();
+        assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_some());
+
+        let res = engine_no_prop.delete_file_from_dest(Path::new("unprop.txt"), &dst);
+        assert!(res.is_ok());
+        assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_none());
+        assert!(unprop_file.exists());
+    }
+}
