@@ -64,7 +64,7 @@ pub static STATUS_RGBA: [[u8; ICON_BUFFER_LEN]; EngineStatus::COUNT] = [
 /// Retrieve a reference to the static compile-time RGBA buffer for a status.
 #[inline]
 #[must_use]
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn status_rgba(status: EngineStatus) -> &'static [u8; ICON_BUFFER_LEN] {
     &STATUS_RGBA[status.index()]
 }
