@@ -63,7 +63,7 @@ impl DirectoryWatcher {
     }
 
     /// Dispatches a filesystem notification event, translating paths relative to `source_root`.
-    pub fn dispatch_event(event: Event, source_root: &Path, tx: &Sender<SyncCommand>) {
+    pub(crate) fn dispatch_event(event: Event, source_root: &Path, tx: &Sender<SyncCommand>) {
         let send = |cmd: SyncCommand| -> bool {
             if let Err(e) = tx.send(cmd) {
                 tracing::error!(

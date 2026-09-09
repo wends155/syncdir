@@ -27,14 +27,17 @@ pub fn path_to_sqlite_key(path: &Path) -> Result<String, SyncError> {
         return Err(SyncError::validation("Path cannot be empty"));
     }
     // Normalize any backslashes to forward slashes for cross-platform SQLite storage
-    let key = s.replace('\\', "/");
-    let trimmed = key.trim_start_matches('/');
-    if trimmed.is_empty() {
+    let mut key = s.replace('\\', "/");
+    let trim_count = key.chars().take_while(|&c| c == '/').count();
+    if trim_count == key.len() {
         return Err(SyncError::validation(
             "Path cannot resolve to empty SQLite key",
         ));
     }
-    Ok(trimmed.to_string())
+    if trim_count > 0 {
+        key.drain(..trim_count);
+    }
+    Ok(key)
 }
 
 /// Minimal configuration parameters required by `SqliteHashStore`.
@@ -238,19 +241,15 @@ impl HashStore for SqliteHashStore {
         let tx = conn.transaction()?;
 
         // UPSERT preserves the rowid on conflict, keeping FK references stable.
-        tx.execute(
+        // RETURNING id retrieves the rowid in a single round-trip.
+        let file_id: i64 = tx.query_row(
             "INSERT INTO file_metadata (relative_path, file_size, last_modified) \
              VALUES (?1, ?2, ?3) \
              ON CONFLICT(relative_path) DO UPDATE SET \
                file_size = excluded.file_size, \
-               last_modified = excluded.last_modified",
+               last_modified = excluded.last_modified \
+             RETURNING id",
             params![key, record.file_size, record.last_modified],
-        )?;
-
-        // Retrieve the stable rowid (works for both insert and update)
-        let file_id: i64 = tx.query_row(
-            "SELECT id FROM file_metadata WHERE relative_path = ?",
-            params![key],
             |row| row.get(0),
         )?;
 
@@ -309,7 +308,7 @@ impl HashStore for SqliteHashStore {
         let key = path_to_sqlite_key(path)?;
         let conn = self.conn()?;
         let mut stmt = conn.prepare_cached(
-            "DELETE FROM file_metadata WHERE relative_path = ?1 OR relative_path LIKE ?1 || '/%'",
+            "DELETE FROM file_metadata WHERE relative_path = ?1 OR substr(relative_path, 1, length(?1) + 1) = ?1 || '/'",
         )?;
         stmt.execute(params![key])?;
         Ok(())
@@ -842,6 +841,65 @@ mod tests {
                 .get_file(Path::new("other/file3.txt"))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn test_delete_file_escapes_like_wildcards() {
+        let temp = NamedTempFile::new().unwrap();
+        let store = SqliteHashStore::new(temp.path(), &dummy_config(1024)).unwrap();
+
+        let r1 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("test_1/file.txt"),
+            file_size: 100,
+            last_modified: 1000,
+        };
+        let r2 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("test-1/file.txt"),
+            file_size: 200,
+            last_modified: 2000,
+        };
+        let r3 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("test%1/file.txt"),
+            file_size: 300,
+            last_modified: 3000,
+        };
+        let r4 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("test_1_extra/file.txt"),
+            file_size: 400,
+            last_modified: 4000,
+        };
+
+        store.save_file(&r1, &[[1u8; 32]]).unwrap();
+        store.save_file(&r2, &[[2u8; 32]]).unwrap();
+        store.save_file(&r3, &[[3u8; 32]]).unwrap();
+        store.save_file(&r4, &[[4u8; 32]]).unwrap();
+
+        // Delete "test_1" directory: should delete only "test_1/file.txt", NOT "test-1/file.txt", "test%1/file.txt", or "test_1_extra/file.txt"
+        store.delete_file(Path::new("test_1")).unwrap();
+
+        assert!(
+            store.get_file(Path::new("test_1/file.txt")).unwrap().is_none(),
+            "test_1/file.txt should have been deleted"
+        );
+        assert!(
+            store.get_file(Path::new("test-1/file.txt")).unwrap().is_some(),
+            "test-1/file.txt must NOT be deleted by test_1 delete"
+        );
+        assert!(
+            store.get_file(Path::new("test%1/file.txt")).unwrap().is_some(),
+            "test%1/file.txt must NOT be deleted by test_1 delete"
+        );
+        assert!(
+            store
+                .get_file(Path::new("test_1_extra/file.txt"))
+                .unwrap()
+                .is_some(),
+            "test_1_extra/file.txt must NOT be deleted by test_1 delete"
         );
     }
 }

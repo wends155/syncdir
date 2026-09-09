@@ -7,6 +7,105 @@ use crate::error::SyncError;
 use crate::path_util::normalize_path;
 use std::path::{Path, PathBuf};
 
+/// Network resolution abstraction for resolving alternate UNC paths and establishing SMB connections.
+pub trait NetworkResolver: Send + Sync {
+    /// Attempts to resolve an alternate path (e.g. drive letter to UNC path or vice versa).
+    fn try_resolve_alternate_path(&self, path: &Path) -> PathBuf;
+
+    /// Attempts to establish an SMB connection to a UNC network share.
+    ///
+    /// # Errors
+    /// Returns `SyncError` if the share is invalid or connection fails.
+    fn establish_smb_connection(&self, unc_path: &Path) -> Result<(), SyncError>;
+}
+
+/// Default Win32 production network resolver using OS APIs.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Win32NetworkResolver;
+
+impl NetworkResolver for Win32NetworkResolver {
+    fn try_resolve_alternate_path(&self, path: &Path) -> PathBuf {
+        try_resolve_alternate_path(path)
+    }
+
+    fn establish_smb_connection(&self, unc_path: &Path) -> Result<(), SyncError> {
+        establish_smb_connection(unc_path)
+    }
+}
+
+/// In-memory mock network resolver for testing without network dependencies.
+#[derive(Debug, Default, Clone)]
+pub struct MockNetworkResolver {
+    alternate_paths: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
+    recorded_calls: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    smb_failures: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, String>>>,
+}
+
+impl MockNetworkResolver {
+    /// Create a new empty `MockNetworkResolver`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set an alternate path mapping from `from` to `to`.
+    pub fn set_alternate_path(&self, from: impl Into<PathBuf>, to: impl Into<PathBuf>) {
+        self.alternate_paths
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(from.into(), to.into());
+    }
+
+    /// Configure an SMB connection failure for `unc`.
+    pub fn set_smb_failure(&self, unc: impl Into<PathBuf>, err_msg: impl Into<String>) {
+        self.smb_failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(unc.into(), err_msg.into());
+    }
+
+    /// Returns recorded paths queried via `try_resolve_alternate_path`.
+    pub fn recorded_resolutions(&self) -> Vec<PathBuf> {
+        self.recorded_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+impl NetworkResolver for MockNetworkResolver {
+    fn try_resolve_alternate_path(&self, path: &Path) -> PathBuf {
+        let p = path.to_path_buf();
+        self.recorded_calls
+            .lock()
+            .unwrap_or_else(|l| l.into_inner())
+            .push(p.clone());
+        if let Some(target) = self
+            .alternate_paths
+            .lock()
+            .unwrap_or_else(|l| l.into_inner())
+            .get(&p)
+        {
+            target.clone()
+        } else {
+            normalize_path(path)
+        }
+    }
+
+    fn establish_smb_connection(&self, unc_path: &Path) -> Result<(), SyncError> {
+        let p = unc_path.to_path_buf();
+        if let Some(err_msg) = self
+            .smb_failures
+            .lock()
+            .unwrap_or_else(|l| l.into_inner())
+            .get(&p)
+        {
+            Err(SyncError::validation(err_msg.clone()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Query Windows Win32 API `WNetGetConnectionW` to resolve a local drive letter (e.g. "R:")
 /// to its underlying remote UNC share path (e.g. "\\\\172.16.0.193\\share").
 /// Returns `None` on non-Windows platforms, unmapped drives, or API errors.
@@ -17,7 +116,7 @@ pub fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let mut buf = vec![0u16; 512];
+    let mut buf = [0u16; 512];
     let mut len = buf.len() as u32;
 
     #[link(name = "mpr")]
@@ -30,11 +129,12 @@ pub fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
     }
 
     // SAFETY: `local_name` is a null-terminated UTF-16 wide string pointing to a valid drive prefix.
-    // `buf` is pre-allocated with 512 `u16` elements and `len` accurately reflects its capacity.
+    // `buf` is a fixed-size stack array with 512 `u16` elements and `len` accurately reflects its capacity.
     // `WNetGetConnectionW` reads from `local_name` up to its null terminator and writes at most `len` elements to `buf`.
     let ret = unsafe { WNetGetConnectionW(local_name.as_ptr(), buf.as_mut_ptr(), &mut len) };
     if ret == 0 {
-        let unc_str = String::from_utf16_lossy(&buf[..len as usize])
+        let valid_len = (len as usize).min(buf.len());
+        let unc_str = String::from_utf16_lossy(&buf[..valid_len])
             .trim_matches('\0')
             .to_string();
         if !unc_str.is_empty() {
@@ -52,7 +152,7 @@ pub fn resolve_mapped_drive_unc(_drive_prefix: &str) -> Option<String> {
 /// Attempt to convert a path starting with a Windows drive letter into a full UNC network path.
 /// If the path starts with a drive letter and `WNetGetConnectionW` succeeds, returns the combined UNC path.
 /// Otherwise, returns the original normalized path unchanged.
-pub fn try_resolve_unc_path(path: &Path) -> PathBuf {
+pub fn try_resolve_unc_path(path: impl AsRef<Path>) -> PathBuf {
     let normalized = normalize_path(path);
     let s = normalized.to_string_lossy();
 
@@ -79,25 +179,17 @@ pub fn try_resolve_unc_path(path: &Path) -> PathBuf {
 /// Returns `SyncError::Validation` if the path is not a valid UNC path or share,
 /// or `SyncError::Io` if `WNetAddConnection2W` fails.
 #[cfg(target_os = "windows")]
-pub fn establish_smb_connection(unc_path: &Path) -> Result<(), SyncError> {
+pub fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
     use std::os::windows::ffi::OsStrExt;
-    let s = unc_path.to_string_lossy();
-    if !s.starts_with(r"\\") {
-        return Err(SyncError::Validation(format!(
-            "Path '{}' is not a UNC network path",
-            unc_path.display()
-        )));
-    }
-
-    // Extract root share e.g. "\\172.16.0.193\Files" or "\\172.16.0.193\ABB Industrial IT Data"
-    let parts: Vec<&str> = s[2..].split('\\').collect();
-    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
-        return Err(SyncError::validation(format!(
+    let unc_path = unc_path.as_ref();
+    let (host, share) = crate::path_util::parse_unc_host_and_share(unc_path).ok_or_else(|| {
+        SyncError::validation(format!(
             "UNC path '{}' does not contain a valid host and share name",
             unc_path.display()
-        )));
-    }
-    let unc_share = format!(r"\\{}\{}", parts[0], parts[1]);
+        ))
+    })?;
+
+    let unc_share = format!(r"\\{}\{}", host, share);
 
     let unc_share_w: Vec<u16> = std::ffi::OsStr::new(&unc_share)
         .encode_wide()
@@ -154,7 +246,14 @@ pub fn establish_smb_connection(unc_path: &Path) -> Result<(), SyncError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn establish_smb_connection(_unc_path: &Path) -> Result<(), SyncError> {
+pub fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
+    let unc_path = unc_path.as_ref();
+    if crate::path_util::parse_unc_host_and_share(unc_path).is_none() {
+        return Err(SyncError::validation(format!(
+            "UNC path '{}' does not contain a valid host and share name",
+            unc_path.display()
+        )));
+    }
     Err(SyncError::Validation(
         "SMB connection is only supported on Windows".into(),
     ))
@@ -195,7 +294,7 @@ fn find_prefix_byte_boundary(original: &str, lower_prefix: &str) -> Option<usize
 
 /// Reverse-lookup active Win32 mapped drive letters ('A'..='Z') to find a drive letter
 /// mapped to a prefix of the given UNC path.
-pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
+pub fn find_mapped_drive_for_unc(unc_path: impl AsRef<Path>) -> Option<PathBuf> {
     let normalized = normalize_path(unc_path);
     let original_str = normalized.to_string_lossy();
     let unc_str_lower = original_str.to_lowercase();
@@ -243,7 +342,7 @@ pub fn find_mapped_drive_for_unc(unc_path: &Path) -> Option<PathBuf> {
 ///    and `find_mapped_drive_for_unc`.
 ///
 /// Returns the resolved alternate path if accessible, or original normalized path.
-pub fn try_resolve_alternate_path(path: &Path) -> PathBuf {
+pub fn try_resolve_alternate_path(path: impl AsRef<Path>) -> PathBuf {
     let normalized = normalize_path(path);
 
     // If path is accessible directly, return normalized
@@ -329,5 +428,87 @@ mod tests {
             Some(orig.len())
         );
         assert_eq!(find_prefix_byte_boundary(orig, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_try_resolve_unc_path_unc_unchanged() {
+        let unc_path = Path::new(r"\\172.16.0.60\share\folder");
+        assert_eq!(try_resolve_unc_path(unc_path), unc_path);
+    }
+
+    #[test]
+    fn test_try_resolve_unc_path_mapped_or_unmapped_drive() {
+        let drive_path = Path::new(r"Z:\nonexistent_folder\subfolder");
+        let resolved = try_resolve_unc_path(drive_path);
+        if let Some(unc_base) = resolve_mapped_drive_unc("Z:") {
+            let expected = format!(
+                "{}\\{}",
+                unc_base.trim_end_matches('\\'),
+                r"nonexistent_folder\subfolder"
+            );
+            assert_eq!(resolved, PathBuf::from(expected));
+        } else {
+            assert_eq!(resolved, PathBuf::from(r"Z:\nonexistent_folder\subfolder"));
+        }
+
+        // Unmapped drive letter should return original normalized path
+        let unmapped_path = Path::new(r"Q:\test_folder\subfolder");
+        if resolve_mapped_drive_unc("Q:").is_none() {
+            assert_eq!(
+                try_resolve_unc_path(unmapped_path),
+                PathBuf::from(r"Q:\test_folder\subfolder")
+            );
+        }
+    }
+
+    #[test]
+    fn test_establish_smb_connection_non_unc() {
+        // Non-UNC path should safely return Err without crashing
+        assert!(establish_smb_connection(Path::new(r"C:\LocalFolder")).is_err());
+    }
+
+    #[test]
+    fn test_find_mapped_drive_boundary_no_false_match() {
+        // UNC path with non-existent host should safely return None
+        assert!(find_mapped_drive_for_unc(Path::new(r"\\nonexistent_host_12345\share")).is_none());
+    }
+
+    #[test]
+    fn test_try_resolve_alternate_path_local_unchanged() {
+        let local_path = Path::new(r"C:\Users\CITECT\Documents");
+        assert_eq!(
+            try_resolve_alternate_path(local_path),
+            normalize_path(local_path)
+        );
+    }
+
+    #[test]
+    fn test_mock_network_resolver_alternate_path() {
+        let resolver = MockNetworkResolver::new();
+        resolver.set_alternate_path(r"R:\data", r"\\server\share\data");
+
+        let resolved = resolver.try_resolve_alternate_path(Path::new(r"R:\data"));
+        assert_eq!(resolved, PathBuf::from(r"\\server\share\data"));
+
+        let unmapped = resolver.try_resolve_alternate_path(Path::new(r"C:\unmapped"));
+        assert_eq!(unmapped, PathBuf::from(r"C:\unmapped"));
+
+        let recorded = resolver.recorded_resolutions();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0], PathBuf::from(r"R:\data"));
+        assert_eq!(recorded[1], PathBuf::from(r"C:\unmapped"));
+    }
+
+    #[test]
+    fn test_mock_network_resolver_smb_failure() {
+        let resolver = MockNetworkResolver::new();
+        resolver.set_smb_failure(r"\\offline\share", "network unreachable");
+
+        assert!(resolver
+            .establish_smb_connection(Path::new(r"\\offline\share"))
+            .is_err());
+        assert!(resolver
+            .establish_smb_connection(Path::new(r"\\online\share"))
+            .is_ok());
     }
 }

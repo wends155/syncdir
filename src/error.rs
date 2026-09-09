@@ -28,6 +28,13 @@ pub enum SyncError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// Write verification failed for a path (data mismatch).
+    #[error("Write verification failed for: {path}")]
+    WriteVerificationFailed {
+        /// The path where verification failed.
+        path: std::path::PathBuf,
+    },
+
     /// Lock was poisoned.
     #[error("Lock poisoned: {0}")]
     LockPoison(
@@ -110,6 +117,11 @@ impl SyncError {
     /// Create a `SyncError::Validation` error.
     pub fn validation(msg: impl Into<String>) -> Self {
         SyncError::Validation(msg.into())
+    }
+
+    /// Create a `SyncError::WriteVerificationFailed` error.
+    pub fn write_verification_failed(path: impl Into<std::path::PathBuf>) -> Self {
+        SyncError::WriteVerificationFailed { path: path.into() }
     }
 
     /// Create a `SyncError::Db` without a source cause.
@@ -316,6 +328,13 @@ mod tests {
 
         let err = SyncError::registry("reg error");
         assert_eq!(err.to_string(), "Registry error: reg error");
+
+        let err = SyncError::write_verification_failed(std::path::PathBuf::from("test/file.txt"));
+        assert_eq!(
+            err.to_string(),
+            "Write verification failed for: test/file.txt"
+        );
+        assert!(matches!(err, SyncError::WriteVerificationFailed { .. }));
     }
 
     #[test]
