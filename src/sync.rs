@@ -1548,6 +1548,7 @@ impl From<bool> for SourceConnectivityTracker {
 pub struct DebounceQueue {
     pending_syncs: HashMap<PathBuf, Instant>,
     pending_deletes: HashMap<PathBuf, Instant>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(Instant, PathBuf)>>,
     max_capacity: usize,
 }
 
@@ -1557,6 +1558,7 @@ impl DebounceQueue {
         Self {
             pending_syncs: HashMap::new(),
             pending_deletes: HashMap::new(),
+            heap: std::collections::BinaryHeap::new(),
             max_capacity,
         }
     }
@@ -1571,7 +1573,9 @@ impl DebounceQueue {
             return false;
         }
         self.pending_deletes.remove(&path);
-        self.pending_syncs.insert(path, Instant::now() + debounce);
+        let dl = Instant::now() + debounce;
+        self.pending_syncs.insert(path.clone(), dl);
+        self.heap.push(std::cmp::Reverse((dl, path)));
         true
     }
 
@@ -1585,7 +1589,9 @@ impl DebounceQueue {
             return false;
         }
         self.pending_syncs.remove(&path);
-        self.pending_deletes.insert(path, Instant::now() + debounce);
+        let dl = Instant::now() + debounce;
+        self.pending_deletes.insert(path.clone(), dl);
+        self.heap.push(std::cmp::Reverse((dl, path)));
         true
     }
 
@@ -1619,21 +1625,41 @@ impl DebounceQueue {
 
     /// Re-enqueue a failed sync path for retry with a backoff delay.
     pub fn requeue_sync_retry(&mut self, path: PathBuf, delay: std::time::Duration) {
-        self.pending_syncs.insert(path, Instant::now() + delay);
+        let dl = Instant::now() + delay;
+        self.pending_syncs.insert(path.clone(), dl);
+        self.heap.push(std::cmp::Reverse((dl, path)));
     }
 
     /// Re-enqueue a failed delete path for retry with a backoff delay.
     pub fn requeue_delete_retry(&mut self, path: PathBuf, delay: std::time::Duration) {
-        self.pending_deletes.insert(path, Instant::now() + delay);
+        let dl = Instant::now() + delay;
+        self.pending_deletes.insert(path.clone(), dl);
+        self.heap.push(std::cmp::Reverse((dl, path)));
     }
 
     /// Calculate earliest deadline across all pending syncs and deletes.
-    pub fn earliest_deadline(&self) -> Option<Instant> {
-        self.pending_syncs
-            .values()
-            .chain(self.pending_deletes.values())
-            .copied()
-            .min()
+    ///
+    /// Uses min-heap top with lazy eviction of stale entries (whose deadline
+    /// was updated or path was drained).
+    pub fn earliest_deadline(&mut self) -> Option<Instant> {
+        while let Some(std::cmp::Reverse((deadline, path))) = self.heap.peek() {
+            let actual_deadline = self
+                .pending_syncs
+                .get(path)
+                .or_else(|| self.pending_deletes.get(path));
+            match actual_deadline {
+                Some(&d) if d == *deadline => return Some(*deadline),
+                _ => {
+                    self.heap.pop();
+                }
+            }
+        }
+        None
+    }
+
+    /// Return true if both pending sync and delete queues are empty.
+    pub fn is_empty(&self) -> bool {
+        self.pending_syncs.is_empty() && self.pending_deletes.is_empty()
     }
 
     /// Return count of pending syncs.
@@ -1644,6 +1670,11 @@ impl DebounceQueue {
     /// Return count of pending deletes.
     pub fn pending_delete_count(&self) -> usize {
         self.pending_deletes.len()
+    }
+
+    /// Return total count of pending syncs and deletes.
+    pub fn pending_count(&self) -> usize {
+        self.pending_syncs.len() + self.pending_deletes.len()
     }
 }
 
@@ -1821,6 +1852,7 @@ pub struct SyncWorkerContext<E: SyncEngine> {
     pub source_connectivity: SourceConnectivityTracker,
     pub resolver: std::sync::Arc<dyn crate::net::NetworkResolver>,
     pub cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub max_pending_queue: usize,
 }
 
 impl<E: SyncEngine> SyncWorkerContext<E> {
@@ -1842,7 +1874,14 @@ impl<E: SyncEngine> SyncWorkerContext<E> {
             source_connectivity: source_connectivity.into(),
             resolver: std::sync::Arc::new(crate::net::Win32NetworkResolver),
             cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_pending_queue: 50_000,
         }
+    }
+
+    /// Set a custom maximum pending queue capacity.
+    pub fn with_max_pending_queue(mut self, max_pending_queue: usize) -> Self {
+        self.max_pending_queue = max_pending_queue;
+        self
     }
 
     /// Set a custom network resolver.
@@ -1907,13 +1946,13 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
         source_connectivity,
         resolver,
         cancellation,
+        max_pending_queue,
     } = context;
 
-    const MAX_PENDING_QUEUE: usize = 50_000;
     std::thread::Builder::new()
         .name(format!("sync-worker-{}", target_index))
         .spawn(move || {
-            let mut queue = DebounceQueue::new(MAX_PENDING_QUEUE);
+            let mut queue = DebounceQueue::new(max_pending_queue);
             let mut reachability = ReachabilityMonitor::new(
                 target_index,
                 config.dest_dir().to_path_buf(),
@@ -1923,6 +1962,8 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
             let mut state = SyncWorkerState::new(config.block_size_bytes());
             let debounce_dur = std::time::Duration::from_secs(config.debounce_seconds());
             let retry_dur = std::time::Duration::from_secs(config.retry_interval_seconds());
+            let mut needs_catchup_scan = false;
+            let drain_threshold = 1_000.min(max_pending_queue / 2);
 
             loop {
                 if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1974,55 +2015,76 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     None => std::time::Duration::from_secs(1),
                 };
 
-                match rx.recv_timeout(timeout) {
-                    Ok(SyncCommand::FileModified(path)) => {
-                        queue.enqueue_sync(path, debounce_dur);
-                    }
-                    Ok(SyncCommand::FileDeleted(path)) => {
-                        queue.enqueue_delete(path, debounce_dur);
-                    }
-                    Ok(SyncCommand::TriggerFullScan) => {
-                        if source_connectivity.is_online() {
-                            match engine.run_cancellable_full_scan(&cancellation) {
-                                Ok(ScanOutcome::Success { synced }) => {
-                                    tracing::info!(synced, "Full scan completed successfully");
-                                    reachability.mark_online(observer.as_ref());
-                                }
-                                Ok(ScanOutcome::PartialFailure {
-                                    synced,
-                                    failed,
-                                    delete_failed,
-                                }) => {
-                                    tracing::warn!(
+                let mut cmd_opt = match rx.recv_timeout(timeout) {
+                    Ok(cmd) => Some(cmd),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+
+                while let Some(cmd) = cmd_opt {
+                    match cmd {
+                        SyncCommand::FileModified(path) => {
+                            if !queue.enqueue_sync(path.clone(), debounce_dur) {
+                                tracing::error!(
+                                    path = %path.display(),
+                                    target_index = target_index + 1,
+                                    "Debounce queue overflow on file modify; scheduling catchup scan"
+                                );
+                                needs_catchup_scan = true;
+                            }
+                        }
+                        SyncCommand::FileDeleted(path) => {
+                            if !queue.enqueue_delete(path.clone(), debounce_dur) {
+                                tracing::error!(
+                                    path = %path.display(),
+                                    target_index = target_index + 1,
+                                    "Debounce queue overflow on file delete; scheduling catchup scan"
+                                );
+                                needs_catchup_scan = true;
+                            }
+                        }
+                        SyncCommand::TriggerFullScan => {
+                            if source_connectivity.is_online() {
+                                match engine.run_cancellable_full_scan(&cancellation) {
+                                    Ok(ScanOutcome::Success { synced }) => {
+                                        tracing::info!(synced, "Full scan completed successfully");
+                                        reachability.mark_online(observer.as_ref());
+                                    }
+                                    Ok(ScanOutcome::PartialFailure {
                                         synced,
                                         failed,
                                         delete_failed,
-                                        target_path = %reachability.active_dest().display(),
-                                        "Full scan completed with partial sync failures"
-                                    );
-                                    reachability.mark_online(observer.as_ref());
+                                    }) => {
+                                        tracing::warn!(
+                                            synced,
+                                            failed,
+                                            delete_failed,
+                                            target_path = %reachability.active_dest().display(),
+                                            "Full scan completed with partial sync failures"
+                                        );
+                                        reachability.mark_online(observer.as_ref());
+                                    }
+                                    Ok(ScanOutcome::DestinationUnreachable) => {
+                                        tracing::warn!(
+                                            target_path = %reachability.active_dest().display(),
+                                            "Full scan aborted: destination is unreachable"
+                                        );
+                                        reachability.mark_offline(observer.as_ref());
+                                    }
+                                    Err(SyncError::Cancelled) => {
+                                        tracing::info!("Full scan cancelled");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Full scan execution failed");
+                                    }
                                 }
-                                Ok(ScanOutcome::DestinationUnreachable) => {
-                                    tracing::warn!(
-                                        target_path = %reachability.active_dest().display(),
-                                        "Full scan aborted: destination is unreachable"
-                                    );
-                                    reachability.mark_offline(observer.as_ref());
-                                }
-                                Err(SyncError::Cancelled) => {
-                                    tracing::info!("Full scan cancelled");
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Full scan execution failed");
-                                }
+                            } else {
+                                tracing::warn!("Skipping full scan: source directory is offline");
                             }
-                        } else {
-                            tracing::warn!("Skipping full scan: source directory is offline");
                         }
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    cmd_opt = rx.try_recv().ok();
                 }
 
                 let now = Instant::now();
@@ -2190,6 +2252,31 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                                     "Deletion permanently failed after 10 retries; evicting"
                                 );
                             }
+                        }
+                    }
+                }
+
+                if needs_catchup_scan
+                    && queue.pending_count() <= drain_threshold
+                    && source_connectivity.is_online()
+                    && reachability.is_dest_online()
+                {
+                    tracing::info!(
+                        target_index = target_index + 1,
+                        "Triggering catch-up full scan following queue overflow recovery"
+                    );
+                    match engine.run_cancellable_full_scan(&cancellation) {
+                        Ok(ScanOutcome::Success { .. }) | Ok(ScanOutcome::PartialFailure { .. }) => {
+                            needs_catchup_scan = false;
+                        }
+                        Ok(ScanOutcome::DestinationUnreachable) => {
+                            reachability.mark_offline(observer.as_ref());
+                        }
+                        Err(SyncError::Cancelled) => {
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Catch-up scan after queue overflow failed");
                         }
                     }
                 }
@@ -3545,6 +3632,66 @@ mod tests {
     }
 
     #[test]
+    fn test_debounce_queue_min_heap_correctness() {
+        let mut queue = DebounceQueue::new(10);
+        let pa = PathBuf::from("a.txt");
+        let pb = PathBuf::from("b.txt");
+        let pc = PathBuf::from("c.txt");
+        let pd = PathBuf::from("d.txt");
+
+        let t0 = Instant::now();
+        queue.enqueue_sync(pa.clone(), std::time::Duration::from_millis(50));
+        queue.enqueue_sync(pb.clone(), std::time::Duration::from_millis(10));
+        queue.enqueue_delete(pc.clone(), std::time::Duration::from_millis(30));
+
+        // pb should be earliest (~10ms)
+        let dl1 = queue.earliest_deadline().unwrap();
+        assert!(dl1 <= t0 + std::time::Duration::from_millis(20));
+
+        // Overwrite pb with later deadline (~100ms) -> pc should now be earliest (~30ms)
+        queue.enqueue_sync(pb.clone(), std::time::Duration::from_millis(100));
+        let dl2 = queue.earliest_deadline().unwrap();
+        assert!(dl2 <= t0 + std::time::Duration::from_millis(40));
+
+        // Requeue retry for pd (~5ms) -> pd should now be earliest
+        queue.requeue_sync_retry(pd.clone(), std::time::Duration::from_millis(5));
+        let dl3 = queue.earliest_deadline().unwrap();
+        assert!(dl3 <= t0 + std::time::Duration::from_millis(15));
+
+        // Drain up to 35ms -> pd (5ms) and pc (30ms) drained
+        let drained_sync = queue.drain_ready_syncs(t0 + std::time::Duration::from_millis(35));
+        assert_eq!(drained_sync, vec![pd]);
+        let drained_del = queue.drain_ready_deletes(t0 + std::time::Duration::from_millis(35));
+        assert_eq!(drained_del, vec![pc]);
+
+        // pa (~50ms) should now be earliest
+        let dl4 = queue.earliest_deadline().unwrap();
+        assert!(dl4 <= t0 + std::time::Duration::from_millis(60));
+    }
+
+    #[test]
+    fn test_debounce_queue_stress_10k_entries() {
+        let mut queue = DebounceQueue::new(20_000);
+        for i in 0..10_000 {
+            let path = PathBuf::from(format!("dir/file_{}.txt", i));
+            let delay = std::time::Duration::from_millis((i % 500 + 1) as u64);
+            queue.enqueue_sync(path, delay);
+        }
+
+        let start = Instant::now();
+        for _ in 0..1000 {
+            let dl = queue.earliest_deadline();
+            assert!(dl.is_some());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "1000 earliest_deadline queries on 10k items took {:?}, expected < 50ms (O(1) peek)",
+            elapsed
+        );
+    }
+
+    #[test]
     fn test_sync_worker_state_failure_tracking() {
         let mut state = SyncWorkerState::new(1024);
         assert_eq!(state.scratch.len(), 1024);
@@ -3647,6 +3794,64 @@ mod tests {
         );
         assert_eq!(engine.synced_calls().len(), 1);
         assert_eq!(engine.synced_calls()[0].0, PathBuf::from("data.txt"));
+    }
+
+    #[test]
+    fn test_queue_overflow_triggers_catchup_scan() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source)
+            .dest_dir(dest)
+            .debounce_seconds(0)
+            .retry_interval_seconds(0)
+            .build();
+
+        let engine = MockSyncEngine::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(0, config, engine.clone(), rx, None, source_online)
+            .with_max_pending_queue(5);
+        let handle = start_sync_worker(ctx).unwrap();
+
+        // Wait for initial catch-up full scan on destination startup
+        let start = Instant::now();
+        while engine.full_scans_count() == 0 && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let base_scans = engine.full_scans_count();
+        assert!(
+            base_scans >= 1,
+            "Initial scan on destination reconnect should complete"
+        );
+
+        // Enqueue 10 distinct file paths to trigger queue overflow (capacity is 5)
+        for i in 0..10 {
+            let _ = tx.send(SyncCommand::FileModified(PathBuf::from(format!(
+                "file_{}.txt",
+                i
+            ))));
+        }
+
+        // Wait for queue to drain and catchup scan to trigger
+        let start = Instant::now();
+        while engine.full_scans_count() <= base_scans
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        drop(tx);
+        handle.join().unwrap();
+
+        assert!(
+            engine.full_scans_count() > base_scans,
+            "Queue overflow must trigger an additional catchup full scan after queue drains"
+        );
     }
 
     #[test]
