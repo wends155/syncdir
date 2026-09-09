@@ -33,6 +33,21 @@ try {
     Write-Output "Repo: '$RepoRoot'"
     Write-Output ""
 
+    # Ensure Windows SDK rc.exe is discovered and added to PATH before quality gate and cargo builds
+    $RcCmd = Get-Command rc.exe -ErrorAction SilentlyContinue
+    if (-not $RcCmd) {
+        $SdkBin = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+        if (Test-Path $SdkBin) {
+            $RcPath = Get-ChildItem -Path $SdkBin -Filter "rc.exe" -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'x64\\rc\.exe$' } |
+                Select-Object -First 1
+            if ($RcPath) {
+                $env:PATH = "$($RcPath.DirectoryName);$env:PATH"
+                Write-Output "> Added Windows SDK rc.exe to PATH: $($RcPath.DirectoryName)"
+            }
+        }
+    }
+
     # Phase 1: Quality Gate Execution (Mandatory)
     Write-Output "## Phase 1: Quality Gate Verification"
     $QualityScript = Join-Path $RepoRoot "scripts\check-quality.ps1"
@@ -145,7 +160,7 @@ try {
     Write-Output "## Phase 6: SHA256 Checksum Generation"
     $Hash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLower()
     $ShaFile = "$ZipPath.sha256"
-    "$Hash  $ZipName" | Out-File -FilePath $ShaFile -Encoding utf8
+    [System.IO.File]::WriteAllText($ShaFile, "$Hash  $ZipName`n", [System.Text.UTF8Encoding]::new($false))
     Write-Output "> SHA256: $Hash"
     Write-Output "> Checksum file: '$ShaFile'"
     Write-Output ""
