@@ -288,6 +288,30 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Transient network drop signature purge in `delete_file_from_dest` eliminated.
 >   - Single-file unbatched SQLite transactions in `run_full_scan` replaced by batch persistence.
 
+---
+
+> 📝 **Context Update (2026-09-09):**
+> * **Feature:** Compile-Time Icon Generation & Tray Subsystem Hardening (Remediating All 13 Review Findings)
+> * **Changes:**
+>   - Extracted compile-time RGBA icon generation into pure leaf submodule [`src/tray/assets.rs`](file:///c:/Users/WSALIGAN/code/syncdir/src/tray/assets.rs) using `const fn generate_status_rgba`, embedding 5 deterministic 32×32 status bitmaps into static `.rdata` table `STATUS_RGBA: [[u8; 4096]; 5]` with zero runtime heap allocations.
+>   - Implemented zero-panic, non-poisoning icon cache provider (`get_cached_icon`) utilizing `OnceLock<[Icon; EngineStatus::COUNT]>` array lookup, eliminating SipHash overhead, 4KB heap re-allocations on query, and unwrap-in-production risks while providing graceful fallback to `Healthy` icon with warning diagnostics.
+>   - Embedded Windows application icon resource (`syncdir.ico`, 32×32 32bpp BGRA DIB + 1-bit mask) into the PE executable binary (`RT_GROUP_ICON`) via `build.rs` and `winres` build-dependency.
+>   - Added state-transition gating (`last_icon_status: Option<EngineStatus>`) in `TrayController::repaint`, eliminating redundant Win32 `Shell_NotifyIconW(NIM_MODIFY)` ALPC IPC overhead when status is unchanged, and updating status strictly on successful Win32 application.
+>   - Encapsulated user-facing display strings within `DestinationState` (`display_label: String` with getter `display_label(&self) -> &str`), and refactored both `TrayController::new` and `handle_status_update` to eliminate domain formatting duplication.
+>   - Hardened `scripts/build-release.ps1` by prepending early Windows Kits 10 SDK `rc.exe` discovery before Phase 1 quality gates and writing BOM-less UTF-8 SHA256 checksums in Phase 6.
+>   - Updated `architecture.md` Sections 4, 5, 6, and 12 to document `build.rs`, `syncdir.ico`, and `tray::assets` module boundaries and dependencies.
+>   - Expanded automated test suite to 238 passing tests (192 lib unit, 3 bin unit, 10 integration, 8 property, 20 snapshot, 5 doctests) with zero warnings, zero clippy lints, and zero AST grep violations.
+> * **New Constraints:**
+>   - Runtime image decoding/rasterization crates (e.g. `image`, `resvg`, `tiny-skia`) remain prohibited in `[dependencies]`.
+>   - Tray icon pixel buffers MUST be pre-evaluated at compile time into `.rdata` static arrays.
+>   - Production icon retrieval in `tray::assets` MUST remain zero-panic and never poison the global cache upon transient OS GDI errors.
+>   - Win32 tray repaint operations MUST gate `set_icon` on state transitions to minimize system shell ALPC IPC chatter.
+> * **Pruned:**
+>   - Monolithic procedural pixel rasterization in `src/tray.rs` eliminated.
+>   - SipHash-based `OnceLock<HashMap<EngineStatus, Icon>>` replaced by $O(1)$ array indexing.
+>   - Duplicated path and UNC label formatting across `TrayController` menu items eliminated.
+
+
 
 
 
