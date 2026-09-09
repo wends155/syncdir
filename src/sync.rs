@@ -792,10 +792,14 @@ pub(crate) struct FileSyncTask<'a> {
     pub src_path: &'a Path,
     pub dest_path: &'a Path,
     pub dest_dir: &'a Path,
+    #[allow(dead_code)]
     pub src_size: i64,
     pub src_mod: i64,
     pub cached_id: Option<i64>,
 }
+
+/// Global atomic counter for unique archive path generation across threads and timestamps.
+static ARCHIVE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl<S: HashStore> LocalSyncEngine<S> {
     /// Create a new sync engine with the given database and config.
@@ -869,7 +873,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         if let Some(parent) = task.dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(task.src_path, task.dest_path)?;
+        let bytes_copied = fs::copy(task.src_path, task.dest_path)?;
 
         if self.config.verify_writes() {
             verify_small_file_write(task.src_path, task.dest_path)?;
@@ -884,14 +888,14 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let record = FileRecord {
             id: task.cached_id,
             relative_path: task.rel_path.to_path_buf(),
-            file_size: task.src_size,
+            file_size: bytes_copied as i64,
             last_modified: task.src_mod,
         };
         self.db.save_file(&record, &[])?;
         tracing::info!(
             path = %task.rel_path.display(),
             target = %task.dest_dir.display(),
-            size = task.src_size,
+            size = bytes_copied,
             "Synced file to destination"
         );
         Ok(())
@@ -960,10 +964,49 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
         range.flush(&mut dest_file)?;
 
+        // Post-stream metadata re-verification (TOCTOU protection)
+        let post_meta = src_file.metadata()?;
+        let post_len = post_meta.len();
+        let post_mod = safe_modified_millis(&post_meta)?;
+        if post_len != total_bytes_read || post_mod != task.src_mod {
+            tracing::warn!(
+                path = %task.rel_path.display(),
+                expected_len = total_bytes_read,
+                post_len,
+                expected_mod = task.src_mod,
+                post_mod,
+                "Source file modified concurrently during delta streaming; aborting sync"
+            );
+            return Err(SyncError::write_verification_failed(
+                task.dest_path.to_path_buf(),
+            ));
+        }
+
+        // Validate destination length before verification (TOCTOU / remote corruption protection)
+        let dest_len_pre = dest_file.metadata()?.len();
+        if dest_len_pre < total_bytes_read {
+            tracing::warn!(
+                path = %task.rel_path.display(),
+                dest_len_pre,
+                total_bytes_read,
+                "Destination file is shorter than expected bytes read before truncation"
+            );
+            return Err(SyncError::write_verification_failed(
+                task.dest_path.to_path_buf(),
+            ));
+        }
+
         if self.config.verify_writes() {
             for &(b_idx, bytes_len, expected_hash) in &modified_block_indices {
                 dest_file.seek(SeekFrom::Start(b_idx * block_size))?;
-                dest_file.read_exact(&mut buffer[..bytes_len])?;
+                if dest_file.read_exact(&mut buffer[..bytes_len]).is_err() {
+                    return Err(SyncError::write_verification_failed_block(
+                        task.dest_path.to_path_buf(),
+                        b_idx,
+                        expected_hash,
+                        [0u8; 32],
+                    ));
+                }
                 let actual_hash = *blake3::hash(&buffer[..bytes_len]).as_bytes();
                 if actual_hash != expected_hash {
                     return Err(SyncError::write_verification_failed_block(
@@ -978,6 +1021,20 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         // Truncate to exact bytes read (TOCTOU protection)
         dest_file.set_len(total_bytes_read)?;
+
+        let dest_len_final = dest_file.metadata()?.len();
+        if dest_len_final != total_bytes_read {
+            tracing::warn!(
+                path = %task.rel_path.display(),
+                dest_len_final,
+                total_bytes_read,
+                "Destination length mismatch after set_len"
+            );
+            return Err(SyncError::write_verification_failed(
+                task.dest_path.to_path_buf(),
+            ));
+        }
+
         dest_file.set_times(
             fs::FileTimes::new()
                 .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod)),
@@ -1100,32 +1157,45 @@ impl<S: HashStore> LocalSyncEngine<S> {
         // Verify destination path does not traverse reparse points (Finding #11)
         verify_destination_not_reparse(dest_dir, rel_path)?;
 
-        if dest_path.exists() && self.config.propagate_deletions() {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| {
-                    SyncError::Io(std::io::Error::other(format!("System clock error: {e}")))
-                })?
-                .as_millis()
-                .to_string();
+        match fs::metadata(&dest_path) {
+            Ok(_) => {
+                if self.config.propagate_deletions() {
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|e| {
+                            SyncError::Io(std::io::Error::other(format!("System clock error: {e}")))
+                        })?
+                        .as_millis();
 
-            let mut archive_path = self.get_archive_path(dest_dir, rel_path, &timestamp)?;
-            let mut counter = 1u32;
-            while archive_path.exists() {
-                archive_path = self.get_archive_path(
-                    dest_dir,
-                    rel_path,
-                    &format!("{}_{}", timestamp, counter),
-                )?;
-                counter += 1;
-            }
+                    let nonce =
+                        ARCHIVE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10_000;
+                    let token = format!("{timestamp}_{nonce:04}");
 
-            if let Some(parent) = archive_path.parent() {
-                fs::create_dir_all(parent)?;
+                    let mut archive_path = self.get_archive_path(dest_dir, rel_path, &token)?;
+                    let mut counter = 1u32;
+                    while archive_path.exists() {
+                        archive_path = self.get_archive_path(
+                            dest_dir,
+                            rel_path,
+                            &format!("{token}_{counter}"),
+                        )?;
+                        counter += 1;
+                    }
+
+                    if let Some(parent) = archive_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::rename(&dest_path, &archive_path)?;
+                }
+                self.db.delete_file(rel_path)?;
             }
-            fs::rename(&dest_path, &archive_path)?;
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.db.delete_file(rel_path)?;
+            }
+            Err(e) => {
+                return Err(SyncError::Io(e));
+            }
         }
-        self.db.delete_file(rel_path)?;
         Ok(())
     }
 
@@ -3257,13 +3327,14 @@ mod tests {
         std::fs::write(src.join("file.bin"), vec![0x55u8; 1024]).unwrap();
         let src_file = src.join("file.bin");
         let dst_file = dst.join("file.bin");
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
         let task = FileSyncTask {
             rel_path: Path::new("file.bin"),
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
             src_size: 2048,
-            src_mod: 12345,
+            src_mod,
             cached_id: None,
         };
         engine.sync_delta_large_file(&task, &mut scratch).unwrap();
@@ -3294,17 +3365,351 @@ mod tests {
         std::fs::write(&src_file, vec![0xEE; 1024]).unwrap();
 
         let mut scratch = vec![0u8; 512];
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
         let task = FileSyncTask {
             rel_path: Path::new("large.bin"),
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
             src_size: 1024,
-            src_mod: 12345,
+            src_mod,
             cached_id: None,
         };
         assert!(engine.sync_delta_large_file(&task, &mut scratch).is_ok());
         assert_eq!(std::fs::read(&dst_file).unwrap(), vec![0xEE; 1024]);
+    }
+
+    #[test]
+    fn test_sync_delta_large_file_post_stream_metadata_reverification() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(512)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        let src_file = src.join("large.bin");
+        let dst_file = dst.join("large.bin");
+        std::fs::write(&src_file, vec![0xAA; 1024]).unwrap();
+
+        let mut scratch = vec![0u8; 512];
+        // Pass a stale src_mod timestamp that doesn't match actual file on disk
+        let task = FileSyncTask {
+            rel_path: Path::new("large.bin"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dst,
+            src_size: 1024,
+            src_mod: 999_999,
+            cached_id: None,
+        };
+        let result = engine.sync_delta_large_file(&task, &mut scratch);
+        assert!(
+            matches!(result, Err(SyncError::WriteVerificationFailed { .. })),
+            "Expected WriteVerificationFailed on post-stream metadata mismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_sync_delta_large_file_dest_len_mismatch_detected() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(512)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let src_file = src.join("large.bin");
+        let dst_file = dst.join("large.bin");
+
+        struct TruncatingMockStore {
+            inner: MockHashStore,
+            target_to_truncate: PathBuf,
+        }
+        impl HashStore for TruncatingMockStore {
+            fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
+                self.inner.get_file(path)
+            }
+            fn save_file(
+                &self,
+                record: &FileRecord,
+                hashes: &[crate::db::BlockHash],
+            ) -> Result<(), SyncError> {
+                self.inner.save_file(record, hashes)
+            }
+            fn get_block_hashes(
+                &self,
+                path: &Path,
+            ) -> Result<Vec<crate::db::BlockHash>, SyncError> {
+                let f = OpenOptions::new()
+                    .write(true)
+                    .open(&self.target_to_truncate)
+                    .unwrap();
+                f.set_len(512).unwrap();
+                self.inner.get_block_hashes(path)
+            }
+            fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
+                self.inner.delete_file(path)
+            }
+            fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+                self.inner.list_files()
+            }
+            fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
+                self.inner.list_all_records()
+            }
+            fn save_files_batch(
+                &self,
+                records: &[(&FileRecord, &[crate::db::BlockHash])],
+            ) -> Result<(), SyncError> {
+                self.inner.save_files_batch(records)
+            }
+        }
+
+        let store = MockHashStore::new();
+        let h0 = *blake3::hash(&[0xEE; 512]).as_bytes();
+        let h1 = *blake3::hash(&[0xEE; 512]).as_bytes();
+        let rec = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("large.bin"),
+            file_size: 1024,
+            last_modified: 100,
+        };
+        store.save_file(&rec, &[h0, h1]).unwrap();
+
+        let trunc_store = TruncatingMockStore {
+            inner: store,
+            target_to_truncate: dst_file.clone(),
+        };
+        let engine = LocalSyncEngine::new(trunc_store, target_cfg);
+
+        // Pre-create destination with 1024 bytes matching source
+        std::fs::write(&src_file, vec![0xEE; 1024]).unwrap();
+        std::fs::write(&dst_file, vec![0xEE; 1024]).unwrap();
+
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
+        let task = FileSyncTask {
+            rel_path: Path::new("large.bin"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dst,
+            src_size: 1024,
+            src_mod,
+            cached_id: Some(1),
+        };
+
+        let mut scratch = vec![0u8; 512];
+        let result = engine.sync_delta_large_file(&task, &mut scratch);
+        assert!(
+            matches!(result, Err(SyncError::WriteVerificationFailed { .. })),
+            "Expected WriteVerificationFailed when destination length is corrupted/truncated, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_sync_small_file_records_actual_bytes_copied() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(512)
+            .verify_writes(false)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        let src_file = src.join("small.txt");
+        let dst_file = dst.join("small.txt");
+        std::fs::write(&src_file, vec![0x42; 500]).unwrap();
+
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
+        let task = FileSyncTask {
+            rel_path: Path::new("small.txt"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dst,
+            src_size: 1000,
+            src_mod,
+            cached_id: None,
+        };
+
+        engine.sync_small_file(&task).unwrap();
+        let record = store.get_file(Path::new("small.txt")).unwrap().unwrap();
+        assert_eq!(
+            record.file_size, 500,
+            "Saved record must use actual bytes copied (500), not stale task.src_size (1000)"
+        );
+    }
+
+    #[test]
+    fn test_archive_path_nonce_uniqueness_concurrent() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let engine = std::sync::Arc::new(LocalSyncEngine::new(MockHashStore::new(), target_cfg));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(50));
+        let mut handles = Vec::new();
+
+        for i in 0..50 {
+            let engine = engine.clone();
+            let barrier = barrier.clone();
+            let dst = dst.clone();
+            handles.push(std::thread::spawn(move || {
+                let file_name = format!("file_{i}.txt");
+                let file_path = dst.join(&file_name);
+                std::fs::write(&file_path, format!("content {i}")).unwrap();
+                barrier.wait();
+                engine
+                    .delete_file_from_dest(Path::new(&file_name), &dst)
+                    .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let archive_dir = dst.join(".syncdir_archive");
+        let archived_entries: Vec<_> = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+
+        assert_eq!(
+            archived_entries.len(),
+            50,
+            "All 50 files must be archived into distinct files without collisions"
+        );
+
+        // Verify that every archive filename contains a 4-digit nonce pattern
+        for entry in archived_entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let parts: Vec<&str> = name.split('_').collect();
+            assert!(
+                parts.len() >= 3,
+                "Archive filename '{name}' must have format '<ts>_<nonce>_<filename>'"
+            );
+            assert_eq!(
+                parts[1].len(),
+                4,
+                "Nonce component '{}' must be 4 digits",
+                parts[1]
+            );
+            assert!(
+                parts[1].chars().all(|c| c.is_ascii_digit()),
+                "Nonce component '{}' must be numeric",
+                parts[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_conditional_db_deletion_on_dest_state() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        // Case 1: Destination file exists but has an exclusive lock (transient/sharing error)
+        let locked_file = dst.join("locked.txt");
+        std::fs::write(&locked_file, "secret").unwrap();
+        let rec1 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("locked.txt"),
+            file_size: 6,
+            last_modified: 100,
+        };
+        store.save_file(&rec1, &[]).unwrap();
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _exclusive_handle = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked_file)
+                .unwrap();
+
+            let res = engine.delete_file_from_dest(Path::new("locked.txt"), &dst);
+            assert!(
+                res.is_err(),
+                "delete_file_from_dest must fail on locked/inaccessible destination"
+            );
+            assert!(
+                store.get_file(Path::new("locked.txt")).unwrap().is_some(),
+                "DB record must be retained when destination is locked/inaccessible"
+            );
+        }
+
+        // Case 2: Destination file is genuinely absent (NotFound)
+        let rec2 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("absent.txt"),
+            file_size: 10,
+            last_modified: 200,
+        };
+        store.save_file(&rec2, &[]).unwrap();
+        assert!(store.get_file(Path::new("absent.txt")).unwrap().is_some());
+
+        let res = engine.delete_file_from_dest(Path::new("absent.txt"), &dst);
+        assert!(
+            res.is_ok(),
+            "delete_file_from_dest must succeed when file is NotFound"
+        );
+        assert!(
+            store.get_file(Path::new("absent.txt")).unwrap().is_none(),
+            "DB record must be deleted when destination file is confirmed NotFound"
+        );
+
+        // Case 3: Destination file exists with propagate_deletions = false -> DB record deleted, file left intact
+        let unprop_file = dst.join("unprop.txt");
+        std::fs::write(&unprop_file, "data").unwrap();
+        let config_no_prop = Config::builder(src)
+            .dest_dir(dst.clone())
+            .propagate_deletions(false)
+            .build();
+        let target_cfg_no_prop = TargetSyncConfig::from_config(&config_no_prop, dst.clone());
+        let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
+        let rec3 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("unprop.txt"),
+            file_size: 4,
+            last_modified: 300,
+        };
+        store.save_file(&rec3, &[]).unwrap();
+        assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_some());
+
+        let res = engine_no_prop.delete_file_from_dest(Path::new("unprop.txt"), &dst);
+        assert!(res.is_ok());
+        assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_none());
+        assert!(unprop_file.exists());
     }
 
     #[cfg(windows)]
