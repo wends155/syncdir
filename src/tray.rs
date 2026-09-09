@@ -1,13 +1,53 @@
 use crate::error::SyncError;
 use crate::sync::{ConnectivityState, WatcherState};
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use winit::event::Event;
 use winit::event_loop::ControlFlow;
+
+/// Open a file or directory in the system default application.
+///
+/// Strictly verifies that `%SystemRoot%\explorer.exe` exists as a file
+/// before executing on Windows, preventing command hijack attacks.
+pub(crate) fn open_path(path: &Path) -> Result<(), SyncError> {
+    if !path.exists() {
+        return Err(SyncError::validation(format!(
+            "Path does not exist: {}",
+            path.display()
+        )));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let explorer = crate::config::system_root().join("explorer.exe");
+        if !explorer.is_file() {
+            return Err(SyncError::validation(format!(
+                "Explorer executable not found at {}",
+                explorer.display()
+            )));
+        }
+        std::process::Command::new(explorer)
+            .arg(path)
+            .spawn()
+            .map_err(SyncError::Io)?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(opener)
+            .arg(path)
+            .spawn()
+            .map_err(SyncError::Io)?;
+    }
+    Ok(())
+}
 
 /// Status of the background sync engine.
 ///
@@ -43,14 +83,32 @@ pub enum TrayExitReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestinationState {
     pub path: PathBuf,
-    pub is_online: bool,
+    pub is_online: ConnectivityState,
+    pub resolved_unc: Option<PathBuf>,
+}
+
+impl DestinationState {
+    /// Create a new DestinationState with path and online reachability.
+    pub fn new(path: impl Into<PathBuf>, is_online: impl Into<ConnectivityState>) -> Self {
+        Self {
+            path: path.into(),
+            is_online: is_online.into(),
+            resolved_unc: None,
+        }
+    }
+
+    /// Builder method to attach a resolved alternate UNC path.
+    pub fn with_resolved_unc(mut self, resolved_unc: impl Into<Option<PathBuf>>) -> Self {
+        self.resolved_unc = resolved_unc.into();
+        self
+    }
 }
 
 /// Per-target status report sent from worker threads to the tray event loop.
 #[derive(Debug, Clone)]
 pub struct TargetStatusUpdate {
     pub target_index: usize,
-    pub dest_online: bool,
+    pub dest_online: ConnectivityState,
 }
 
 /// Custom winit user event to wake up the loop on tray interactions and status updates.
@@ -77,17 +135,26 @@ pub enum UserEvent {
 pub struct TrayState {
     source_online: ConnectivityState,
     watcher_active: WatcherState,
-    dest_online: Vec<bool>,
+    dest_online: Vec<ConnectivityState>,
+    scan_notice: Option<String>,
 }
 
 impl TrayState {
     /// Create a new TrayState with initial destination reachability states.
-    pub fn new(initial_dest_online: Vec<bool>) -> Self {
+    pub fn new(
+        initial_dest_online: impl IntoIterator<Item = impl Into<ConnectivityState>>,
+    ) -> Self {
         Self {
             source_online: ConnectivityState::Offline,
             watcher_active: WatcherState::Inactive,
-            dest_online: initial_dest_online,
+            dest_online: initial_dest_online.into_iter().map(Into::into).collect(),
+            scan_notice: None,
         }
+    }
+
+    /// Create an empty TrayState with no destinations.
+    pub fn empty() -> Self {
+        Self::new(Vec::<ConnectivityState>::new())
     }
 
     /// Access whether the source directory is currently online.
@@ -111,15 +178,20 @@ impl TrayState {
     }
 
     /// Access the per-destination online reachability slice.
-    pub fn dest_online(&self) -> &[bool] {
+    pub fn dest_online(&self) -> &[ConnectivityState] {
         &self.dest_online
     }
 
     /// Update target destination reachability by index.
-    pub fn update_target_status(&mut self, target_index: usize, online: bool) -> bool {
+    pub fn update_target_status(
+        &mut self,
+        target_index: usize,
+        state: impl Into<ConnectivityState>,
+    ) -> bool {
+        let conn_state = state.into();
         if target_index < self.dest_online.len() {
-            let changed = self.dest_online[target_index] != online;
-            self.dest_online[target_index] = online;
+            let changed = self.dest_online[target_index] != conn_state;
+            self.dest_online[target_index] = conn_state;
             changed
         } else {
             false
@@ -151,11 +223,26 @@ impl TrayState {
         self.update_watcher_status(source_online.into(), watcher_active.into())
     }
 
+    /// Set an optional scan notice (e.g. "Partial Scan (N skipped)").
+    pub fn set_scan_notice(&mut self, notice: Option<String>) -> bool {
+        let changed = self.scan_notice != notice;
+        self.scan_notice = notice;
+        changed
+    }
+
+    /// Access the current scan notice if any.
+    pub fn scan_notice(&self) -> Option<&str> {
+        self.scan_notice.as_deref()
+    }
+
     /// Calculate the overall engine health status based on current state.
     pub fn overall_status(&self) -> EngineStatus {
-        let all_dest_online =
-            !self.dest_online.is_empty() && self.dest_online.iter().all(|&online| online);
-        let any_dest_online = self.dest_online.iter().any(|&online| online);
+        let all_dest_online = !self.dest_online.is_empty()
+            && self
+                .dest_online
+                .iter()
+                .all(|&online| online == ConnectivityState::Online);
+        let any_dest_online = self.dest_online.contains(&ConnectivityState::Online);
 
         if self.source_online != ConnectivityState::Online
             || self.watcher_active != WatcherState::Active
@@ -176,7 +263,10 @@ impl TrayState {
 
     /// Count how many destination targets are currently online.
     pub fn online_dest_count(&self) -> usize {
-        self.dest_online.iter().filter(|&&online| online).count()
+        self.dest_online
+            .iter()
+            .filter(|&&online| online == ConnectivityState::Online)
+            .count()
     }
 
     /// Generate the formatted tooltip text for the system tray icon.
@@ -186,12 +276,17 @@ impl TrayState {
             (ConnectivityState::Online, WatcherState::Inactive) => "Degraded",
             (ConnectivityState::Online, WatcherState::Active) => "Online",
         };
-        format!(
+        let mut text = format!(
             "syncdir — Src: {} | Dests: {}/{} Online",
             src_status_str,
             self.online_dest_count(),
             self.dest_online.len()
-        )
+        );
+        if let Some(notice) = &self.scan_notice {
+            text.push_str(" | ");
+            text.push_str(notice);
+        }
+        text
     }
 }
 
@@ -375,100 +470,331 @@ pub trait TrayActionHandler: Send + Sync + 'static {
 /// # Errors
 ///
 /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
+#[derive(Debug, Clone)]
+pub(crate) struct TrayMenuIds {
+    pub open_config_id: tray_icon::menu::MenuId,
+    pub reload_config_id: tray_icon::menu::MenuId,
+    pub view_logs_id: tray_icon::menu::MenuId,
+    pub sync_now_id: tray_icon::menu::MenuId,
+    pub startup_toggle_id: tray_icon::menu::MenuId,
+    pub about_id: tray_icon::menu::MenuId,
+    pub exit_id: tray_icon::menu::MenuId,
+}
+
+/// Encapsulates tray icon menus, event dispatching, and UI state synchronization.
+pub struct TrayController<H: TrayActionHandler + ?Sized> {
+    tray_icon: tray_icon::TrayIcon,
+    menu_ids: TrayMenuIds,
+    startup_toggle: CheckMenuItem,
+    dest_menu_items: Vec<MenuItem>,
+    destinations: Vec<DestinationState>,
+    state: TrayState,
+    handler: Arc<H>,
+    reload_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    is_reloading: Arc<std::sync::atomic::AtomicBool>,
+    exit_reason: Rc<Cell<TrayExitReason>>,
+}
+
+impl<H: TrayActionHandler + ?Sized> TrayController<H> {
+    /// Initialize the tray controller with menus, icons, and event proxies.
+    pub fn new(
+        event_loop: &winit::event_loop::EventLoop<UserEvent>,
+        destinations: Vec<DestinationState>,
+        handler: Arc<H>,
+        exit_reason: Rc<Cell<TrayExitReason>>,
+    ) -> Result<Self, SyncError> {
+        let open_config = MenuItem::new("Open Config", true, None);
+        let reload_config = MenuItem::new("Reload Config", true, None);
+        let view_logs = MenuItem::new("View Logs", true, None);
+        let sync_now = MenuItem::new("Sync Now", true, None);
+
+        let initially_checked = match handler.is_startup_enabled() {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to query startup registration status");
+                false
+            }
+        };
+        let startup_toggle =
+            CheckMenuItem::new("Start on System Startup", true, initially_checked, None);
+
+        let about = MenuItem::new("About", true, None);
+        let exit = MenuItem::new("Exit", true, None);
+
+        let menu = Menu::new();
+        menu.append(&open_config)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+        menu.append(&reload_config)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+        menu.append(&view_logs)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+        menu.append(&sync_now)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+        menu.append(&startup_toggle)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+
+        let mut dest_menu_items = Vec::new();
+        if !destinations.is_empty() {
+            let separator = PredefinedMenuItem::separator();
+            menu.append(&separator)
+                .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+
+            for d in &destinations {
+                let is_online = d.is_online == ConnectivityState::Online;
+                let indicator = if is_online { "●" } else { "○" };
+                let status_str = if is_online { "Online" } else { "Offline" };
+                let path_label = match &d.resolved_unc {
+                    Some(unc) => format!("{} -> {}", d.path.display(), unc.display()),
+                    None => format!("{}", d.path.display()),
+                };
+                let label = format!("{} {} ({})", indicator, path_label, status_str);
+                let item = MenuItem::new(&label, false, None); // Read-only / disabled
+                menu.append(&item)
+                    .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+                dest_menu_items.push(item);
+            }
+        }
+
+        let separator_exit = PredefinedMenuItem::separator();
+        menu.append(&separator_exit)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+        menu.append(&about)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+        menu.append(&exit)
+            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
+
+        let icon = generate_default_icon()?;
+        let tray_icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("syncdir — Folder Sync")
+            .with_icon(icon)
+            .build()
+            .map_err(|e| SyncError::tray_with_source("Failed to create tray icon", e))?;
+
+        let proxy = event_loop.create_proxy();
+        let reload_proxy = proxy.clone();
+        MenuEvent::set_event_handler(Some(move |event| {
+            let _ = proxy.send_event(UserEvent::Menu(event));
+        }));
+
+        let menu_ids = TrayMenuIds {
+            open_config_id: open_config.id().clone(),
+            reload_config_id: reload_config.id().clone(),
+            view_logs_id: view_logs.id().clone(),
+            sync_now_id: sync_now.id().clone(),
+            startup_toggle_id: startup_toggle.id().clone(),
+            about_id: about.id().clone(),
+            exit_id: exit.id().clone(),
+        };
+
+        let initial_dest_online = destinations.iter().map(|d| d.is_online).collect::<Vec<_>>();
+        let state = TrayState::new(initial_dest_online);
+        let is_reloading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        Ok(Self {
+            tray_icon,
+            menu_ids,
+            startup_toggle,
+            dest_menu_items,
+            destinations,
+            state,
+            handler,
+            reload_proxy,
+            is_reloading,
+            exit_reason,
+        })
+    }
+
+    /// Dispatch context menu selection events.
+    pub fn handle_menu_event(
+        &mut self,
+        menu_event: MenuEvent,
+        elwt: &winit::event_loop::EventLoopWindowTarget<UserEvent>,
+    ) {
+        if menu_event.id == self.menu_ids.exit_id {
+            MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+            elwt.exit();
+        } else if menu_event.id == self.menu_ids.sync_now_id {
+            if let Err(e) = self.handler.on_sync_now() {
+                tracing::error!(error = %e, "Manual sync failed");
+            } else {
+                tracing::info!("Manual sync triggered from tray menu");
+            }
+        } else if menu_event.id == self.menu_ids.open_config_id {
+            if let Err(e) = self.handler.on_open_config() {
+                let err_msg = format!("Failed to open config:\n\n{e}");
+                tracing::error!(error = %e, "Failed to open config file");
+                show_error_dialog("Open Config Error", &err_msg);
+            }
+        } else if menu_event.id == self.menu_ids.reload_config_id {
+            if self
+                .is_reloading
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                tracing::info!(
+                    "Reload Config requested via tray menu; offloading to background thread."
+                );
+                let handler_clone = self.handler.clone();
+                let proxy_clone = self.reload_proxy.clone();
+                let reloading_flag = self.is_reloading.clone();
+                let _ = std::thread::Builder::new()
+                    .name("config-reload".to_string())
+                    .spawn(move || {
+                        let res = handler_clone.on_reload_config();
+                        reloading_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        let _ = proxy_clone.send_event(UserEvent::ConfigReloadResult(res));
+                    });
+            } else {
+                tracing::warn!(
+                    "Configuration reload already in progress; ignoring duplicate request."
+                );
+            }
+        } else if menu_event.id == self.menu_ids.view_logs_id {
+            if let Err(e) = self.handler.on_view_logs() {
+                let err_msg = format!("Failed to open log directory:\n\n{e}");
+                tracing::error!(error = %e, "Failed to open log directory");
+                show_error_dialog("View Logs Error", &err_msg);
+            }
+        } else if menu_event.id == self.menu_ids.startup_toggle_id {
+            let is_checked = self.startup_toggle.is_checked();
+            match self.handler.on_toggle_startup(is_checked) {
+                Ok(actual_state) => {
+                    self.startup_toggle.set_checked(actual_state);
+                    tracing::info!(
+                        enabled = actual_state,
+                        "Startup auto-run toggled from tray menu"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Failed to toggle startup registration from tray"
+                    );
+                    self.startup_toggle.set_checked(!is_checked);
+                }
+            }
+        } else if menu_event.id == self.menu_ids.about_id {
+            show_about_dialog();
+        }
+    }
+
+    /// Handle the completion of an asynchronous configuration reload attempt.
+    pub fn handle_config_reload_result(
+        &mut self,
+        res: Result<(), SyncError>,
+        elwt: &winit::event_loop::EventLoopWindowTarget<UserEvent>,
+    ) {
+        match res {
+            Ok(()) => {
+                tracing::info!("Configuration validated successfully. Restarting daemon...");
+                MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+                self.exit_reason.set(TrayExitReason::Restart);
+                elwt.exit();
+            }
+            Err(e) => {
+                let err_msg = format!("Configuration reload error:\n\n{e}");
+                tracing::error!(error = %e, "Configuration reload failed");
+                show_error_dialog("Config Reload Error", &err_msg);
+            }
+        }
+    }
+
+    /// Update per-destination connectivity and repaint tray icon and menu item text.
+    pub fn handle_status_update(&mut self, update: TargetStatusUpdate) {
+        if self
+            .state
+            .update_target_status(update.target_index, update.dest_online)
+        {
+            if update.target_index < self.destinations.len() {
+                let d = &self.destinations[update.target_index];
+                let is_online = update.dest_online == ConnectivityState::Online;
+                let status_str = if is_online { "Online" } else { "Offline" };
+                let indicator = if is_online { "●" } else { "○" };
+                let path_label = match &d.resolved_unc {
+                    Some(unc) => format!("{} -> {}", d.path.display(), unc.display()),
+                    None => format!("{}", d.path.display()),
+                };
+                self.dest_menu_items[update.target_index]
+                    .set_text(format!("{} {} ({})", indicator, path_label, status_str));
+            }
+            self.repaint();
+        }
+    }
+
+    /// Update source connectivity and directory watcher active status.
+    pub fn handle_watcher_status(
+        &mut self,
+        source_online: ConnectivityState,
+        watcher_active: WatcherState,
+    ) {
+        if self
+            .state
+            .update_watcher_status(source_online, watcher_active)
+        {
+            self.repaint();
+        }
+    }
+
+    /// Re-render the tray icon and update its hover tooltip.
+    pub fn repaint(&mut self) {
+        let status = self.state.overall_status();
+        let new_tooltip = self.state.tooltip_text();
+        let _ = self.tray_icon.set_tooltip(Some(&new_tooltip));
+        if let Ok(new_icon) = get_cached_icon(status) {
+            let _ = self.tray_icon.set_icon(Some(new_icon));
+        }
+        tracing::info!(
+            status = ?status,
+            online_count = self.state.online_dest_count(),
+            "Tray status updated"
+        );
+    }
+
+    /// Retrieve the current exit reason.
+    pub fn exit_reason(&self) -> TrayExitReason {
+        self.exit_reason.get()
+    }
+
+    /// Read-only access to inner TrayState for inspection.
+    pub fn state(&self) -> &TrayState {
+        &self.state
+    }
+}
+
+/// Launch the system tray event loop (blocking).
+///
+/// Creates a tray icon in the Windows notification area with a checkable
+/// context menu and listens for user mouse interactions and directory status updates.
+///
+/// # Arguments
+///
+/// * `event_loop` - The winit event loop initialized on the main UI thread.
+/// * `destinations` - Initial destination states with reachability status.
+/// * `handler` - Handler dispatching user actions to the sync daemon and startup backend.
+///
+/// # Returns
+///
+/// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
+///
+/// # Errors
+///
+/// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
 pub fn run_tray<H: TrayActionHandler + ?Sized>(
     event_loop: winit::event_loop::EventLoop<UserEvent>,
     destinations: Vec<DestinationState>,
     handler: Arc<H>,
 ) -> Result<TrayExitReason, SyncError> {
-    let dests: Vec<PathBuf> = destinations.iter().map(|d| d.path.clone()).collect();
-    let initial_dest_online: Vec<bool> = destinations.iter().map(|d| d.is_online).collect();
-
-    let open_config = MenuItem::new("Open Config", true, None);
-    let reload_config = MenuItem::new("Reload Config", true, None);
-    let view_logs = MenuItem::new("View Logs", true, None);
-    let sync_now = MenuItem::new("Sync Now", true, None);
-
-    let initially_checked = match handler.is_startup_enabled() {
-        Ok(enabled) => enabled,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to query startup registration status");
-            false
-        }
-    };
-    let startup_toggle =
-        CheckMenuItem::new("Start on System Startup", true, initially_checked, None);
-
-    let about = MenuItem::new("About", true, None);
-    let exit = MenuItem::new("Exit", true, None);
-
-    let menu = Menu::new();
-    menu.append(&open_config)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-    menu.append(&reload_config)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-    menu.append(&view_logs)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-    menu.append(&sync_now)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-    menu.append(&startup_toggle)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-
-    // Add per-destination items
-    let mut dest_menu_items = Vec::new();
-    if !dests.is_empty() {
-        let separator = PredefinedMenuItem::separator();
-        menu.append(&separator)
-            .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-
-        for (i, d) in dests.iter().enumerate() {
-            let is_online = initial_dest_online.get(i).copied().unwrap_or(false);
-            let indicator = if is_online { "●" } else { "○" };
-            let status_str = if is_online { "Online" } else { "Offline" };
-            let label = format!("{} {} ({})", indicator, d.display(), status_str);
-            let item = MenuItem::new(&label, false, None); // Read-only / disabled
-            menu.append(&item)
-                .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-            dest_menu_items.push(item);
-        }
-    }
-
-    let separator_exit = PredefinedMenuItem::separator();
-    menu.append(&separator_exit)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-    menu.append(&about)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-    menu.append(&exit)
-        .map_err(|e| SyncError::tray_with_source("Failed to append menu item", e))?;
-
-    let icon = generate_default_icon()?;
-    let tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("syncdir — Folder Sync")
-        .with_icon(icon)
-        .build()
-        .map_err(|e| SyncError::tray_with_source("Failed to create tray icon", e))?;
-
-    // Set menu event handler to forward menu events to the event loop
-    let proxy = event_loop.create_proxy();
-    let reload_proxy = proxy.clone();
-    MenuEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::Menu(event));
-    }));
-
-    let open_config_id = open_config.id().clone();
-    let reload_config_id = reload_config.id().clone();
-    let view_logs_id = view_logs.id().clone();
-    let sync_now_id = sync_now.id().clone();
-    let startup_toggle_id = startup_toggle.id().clone();
-    let about_id = about.id().clone();
-    let exit_id = exit.id().clone();
-
-    let mut state = TrayState::new(initial_dest_online);
-    let mut needs_repaint = true;
     let exit_reason = Rc::new(Cell::new(TrayExitReason::UserExit));
-    let exit_reason_closure = exit_reason.clone();
+    let mut controller =
+        TrayController::new(&event_loop, destinations, handler, exit_reason.clone())?;
 
-    let is_reloading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    controller.repaint();
 
     event_loop
         .run(move |event, elwt| {
@@ -476,138 +802,21 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
 
             match event {
                 Event::UserEvent(UserEvent::Menu(menu_event)) => {
-                    if menu_event.id == exit_id {
-                        MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
-                        elwt.exit();
-                    } else if menu_event.id == sync_now_id {
-                        if let Err(e) = handler.on_sync_now() {
-                            tracing::error!(error = %e, "Manual sync failed");
-                        } else {
-                            tracing::info!("Manual sync triggered from tray menu");
-                        }
-                    } else if menu_event.id == open_config_id {
-                        if let Err(e) = handler.on_open_config() {
-                            let err_msg = format!("Failed to open config:\n\n{e}");
-                            tracing::error!(error = %e, "Failed to open config file");
-                            show_error_dialog("Open Config Error", &err_msg);
-                        }
-                    } else if menu_event.id == reload_config_id {
-                        if is_reloading
-                            .compare_exchange(
-                                false,
-                                true,
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::SeqCst,
-                            )
-                            .is_ok()
-                        {
-                            tracing::info!(
-                                "Reload Config requested via tray menu; offloading to background thread."
-                            );
-                            let handler_clone = handler.clone();
-                            let proxy_clone = reload_proxy.clone();
-                            let reloading_flag = is_reloading.clone();
-                            let _ = std::thread::Builder::new()
-                                .name("config-reload".to_string())
-                                .spawn(move || {
-                                    let res = handler_clone.on_reload_config();
-                                    reloading_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    let _ = proxy_clone
-                                        .send_event(UserEvent::ConfigReloadResult(res));
-                                });
-                        } else {
-                            tracing::warn!(
-                                "Configuration reload already in progress; ignoring duplicate request."
-                            );
-                        }
-                    } else if menu_event.id == view_logs_id {
-                        if let Err(e) = handler.on_view_logs() {
-                            let err_msg = format!("Failed to open log directory:\n\n{e}");
-                            tracing::error!(error = %e, "Failed to open log directory");
-                            show_error_dialog("View Logs Error", &err_msg);
-                        }
-                    } else if menu_event.id == startup_toggle_id {
-                        let is_checked = startup_toggle.is_checked();
-                        match handler.on_toggle_startup(is_checked) {
-                            Ok(actual_state) => {
-                                startup_toggle.set_checked(actual_state);
-                                tracing::info!(
-                                    enabled = actual_state,
-                                    "Startup auto-run toggled from tray menu"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "Failed to toggle startup registration from tray"
-                                );
-                                startup_toggle.set_checked(!is_checked);
-                            }
-                        }
-                    } else if menu_event.id == about_id {
-                        show_about_dialog();
-                    }
+                    controller.handle_menu_event(menu_event, elwt);
                 }
                 Event::UserEvent(UserEvent::ConfigReloadResult(res)) => {
-                    match res {
-                        Ok(()) => {
-                            tracing::info!(
-                                "Configuration validated successfully. Restarting daemon..."
-                            );
-                            MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
-                            exit_reason_closure.set(TrayExitReason::Restart);
-                            elwt.exit();
-                        }
-                        Err(e) => {
-                            let err_msg = format!("Configuration reload error:\n\n{e}");
-                            tracing::error!(error = %e, "Configuration reload failed");
-                            show_error_dialog("Config Reload Error", &err_msg);
-                        }
-                    }
+                    controller.handle_config_reload_result(res, elwt);
                 }
                 Event::UserEvent(UserEvent::StatusUpdate(update)) => {
-                    if state.update_target_status(update.target_index, update.dest_online) {
-                        if update.target_index < dests.len() {
-                            let d_path = &dests[update.target_index];
-                            let status_str = if update.dest_online {
-                                "Online"
-                            } else {
-                                "Offline"
-                            };
-                            let indicator = if update.dest_online { "●" } else { "○" };
-                            dest_menu_items[update.target_index].set_text(format!(
-                                "{} {} ({})",
-                                indicator,
-                                d_path.display(),
-                                status_str
-                            ));
-                        }
-                        needs_repaint = true;
-                    }
+                    controller.handle_status_update(update);
                 }
                 Event::UserEvent(UserEvent::WatcherStatus {
-                    source_online: so,
-                    watcher_active: wa,
+                    source_online,
+                    watcher_active,
                 }) => {
-                    needs_repaint = state.update_watcher_status(so, wa) || needs_repaint;
+                    controller.handle_watcher_status(source_online, watcher_active);
                 }
                 _ => {}
-            }
-
-            if needs_repaint {
-                needs_repaint = false;
-                let status = state.overall_status();
-                let new_tooltip = state.tooltip_text();
-
-                let _ = tray_icon.set_tooltip(Some(&new_tooltip));
-                if let Ok(new_icon) = get_cached_icon(status) {
-                    let _ = tray_icon.set_icon(Some(new_icon));
-                }
-                tracing::info!(
-                    status = ?status,
-                    online_count = state.online_dest_count(),
-                    "Tray status updated"
-                );
             }
         })
         .map_err(|e| SyncError::tray_with_source("Event loop error", e))?;
@@ -627,7 +836,10 @@ mod tests {
         assert_eq!(state.watcher_active(), false);
         assert_eq!(state.source_connectivity(), ConnectivityState::Offline);
         assert_eq!(state.watcher_state(), WatcherState::Inactive);
-        assert_eq!(state.dest_online, vec![true, false]);
+        assert_eq!(
+            state.dest_online,
+            vec![ConnectivityState::Online, ConnectivityState::Offline]
+        );
         assert_eq!(state.online_dest_count(), 1);
     }
 
@@ -701,12 +913,12 @@ mod tests {
     fn test_tray_state_update_target_out_of_bounds() {
         let mut state = TrayState::new(vec![true]);
         assert!(!state.update_target_status(5, false));
-        assert_eq!(state.dest_online(), &[true]);
+        assert_eq!(state.dest_online(), &[ConnectivityState::Online]);
     }
 
     #[test]
     fn test_tray_state_empty_destinations() {
-        let mut state = TrayState::new(vec![]);
+        let mut state = TrayState::empty();
         state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
         assert_eq!(state.overall_status(), EngineStatus::Healthy);
         assert_eq!(
@@ -733,5 +945,36 @@ mod tests {
         let not_changed =
             state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
         assert!(!not_changed);
+    }
+
+    #[test]
+    fn test_tray_open_path_nonexistent() {
+        let res = open_path(Path::new("Z:\\nonexistent_dir_12345\\missing"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_tray_state_scan_notice() {
+        let mut state = TrayState::new(vec![true, true]);
+        state.update_watcher_status(ConnectivityState::Online, WatcherState::Active);
+        assert_eq!(
+            state.tooltip_text(),
+            "syncdir — Src: Online | Dests: 2/2 Online"
+        );
+        state.set_scan_notice(Some("Partial Scan (1 skipped)".to_string()));
+        assert_eq!(
+            state.tooltip_text(),
+            "syncdir — Src: Online | Dests: 2/2 Online | Partial Scan (1 skipped)"
+        );
+        assert_eq!(state.scan_notice(), Some("Partial Scan (1 skipped)"));
+    }
+
+    #[test]
+    fn test_destination_state_builder() {
+        let dest = DestinationState::new("D:\\Sync", true)
+            .with_resolved_unc(PathBuf::from("\\\\server\\share"));
+        assert_eq!(dest.path, PathBuf::from("D:\\Sync"));
+        assert_eq!(dest.is_online, ConnectivityState::Online);
+        assert_eq!(dest.resolved_unc, Some(PathBuf::from("\\\\server\\share")));
     }
 }

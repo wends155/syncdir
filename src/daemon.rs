@@ -18,39 +18,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
-/// Open a file or directory in the system default application.
-pub(crate) fn open_path(path: &Path) -> Result<(), SyncError> {
-    if !path.exists() {
-        return Err(SyncError::validation(format!(
-            "Path does not exist: {}",
-            path.display()
-        )));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let explorer = crate::config::system_root().join("explorer.exe");
-        let mut cmd = if explorer.exists() {
-            std::process::Command::new(explorer)
-        } else {
-            std::process::Command::new("explorer")
-        };
-        cmd.arg(path).spawn().map_err(SyncError::Io)?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        std::process::Command::new(opener)
-            .arg(path)
-            .spawn()
-            .map_err(SyncError::Io)?;
-    }
-    Ok(())
-}
-
 /// Handle for dispatching asynchronous control commands to a running `SyncDaemon`.
 #[derive(Clone)]
 pub struct DaemonHandle {
@@ -117,11 +84,11 @@ impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTra
     }
 
     fn on_open_config(&self) -> Result<(), SyncError> {
-        open_path(&self.config_path)
+        crate::tray::open_path(&self.config_path)
     }
 
     fn on_view_logs(&self) -> Result<(), SyncError> {
-        open_path(&self.log_dir)
+        crate::tray::open_path(&self.log_dir)
     }
 }
 
@@ -152,7 +119,7 @@ impl SyncEngineFactory for SqliteEngineFactory {
         target_config: &crate::config::TargetSyncConfig,
         app_dir: &Path,
     ) -> Result<Self::Engine, SyncError> {
-        let dest = &target_config.dest_dir;
+        let dest = target_config.dest_dir();
         let dest_str = dest.to_string_lossy();
         let hash = blake3::hash(dest_str.as_bytes());
         let db_filename = format!("sigcache_{}.db", hash.to_hex());
@@ -181,6 +148,165 @@ pub struct SyncDaemon {
 }
 
 impl SyncDaemon {
+    /// Validates that no recursive sync loops exist between the source directory and destination directories,
+    /// resolving mapped drive letters to UNC paths via `resolver` to prevent loop bypass.
+    pub fn validate_target_loops(
+        config: &Config,
+        resolver: &dyn crate::net::NetworkResolver,
+    ) -> Result<(), SyncError> {
+        let src_orig = config.source_dir();
+        let src_resolved = resolver.try_resolve_alternate_path(src_orig);
+
+        for dest in config.resolved_dest_dirs() {
+            let dest_resolved = resolver.try_resolve_alternate_path(&dest);
+
+            let is_loop = crate::config::is_same_or_descendant(&src_resolved, &dest_resolved)
+                || crate::config::is_same_or_descendant(&dest_resolved, &src_resolved)
+                || crate::config::is_same_or_descendant(src_orig, &dest_resolved)
+                || crate::config::is_same_or_descendant(&dest_resolved, src_orig)
+                || crate::config::is_same_or_descendant(&src_resolved, &dest)
+                || crate::config::is_same_or_descendant(&dest, &src_resolved);
+
+            if is_loop {
+                return Err(SyncError::validation(format!(
+                    "Destination directory '{}' (resolved: '{}') is identical to or nested within source directory '{}' (resolved: '{}') (recursive sync loop)",
+                    dest.display(),
+                    dest_resolved.display(),
+                    src_orig.display(),
+                    src_resolved.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn the directory watcher coordinator thread.
+    fn spawn_watcher_coordinator(
+        config: Config,
+        command_tx: Sender<SyncCommand>,
+        source_connectivity: crate::sync::SourceConnectivityTracker,
+        shutdown_flag: Arc<AtomicBool>,
+        observer: Option<Arc<dyn SyncStatusObserver>>,
+    ) -> Result<JoinHandle<()>, SyncError> {
+        std::thread::Builder::new()
+            .name("watcher-coordinator".to_string())
+            .spawn(move || {
+                let mut watcher: Option<crate::monitor::DirectoryWatcher> = None;
+                let retry_interval =
+                    std::time::Duration::from_secs(config.retry_interval_seconds());
+                let mut last_status_check: Option<std::time::Instant> = None;
+
+                let mut last_sent_online = None;
+                let mut last_sent_active = None;
+
+                while !shutdown_flag.load(Ordering::Relaxed) {
+                    let now = std::time::Instant::now();
+                    let should_check = match last_status_check {
+                        None => true,
+                        Some(last) => now.duration_since(last) >= retry_interval,
+                    };
+
+                    if should_check {
+                        last_status_check = Some(now);
+                        let current_source = config.resolved_source_dir();
+                        let is_online = current_source.exists() && current_source.is_dir();
+                        source_connectivity.set_online(is_online);
+
+                        let mut watcher_active = false;
+                        if is_online {
+                            if watcher.is_none() {
+                                tracing::info!(
+                                    "Source directory online. Starting directory watcher..."
+                                );
+                                match crate::monitor::DirectoryWatcher::start(
+                                    config.resolved_source_dir(),
+                                    command_tx.clone(),
+                                ) {
+                                    Ok(w) => {
+                                        watcher = Some(w);
+                                        watcher_active = true;
+                                        // Trigger catch-up full scan on source reconnection/startup
+                                        tracing::info!(
+                                            "Triggering full scan after source directory came online."
+                                        );
+                                        let _ = command_tx.send(SyncCommand::TriggerFullScan);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to start directory watcher: {e}");
+                                        watcher_active = false;
+                                    }
+                                }
+                            } else {
+                                watcher_active = true;
+                            }
+                        } else if watcher.is_some() {
+                            tracing::warn!(
+                                "Source directory went offline. Dropping directory watcher."
+                            );
+                            watcher = None;
+                        }
+
+                        if last_sent_online != Some(is_online)
+                            || last_sent_active != Some(watcher_active)
+                        {
+                            last_sent_online = Some(is_online);
+                            last_sent_active = Some(watcher_active);
+                            if let Some(ref obs) = observer {
+                                obs.on_watcher_status_change(is_online.into(), watcher_active.into());
+                            }
+                        }
+                    }
+
+                    for _ in 0..10 {
+                        if shutdown_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            })
+            .map_err(SyncError::Io)
+    }
+
+    /// Spawn the central command broadcaster thread.
+    fn spawn_command_broadcaster(
+        command_rx: std::sync::mpsc::Receiver<SyncCommand>,
+        mut worker_senders: Vec<Sender<SyncCommand>>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Result<JoinHandle<()>, SyncError> {
+        std::thread::Builder::new()
+            .name("command-broadcaster".to_string())
+            .spawn(move || {
+                while !shutdown_flag.load(Ordering::Relaxed) {
+                    match command_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        Ok(mut cmd) => {
+                            let count = worker_senders.len();
+                            let mut failed = Vec::new();
+                            for (i, tx) in worker_senders.iter().enumerate() {
+                                let to_send = if i + 1 == count {
+                                    std::mem::replace(&mut cmd, SyncCommand::TriggerFullScan)
+                                } else {
+                                    cmd.clone()
+                                };
+                                if tx.send(to_send).is_err() {
+                                    tracing::warn!(
+                                        "Sync worker channel disconnected. Removing sender."
+                                    );
+                                    failed.push(i);
+                                }
+                            }
+                            for &i in failed.iter().rev() {
+                                worker_senders.swap_remove(i);
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .map_err(SyncError::Io)
+    }
+
     /// Starts all sync workers, the central directory watcher, and the central command broadcaster.
     ///
     /// Initializes isolated signature cache SQLite databases for each configured target directory,
@@ -217,12 +343,13 @@ impl SyncDaemon {
         app_dir: &Path,
         observer: Option<Arc<dyn SyncStatusObserver>>,
     ) -> Result<Self, SyncError> {
+        let resolver = crate::net::Win32NetworkResolver;
+        Self::validate_target_loops(&config, &resolver)?;
+
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let mut worker_handles = Vec::new();
 
-        // Avoid blocking network/SMB metadata checks on the main startup thread.
-        // Worker reachability and source watcher reachability are evaluated asynchronously.
-        let source_online = Arc::new(AtomicBool::new(false));
+        let source_connectivity = crate::sync::SourceConnectivityTracker::new(false);
 
         // 1. Initialize target databases and workers
         let mut worker_txs = Vec::new();
@@ -235,7 +362,7 @@ impl SyncDaemon {
 
             tracing::info!(
                 target_index = idx + 1,
-                target_path = %target_config.dest_dir.display(),
+                target_path = %target_config.dest_dir().display(),
                 "Starting sync worker thread for target..."
             );
             let worker_ctx = SyncWorkerContext::new(
@@ -244,7 +371,7 @@ impl SyncDaemon {
                 engine,
                 w_rx,
                 observer.clone(),
-                source_online.clone(),
+                source_connectivity.clone(),
             );
             let worker_handle = start_sync_worker(worker_ctx)?;
             worker_handles.push(worker_handle);
@@ -254,119 +381,17 @@ impl SyncDaemon {
         let (tx, rx) = channel();
 
         // Spawn central watcher coordinator thread
-        let watcher_config = config.clone();
-        let watcher_tx = tx.clone();
-        let watcher_source_online = source_online.clone();
-        let watcher_shutdown = shutdown_flag.clone();
-        let watcher_observer = observer.clone();
-        let watcher_handle = std::thread::spawn(move || {
-            let mut watcher: Option<crate::monitor::DirectoryWatcher> = None;
-            let retry_interval =
-                std::time::Duration::from_secs(watcher_config.retry_interval_seconds());
-            let mut last_status_check: Option<std::time::Instant> = None;
-
-            let mut last_sent_online = None;
-            let mut last_sent_active = None;
-
-            while !watcher_shutdown.load(Ordering::Relaxed) {
-                let now = std::time::Instant::now();
-                let should_check = match last_status_check {
-                    None => true,
-                    Some(last) => now.duration_since(last) >= retry_interval,
-                };
-
-                if should_check {
-                    last_status_check = Some(now);
-                    let current_source = watcher_config.resolved_source_dir();
-                    let is_online = current_source.exists() && current_source.is_dir();
-                    watcher_source_online.store(is_online, Ordering::Relaxed);
-
-                    let mut watcher_active = false;
-                    if is_online {
-                        if watcher.is_none() {
-                            tracing::info!(
-                                "Source directory online. Starting directory watcher..."
-                            );
-                            match crate::monitor::DirectoryWatcher::start(
-                                watcher_config.resolved_source_dir(),
-                                watcher_tx.clone(),
-                            ) {
-                                Ok(w) => {
-                                    watcher = Some(w);
-                                    watcher_active = true;
-                                    // Trigger catch-up full scan on source reconnection/startup
-                                    tracing::info!(
-                                        "Triggering full scan after source directory came online."
-                                    );
-                                    let _ = watcher_tx.send(SyncCommand::TriggerFullScan);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to start directory watcher: {e}");
-                                    watcher_active = false;
-                                }
-                            }
-                        } else {
-                            watcher_active = true;
-                        }
-                    } else if watcher.is_some() {
-                        tracing::warn!(
-                            "Source directory went offline. Dropping directory watcher."
-                        );
-                        watcher = None;
-                    }
-
-                    if last_sent_online != Some(is_online)
-                        || last_sent_active != Some(watcher_active)
-                    {
-                        last_sent_online = Some(is_online);
-                        last_sent_active = Some(watcher_active);
-                        if let Some(ref obs) = watcher_observer {
-                            obs.on_watcher_status_change(is_online.into(), watcher_active.into());
-                        }
-                    }
-                }
-
-                for _ in 0..10 {
-                    if watcher_shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-        });
+        let watcher_handle = Self::spawn_watcher_coordinator(
+            config.clone(),
+            tx.clone(),
+            source_connectivity,
+            shutdown_flag.clone(),
+            observer,
+        )?;
 
         // Spawn central broadcaster thread
-        let broadcaster_shutdown = shutdown_flag.clone();
-        let broadcaster_rx = rx;
-        let mut worker_senders = worker_txs;
-        let broadcaster_handle = std::thread::spawn(move || {
-            while !broadcaster_shutdown.load(Ordering::Relaxed) {
-                match broadcaster_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                    Ok(mut cmd) => {
-                        let count = worker_senders.len();
-                        let mut failed = Vec::new();
-                        for (i, tx) in worker_senders.iter().enumerate() {
-                            let to_send = if i + 1 == count {
-                                std::mem::replace(&mut cmd, SyncCommand::TriggerFullScan)
-                            } else {
-                                cmd.clone()
-                            };
-                            if tx.send(to_send).is_err() {
-                                tracing::warn!(
-                                    "Sync worker channel disconnected. Removing sender."
-                                );
-                                failed.push(i);
-                            }
-                        }
-                        for &i in failed.iter().rev() {
-                            worker_senders.swap_remove(i);
-                        }
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-        });
+        let broadcaster_handle =
+            Self::spawn_command_broadcaster(rx, worker_txs, shutdown_flag.clone())?;
 
         Ok(Self {
             config,
@@ -532,5 +557,33 @@ dest_dir = "C:\\dummy_dest"
             SyncDaemon::start_with_factory(MockEngineFactory, config, dir.path(), None).unwrap();
         assert_eq!(daemon.worker_handles.len(), 1);
         daemon.shutdown();
+    }
+
+    #[test]
+    fn test_validate_target_loops_detects_mapped_drive_unc_loop() {
+        let mock_resolver = crate::net::MockNetworkResolver::new();
+        mock_resolver.set_alternate_path("Z:\\shared", "\\\\server\\share\\data");
+
+        let config = Config::builder("Z:\\shared")
+            .dest_dir("\\\\server\\share\\data\\subfolder")
+            .build();
+
+        let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("recursive sync loop"));
+    }
+
+    #[test]
+    fn test_validate_target_loops_allows_disjoint_targets() {
+        let mock_resolver = crate::net::MockNetworkResolver::new();
+        mock_resolver.set_alternate_path("Z:\\source", "\\\\server\\share1");
+
+        let config = Config::builder("Z:\\source")
+            .dest_dir("\\\\server\\share2")
+            .build();
+
+        let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
+        assert!(result.is_ok());
     }
 }

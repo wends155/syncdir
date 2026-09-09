@@ -26,7 +26,7 @@ impl SyncStatusObserver for WinitStatusObserver {
             .send_event(syncdir::tray::UserEvent::StatusUpdate(
                 syncdir::tray::TargetStatusUpdate {
                     target_index,
-                    dest_online: state.into(),
+                    dest_online: state,
                 },
             ));
     }
@@ -112,8 +112,8 @@ retry_interval_seconds = 10
         .resolved_dest_dirs()
         .into_iter()
         .map(|d| {
-            let is_online = d.exists() && d.is_dir();
-            DestinationState { path: d, is_online }
+            let is_online = std::fs::metadata(&d).map(|m| m.is_dir()).unwrap_or(false);
+            DestinationState::new(d, is_online)
         })
         .collect();
 
