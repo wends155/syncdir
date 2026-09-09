@@ -1,0 +1,18 @@
+---
+source: tests/snapshot_tests.rs
+expression: "format!(\"{:#?}\", target_config)"
+---
+Ok(
+    TargetSyncConfig {
+        source_dir: "C:\\source",
+        dest_dir: TargetDir(
+            "D:\\backup",
+        ),
+        block_size_bytes: 512,
+        block_sync_threshold_bytes: 1024,
+        verify_writes: true,
+        debounce_seconds: 5,
+        retry_interval_seconds: 30,
+        propagate_deletions: true,
+    },
+)

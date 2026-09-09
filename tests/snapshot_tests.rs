@@ -158,6 +158,30 @@ fn test_sync_error_display_lock_poison() {
     assert_snapshot!(err.to_string());
 }
 
+#[test]
+fn test_sync_error_display_write_verification_failed() {
+    let err = SyncError::write_verification_failed(PathBuf::from(r"D:\backup\data.bin"));
+    assert_snapshot!(err.to_string());
+}
+
+// --- TargetSyncConfig Debug Snapshot ---
+
+#[test]
+fn test_target_sync_config_debug_snapshot() {
+    let target_config = syncdir::config::TargetSyncConfig::builder(
+        PathBuf::from(r"C:\source"),
+        PathBuf::from(r"D:\backup"),
+    )
+    .debounce_seconds(5)
+    .propagate_deletions(true)
+    .block_sync_threshold_bytes(1024)
+    .block_size_bytes(512)
+    .verify_writes(true)
+    .retry_interval_seconds(30)
+    .build();
+    assert_snapshot!(format!("{:#?}", target_config));
+}
+
 // --- FileRecord Debug Snapshot ---
 
 #[test]

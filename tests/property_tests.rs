@@ -54,16 +54,42 @@ proptest! {
         prop_assert_eq!(config.propagate_deletions(), parsed.propagate_deletions());
     }
 
-    // 3. SMB Timestamp Tolerance Invariant (±2000ms)
+    // 3. SMB Timestamp Tolerance & Metadata Evaluation Invariant (±2000ms)
     #[test]
-    fn prop_smb_timestamp_tolerance(
-        base_time in 1_000_000_000u64..2_000_000_000u64,
-        delta in -1999i64..=1999i64,
+    fn prop_is_metadata_up_to_date_evaluation(
+        size in 0i64..1_000_000i64,
+        dest_size_diff in -5i64..=5i64,
+        src_mod in 1_000_000_000i64..2_000_000_000i64,
+        delta in -10_000i64..=10_000i64,
+        has_matching_record in prop::bool::ANY,
     ) {
-        let t1 = base_time;
-        let t2 = (base_time as i64 + delta) as u64;
-        let diff = (t1 as i64 - t2 as i64).abs();
-        prop_assert!(diff < 2000);
+        let dest_size = size + dest_size_diff;
+        let dest_mod = src_mod + delta;
+
+        let record = if has_matching_record {
+            Some(syncdir::db::FileRecord {
+                id: Some(1),
+                relative_path: PathBuf::from("file.bin"),
+                file_size: size,
+                last_modified: src_mod,
+            })
+        } else {
+            None
+        };
+
+        let result = syncdir::sync::is_metadata_up_to_date_raw(
+            dest_size,
+            dest_mod,
+            size,
+            src_mod,
+            record.as_ref(),
+        );
+
+        let expected = has_matching_record
+            && dest_size == size
+            && delta.abs() <= 2000;
+
+        prop_assert_eq!(result, expected);
     }
 
     // 4. Path Traversal Safety Invariant
@@ -87,6 +113,38 @@ proptest! {
             .dest_dir(PathBuf::from(r"D:\Dest"))
             .build();
         prop_assert!(config.validate().is_err());
+    }
+
+    // 6. DirtyBlockRange Chunk Coalescing Invariant
+    #[test]
+    fn prop_dirty_block_range_chunk_coalescing(
+        start_block in 0u64..1000u64,
+        count in 1usize..15usize,
+        block_size in 128u64..1024u64,
+    ) {
+        use std::io::Cursor;
+        use syncdir::sync::DirtyBlockRange;
+
+        let mut range = DirtyBlockRange::new();
+        let mut cursor = Cursor::new(Vec::new());
+        let payload = vec![0xAAu8; block_size as usize];
+
+        for i in 0..count {
+            let idx = start_block + i as u64;
+            range.add_block(idx, &payload, &mut cursor, block_size).unwrap();
+        }
+
+        prop_assert_eq!(range.start_block(), start_block);
+        prop_assert_eq!(range.block_count(), count as u64);
+        prop_assert_eq!(range.byte_len(), count * (block_size as usize));
+
+        range.flush(&mut cursor, block_size).unwrap();
+
+        prop_assert!(range.is_empty());
+        prop_assert_eq!(range.byte_len(), 0);
+        let written = cursor.into_inner();
+        let expected_min_len = (start_block as usize + count) * (block_size as usize);
+        prop_assert_eq!(written.len(), expected_min_len);
     }
 }
 
