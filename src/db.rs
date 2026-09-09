@@ -13,15 +13,38 @@ use std::sync::Mutex;
 /// Metadata record for a tracked file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
-    pub id: Option<i64>,
+    pub(crate) id: Option<i64>,
     pub relative_path: PathBuf,
     /// File size in bytes. Uses `i64` to match SQLite INTEGER column type.
     pub file_size: i64,
     pub last_modified: i64,
 }
 
+impl FileRecord {
+    /// Create a new file record without a database surrogate ID.
+    pub fn new(relative_path: impl Into<PathBuf>, file_size: i64, last_modified: i64) -> Self {
+        Self {
+            id: None,
+            relative_path: relative_path.into(),
+            file_size,
+            last_modified,
+        }
+    }
+
+    /// Attach a surrogate database ID to the record (used for testing and persistence).
+    pub fn with_id(mut self, id: i64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// Returns `true` if this file record has been persisted to the database.
+    pub fn is_tracked(&self) -> bool {
+        self.id.is_some()
+    }
+}
+
 /// Convert relative path to canonical forward-slash SQLite storage key.
-pub fn path_to_sqlite_key(path: &Path) -> Result<String, SyncError> {
+pub(crate) fn path_to_sqlite_key(path: &Path) -> Result<String, SyncError> {
     let s = path.to_string_lossy();
     if s.is_empty() {
         return Err(SyncError::validation("Path cannot be empty"));
@@ -97,6 +120,15 @@ pub trait HashStore: Send + Sync {
 
     /// Bulk retrieve all stored file metadata records mapped by relative path.
     fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError>;
+
+    /// Persist multiple file records and their block hashes in a single transaction.
+    ///
+    /// This dramatically reduces SQLite commit overhead during full scans.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Db` if any database operation fails.
+    fn save_files_batch(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError>;
 }
 
 /// SQLite implementation of `HashStore`.
@@ -274,6 +306,41 @@ impl HashStore for SqliteHashStore {
         Ok(())
     }
 
+    fn save_files_batch(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        for (record, hashes) in records {
+            let key = path_to_sqlite_key(&record.relative_path)?;
+            let file_id: i64 = tx.query_row(
+                "INSERT INTO file_metadata (relative_path, file_size, last_modified) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(relative_path) DO UPDATE SET \
+                   file_size = excluded.file_size, \
+                   last_modified = excluded.last_modified \
+                 RETURNING id",
+                params![key, record.file_size, record.last_modified],
+                |row| row.get(0),
+            )?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO block_hashes (file_id, block_index, hash) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(file_id, block_index) DO UPDATE SET hash = excluded.hash \
+                     WHERE block_hashes.hash != excluded.hash",
+                )?;
+                for (idx, hash) in hashes.iter().enumerate() {
+                    stmt.execute(params![file_id, idx as i64, hash.as_slice()])?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM block_hashes WHERE file_id = ?1 AND block_index >= ?2",
+                params![file_id, hashes.len() as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn get_block_hashes(&self, path: &Path) -> Result<Vec<BlockHash>, SyncError> {
         let key = path_to_sqlite_key(path)?;
         let conn = self.conn()?;
@@ -307,10 +374,16 @@ impl HashStore for SqliteHashStore {
     fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
         let key = path_to_sqlite_key(path)?;
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "DELETE FROM file_metadata WHERE relative_path = ?1 OR substr(relative_path, 1, length(?1) + 1) = ?1 || '/'",
-        )?;
-        stmt.execute(params![key])?;
+        // 1. Exact match (uses UNIQUE index directly)
+        conn.prepare_cached("DELETE FROM file_metadata WHERE relative_path = ?1")?
+            .execute(params![key])?;
+        // 2. Sargable prefix range for directory children (uses index range scan)
+        let prefix_start = format!("{}/", key);
+        let prefix_end = format!("{}0", key); // '0' is next ASCII char after '/'
+        conn.prepare_cached(
+            "DELETE FROM file_metadata WHERE relative_path >= ?1 AND relative_path < ?2",
+        )?
+        .execute(params![prefix_start, prefix_end])?;
         Ok(())
     }
 
@@ -467,6 +540,13 @@ impl HashStore for MockHashStore {
             .map(|r| (r.relative_path.clone(), r.clone()))
             .collect();
         Ok(map)
+    }
+
+    fn save_files_batch(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError> {
+        for (record, hashes) in records {
+            self.save_file(record, hashes)?;
+        }
+        Ok(())
     }
 }
 
@@ -910,5 +990,51 @@ mod tests {
                 .is_some(),
             "test_1_extra/file.txt must NOT be deleted by test_1 delete"
         );
+    }
+
+    #[test]
+    fn test_delete_file_sargable_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteHashStore::new(
+            &dir.path().join("test.db"),
+            StoreConfig::new(1_048_576, 10_485_760),
+        )
+        .unwrap();
+        // Insert a file and its "child" directory file
+        let parent = FileRecord::new(PathBuf::from("docs"), 100, 1000);
+        let child = FileRecord::new(PathBuf::from("docs/readme.md"), 200, 2000);
+        let other = FileRecord::new(PathBuf::from("src/main.rs"), 50, 500);
+        store.save_file(&parent, &[]).unwrap();
+        store.save_file(&child, &[]).unwrap();
+        store.save_file(&other, &[]).unwrap();
+        // Delete the "docs" directory
+        store.delete_file(Path::new("docs")).unwrap();
+        // Both docs and docs/readme.md should be gone
+        let remaining = store.list_files().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0], PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn test_batch_save_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteHashStore::new(
+            &dir.path().join("test.db"),
+            StoreConfig::new(1_048_576, 10_485_760),
+        )
+        .unwrap();
+        let records: Vec<(FileRecord, Vec<BlockHash>)> = (0..100)
+            .map(|i| {
+                (
+                    FileRecord::new(format!("file_{}.txt", i), i * 100, i * 1000),
+                    vec![],
+                )
+            })
+            .collect();
+        let batch: Vec<(&FileRecord, &[BlockHash])> =
+            records.iter().map(|(r, h)| (r, h.as_slice())).collect();
+        store.save_files_batch(&batch).unwrap();
+        let all = store.list_all_records().unwrap();
+        assert_eq!(all.len(), 100);
     }
 }

@@ -32,12 +32,7 @@ fn test_integration_config_db_sync_commands() {
 
     // Database round-trip
     let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
-    let record = FileRecord {
-        id: None,
-        relative_path: PathBuf::from("test_file.bin"),
-        file_size: 4096,
-        last_modified: 99999,
-    };
+    let record = FileRecord::new(PathBuf::from("test_file.bin"), 4096, 99999);
     let hashes = vec![[9u8; 32]; 4];
 
     store.save_file(&record, &hashes).unwrap();

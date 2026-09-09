@@ -2,6 +2,13 @@
 
 use thiserror::Error;
 
+fn format_block_detail(block_index: &Option<u64>) -> String {
+    match block_index {
+        Some(idx) => format!(" (block {})", idx),
+        None => String::new(),
+    }
+}
+
 /// All fallible operations in syncdir return this error type.
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -29,10 +36,16 @@ pub enum SyncError {
     Validation(String),
 
     /// Write verification failed for a path (data mismatch).
-    #[error("Write verification failed for: {path}")]
+    #[error("Write verification failed for: {path}{}", format_block_detail(.block_index))]
     WriteVerificationFailed {
         /// The path where verification failed.
         path: std::path::PathBuf,
+        /// The specific block index that failed verification, if applicable.
+        block_index: Option<u64>,
+        /// The expected Blake3 hash of the block.
+        expected_hash: Option<[u8; 32]>,
+        /// The actual Blake3 hash read back from the destination.
+        actual_hash: Option<[u8; 32]>,
     },
 
     /// Lock was poisoned.
@@ -121,7 +134,27 @@ impl SyncError {
 
     /// Create a `SyncError::WriteVerificationFailed` error.
     pub fn write_verification_failed(path: impl Into<std::path::PathBuf>) -> Self {
-        SyncError::WriteVerificationFailed { path: path.into() }
+        SyncError::WriteVerificationFailed {
+            path: path.into(),
+            block_index: None,
+            expected_hash: None,
+            actual_hash: None,
+        }
+    }
+
+    /// Create an enriched `SyncError::WriteVerificationFailed` error with block diagnostics.
+    pub fn write_verification_failed_block(
+        path: impl Into<std::path::PathBuf>,
+        block_index: u64,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    ) -> Self {
+        SyncError::WriteVerificationFailed {
+            path: path.into(),
+            block_index: Some(block_index),
+            expected_hash: Some(expected),
+            actual_hash: Some(actual),
+        }
     }
 
     /// Create a `SyncError::Db` without a source cause.
@@ -369,5 +402,27 @@ mod tests {
         use std::error::Error;
         let err = SyncError::lock_poison("lock failed");
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_write_verification_diagnostics() {
+        let hash_a: [u8; 32] = [0xAA; 32];
+        let hash_b: [u8; 32] = [0xBB; 32];
+        let err = SyncError::WriteVerificationFailed {
+            path: std::path::PathBuf::from("test/file.bin"),
+            block_index: Some(42),
+            expected_hash: Some(hash_a),
+            actual_hash: Some(hash_b),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("test/file.bin"));
+        assert!(msg.contains("block 42"));
+        assert!(matches!(
+            err,
+            SyncError::WriteVerificationFailed {
+                block_index: Some(42),
+                ..
+            }
+        ));
     }
 }

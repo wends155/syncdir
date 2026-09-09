@@ -67,21 +67,16 @@ proptest! {
         let dest_mod = src_mod + delta;
 
         let record = if has_matching_record {
-            Some(syncdir::db::FileRecord {
-                id: Some(1),
-                relative_path: PathBuf::from("file.bin"),
-                file_size: size,
-                last_modified: src_mod,
-            })
+            Some(syncdir::db::FileRecord::new(PathBuf::from("file.bin"), size, src_mod).with_id(1))
         } else {
             None
         };
 
+        let dest = syncdir::sync::FileMetadataSnapshot::new(dest_size, dest_mod);
+        let src = syncdir::sync::FileMetadataSnapshot::new(size, src_mod);
         let result = syncdir::sync::is_metadata_up_to_date_raw(
-            dest_size,
-            dest_mod,
-            size,
-            src_mod,
+            &dest,
+            &src,
             record.as_ref(),
         );
 
@@ -125,20 +120,20 @@ proptest! {
         use std::io::Cursor;
         use syncdir::sync::DirtyBlockRange;
 
-        let mut range = DirtyBlockRange::new();
+        let mut range = DirtyBlockRange::new(block_size);
         let mut cursor = Cursor::new(Vec::new());
         let payload = vec![0xAAu8; block_size as usize];
 
         for i in 0..count {
             let idx = start_block + i as u64;
-            range.add_block(idx, &payload, &mut cursor, block_size).unwrap();
+            range.add_block(idx, &payload, &mut cursor).unwrap();
         }
 
         prop_assert_eq!(range.start_block(), start_block);
         prop_assert_eq!(range.block_count(), count as u64);
         prop_assert_eq!(range.byte_len(), count * (block_size as usize));
 
-        range.flush(&mut cursor, block_size).unwrap();
+        range.flush(&mut cursor).unwrap();
 
         prop_assert!(range.is_empty());
         prop_assert_eq!(range.byte_len(), 0);

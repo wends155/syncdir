@@ -164,6 +164,20 @@ fn test_sync_error_display_write_verification_failed() {
     assert_snapshot!(err.to_string());
 }
 
+#[test]
+fn test_sync_error_display_write_verification_failed_with_block() {
+    let err = SyncError::write_verification_failed_block(
+        PathBuf::from(r"D:\backup\data.bin"),
+        42,
+        [0xAA; 32],
+        [0xBB; 32],
+    );
+    assert_eq!(
+        err.to_string(),
+        r"Write verification failed for: D:\backup\data.bin (block 42)"
+    );
+}
+
 // --- TargetSyncConfig Debug Snapshot ---
 
 #[test]
@@ -186,12 +200,7 @@ fn test_target_sync_config_debug_snapshot() {
 
 #[test]
 fn test_file_record_snapshot() {
-    let record = FileRecord {
-        id: Some(42),
-        relative_path: PathBuf::from("docs/readme.txt"),
-        file_size: 8192,
-        last_modified: 1722470400,
-    };
+    let record = FileRecord::new(PathBuf::from("docs/readme.txt"), 8192, 1722470400).with_id(42);
     assert_snapshot!(format!("{:#?}", record));
 }
 

@@ -222,7 +222,36 @@ This file documents the chronological history, design decisions, and rules conte
 >   - External process spawning for system files (`explorer.exe`) must use fully verified absolute paths (`%SystemRoot%\explorer.exe`).
 >   - `TargetSyncConfig` fields are private; callers must use getters or `TargetSyncConfigBuilder`.
 >   - All four inter-module boundaries (`HashStore`, `RegistryBackend`, `NetworkResolver`, `SyncEngine`) must maintain in-memory mock implementations.
+---
+
+> 📝 **Context Update (2026-09-09):**
+> * **Feature:** Synchronization Algorithms & Corruption Prevention Hardening (31 Review Findings Remediation)
+> * **Changes:**
+>   - Remediated all 31 review findings across 6 component groups (`src/error.rs`, `src/db.rs`, `src/sync.rs`, tests).
+>   - Enriched `SyncError::WriteVerificationFailed` with `block_index: Option<u64>`, `expected_hash`, and `actual_hash` hex diagnostics (O10).
+>   - Tightened database encapsulation by reducing `path_to_sqlite_key` and `FileRecord.id` to `pub(crate)`, adding `is_tracked()`, and replacing unindexed table scan queries in `SqliteHashStore::delete_file` with sargable range scan (`relative_path >= ?1 AND relative_path < ?2`) (O5, O14, O16).
+>   - Added `HashStore::save_files_batch` with single-transaction atomic batching (O4).
+>   - Switched reparse point and symlink auditing to `fs::symlink_metadata` across all traversal paths and intermediate directory components (`is_reparse_or_symlink`, `verify_source_not_reparse`, `verify_destination_not_reparse`, `delete_file_from_dest`), preventing symlink escape and junction traversal (O2, O9).
+>   - Hardened `is_safe_relative_path` to reject trailing spaces/dots and DOS device names before stem truncation (O8).
+>   - Added reparse verification directory cache (`verify_destination_not_reparse_cached`) to eliminate redundant SMB RPC round-trips during full scans (O13).
+>   - Pinned `block_size` in `DirtyBlockRange::new(block_size)` constructor, removing method parameter drift (O6).
+>   - Replaced 4-consecutive `i64` transposition hazard in `is_metadata_up_to_date_raw` with structured `FileMetadataSnapshot` (O17).
+>   - Removed dangerous default implementations discarding `_dest_dir` from `SyncEngine` trait (O7).
+>   - Added traversal completeness tracking in `scan_dir` (`scan_complete: &mut bool`); skipped deletions in `run_full_scan` if any directory encountered `PermissionDenied` or max depth (O3).
+>   - Normalized full scan relative paths to forward slashes before SQLite key and source lookup comparisons, permanently preventing false deletions on Windows (O1).
+>   - Enriched `ScanOutcome::PartialFailure` with `delete_failed: usize`, and routed general I/O failures through exponential backoff retry in worker loop (O11, O12, O15).
+>   - Returned raw Win32 OS error 53 (ERROR_BAD_NETPATH) on missing destination in `delete_file_from_dest` to preserve network offline detection (O18).
+>   - Equipped `LocalSyncEngine` with `resolved_dest: Option<PathBuf>` and `with_resolved_dest`, eliminating static DIP bypass in `run_full_scan`.
+>   - Expanded automated test suite to 208 passing tests (+11 net-new tests: 10 unit + 1 snapshot), with zero test regressions and 100% clean formatting and linting.
+> * **New Constraints:**
+>   - Directory scanning must always track completeness via `scan_complete: &mut bool`; deletion propagation MUST be skipped if the scan was incomplete.
+>   - Relative paths for SQLite keys and source lookups must be normalized to forward slashes before comparison.
+>   - Reparse and junction checks must ALWAYS use `fs::symlink_metadata`, never `entry.metadata()`.
+>   - `delete_file` in `HashStore` must use sargable index range queries (`>= ?1 AND < ?2`) rather than string manipulation functions in SQL.
+>   - `DirtyBlockRange` must be constructed with its fixed block size; callers cannot supply varying block sizes to `add_block` or `flush`.
+>   - General I/O errors in the worker loop must use `calculate_exponential_backoff` and cap at 10 retry attempts before eviction.
 > * **Pruned:**
->   - Intermediate review finding discussions, preliminary plan iterations, tautological property tests, and obsolete db_version "3" references.
+>   - Obsolete review findings discussions, pre-normalization path separator mismatch bugs, unindexed SQL substring scan overhead, parameter transposition hazards, and unhandled permission denied subtree deletion hazards are resolved and closed.
+
 
 
