@@ -246,7 +246,7 @@ impl SyncDaemon {
                 observer.clone(),
                 source_online.clone(),
             );
-            let worker_handle = start_sync_worker(worker_ctx);
+            let worker_handle = start_sync_worker(worker_ctx)?;
             worker_handles.push(worker_handle);
         }
 

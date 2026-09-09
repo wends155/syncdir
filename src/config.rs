@@ -229,7 +229,7 @@ impl TargetDir {
     /// Construct TargetDir by normalizing path via normalize_path(). Infallible.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(normalize_path(&path.into()))
+        Self(normalize_path(path.into()))
     }
 
     /// Validates path syntax for a given role ("source" or "destination").
@@ -902,7 +902,8 @@ fn preprocess_config_toml(content: &str) -> String {
 
         if starts_dest_dirs {
             // Check if array is multi-line (has opening bracket but no closing bracket outside quotes on this line)
-            if has_bracket_outside_quotes(trimmed, '[') && !has_bracket_outside_quotes(trimmed, ']') {
+            if has_bracket_outside_quotes(trimmed, '[') && !has_bracket_outside_quotes(trimmed, ']')
+            {
                 in_dest_dirs_array = true;
             }
         }
@@ -1733,7 +1734,8 @@ mod tests {
             verify_writes = true
         "#;
         let processed = preprocess_config_toml(input);
-        let config: Config = toml::from_str(&processed).expect("should parse bracketed paths in array");
+        let config: Config =
+            toml::from_str(&processed).expect("should parse bracketed paths in array");
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].to_string_lossy(), r"D:\Backup[1]\Data");

@@ -79,7 +79,7 @@ fn test_watcher_and_sync_engine_flow() {
     let target_config = TargetSyncConfig::from_config(&config, dest.clone());
     let engine = LocalSyncEngine::new(store, target_config.clone());
     let worker_ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
-    let _worker_handle = start_sync_worker(worker_ctx);
+    let _worker_handle = start_sync_worker(worker_ctx).unwrap();
 
     // Give watcher thread time to establish OS directory hook and catch-up scan to stabilize
     std::thread::sleep(std::time::Duration::from_millis(200));

@@ -504,11 +504,15 @@ mod tests {
         let resolver = MockNetworkResolver::new();
         resolver.set_smb_failure(r"\\offline\share", "network unreachable");
 
-        assert!(resolver
-            .establish_smb_connection(Path::new(r"\\offline\share"))
-            .is_err());
-        assert!(resolver
-            .establish_smb_connection(Path::new(r"\\online\share"))
-            .is_ok());
+        assert!(
+            resolver
+                .establish_smb_connection(Path::new(r"\\offline\share"))
+                .is_err()
+        );
+        assert!(
+            resolver
+                .establish_smb_connection(Path::new(r"\\online\share"))
+                .is_ok()
+        );
     }
 }

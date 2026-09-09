@@ -883,15 +883,24 @@ mod tests {
         store.delete_file(Path::new("test_1")).unwrap();
 
         assert!(
-            store.get_file(Path::new("test_1/file.txt")).unwrap().is_none(),
+            store
+                .get_file(Path::new("test_1/file.txt"))
+                .unwrap()
+                .is_none(),
             "test_1/file.txt should have been deleted"
         );
         assert!(
-            store.get_file(Path::new("test-1/file.txt")).unwrap().is_some(),
+            store
+                .get_file(Path::new("test-1/file.txt"))
+                .unwrap()
+                .is_some(),
             "test-1/file.txt must NOT be deleted by test_1 delete"
         );
         assert!(
-            store.get_file(Path::new("test%1/file.txt")).unwrap().is_some(),
+            store
+                .get_file(Path::new("test%1/file.txt"))
+                .unwrap()
+                .is_some(),
             "test%1/file.txt must NOT be deleted by test_1 delete"
         );
         assert!(
