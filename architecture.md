@@ -37,6 +37,8 @@ This document outlines the architecture, design patterns, and contracts for the 
 syncdir/
 ├── Cargo.toml            # Project dependencies and workspace config
 ├── Cargo.lock            # Cargo lockfile
+├── build.rs              # Windows PE executable resource compilation script (winres)
+├── syncdir.ico           # 32x32 32bpp Windows application icon asset
 ├── LICENSE               # Project MIT license
 ├── README.md             # Project README documentation
 ├── architecture.md       # Technical design (this file)
@@ -60,7 +62,9 @@ syncdir/
     ├── monitor.rs        # ReadDirectoryChangesW event monitor
     ├── startup.rs        # Platform-specific registry auto-start hook
     ├── sync.rs           # Block delta sync engine and background worker
-    └── tray.rs           # System tray icon event loop, menus, and process execution
+    ├── tray.rs           # System tray icon event loop, menus, and process execution
+    └── tray/
+        └── assets.rs     # Compile-time icon RGBA buffer generation, .rdata tables, and icon cache
 ```
 
 ## 5. Module Boundaries
@@ -112,7 +116,9 @@ syncdir/
 * **Does NOT own**: Filesystem watching, tray menu construction, or SQLite database operations.
 
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), event dispatching and UI loop abstraction via `TrayController`, managing `TrayState` (pure state container tracking strongly-typed `ConnectivityState` and `WatcherState` domain enum transitions, online destination counts, scan notices, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping, guarded config reload background thread execution, thread-safe icon caching (`ICON_CACHE` via `OnceLock`), qualified `%SystemRoot%\explorer.exe` process execution (`open_path`), and toggling Windows startup registration via injected `RegistryBackend` trait (`run_tray<H, R>`).
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), event dispatching and UI loop abstraction via `TrayController`, managing `TrayState` (pure state container tracking strongly-typed `ConnectivityState` and `WatcherState` domain enum transitions, online destination counts, scan notices, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping with encapsulated precomputed `display_label`, state-transition-gated repaint Win32 IPC (suppressing duplicate `Shell_NotifyIconW` calls), guarded config reload background thread execution, qualified `%SystemRoot%\explorer.exe` process execution (`open_path`), and toggling Windows startup registration via injected `RegistryBackend` trait (`run_tray<H, R>`).
+* **Submodules**:
+  * `tray::assets`: Compile-time 32×32 RGBA icon buffer generation (`const fn generate_status_rgba`), static `.rdata` tables (`STATUS_RGBA`), zero-panic array caching (`ICON_CACHE` via `OnceLock<[Icon; EngineStatus::COUNT]>`), and graceful healthy fallback.
 * **Does NOT own**: Filesystem watching or database execution.
 
 ### `startup`
@@ -130,7 +136,8 @@ syncdir/
 |--------|-----------|-----------------|
 | `main` | `daemon`, `tray`, `config`, `sync`, `startup`, `error` | `db` (direct) |
 | `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `tray`, `startup`, `path_util`, `error` | `main` |
-| `tray` | `sync`, `config`, `error`, `startup` (trait) | `db` (direct), `main`, `daemon` |
+| `tray` | `sync`, `config`, `error`, `startup` (trait), `tray::assets` | `db` (direct), `main`, `daemon` |
+| `tray::assets` | `EngineStatus` (super), `error`, `tray-icon` | All other modules |
 | `monitor` | `sync`, `error` | `config`, `db`, `tray`, `main`, `daemon` |
 | `sync` | `db` (trait), `config`, `net`, `path_util`, `error` | `monitor`, `tray`, `main`, `daemon` |
 | `db` | `config`, `error` | `sync`, `monitor`, `tray`, `main`, `daemon` |
@@ -197,6 +204,7 @@ syncdir/
   * `tray-icon` (v0.14) & `winit` (v0.29): For system tray creation and event loop.
   * `serde` & `toml`: Parsing `config.toml`.
   * `thiserror`: Unified error handling.
+  * `winres` (v0.1, Windows target build-dependency): Windows PE binary resource compilation embedding `syncdir.ico` application icon.
 * **Development & Testing Dependencies**:
   * `tempfile` (v3): Temporary directory creation for integration tests.
   * `pretty_assertions` (v1): Colorized structural diff assertions.
