@@ -11,6 +11,7 @@ Ok(
         block_size_bytes: 512,
         block_sync_threshold_bytes: 1024,
         verify_writes: true,
+        verification_mode: Full,
         debounce_seconds: 5,
         retry_interval_seconds: 30,
         propagate_deletions: true,

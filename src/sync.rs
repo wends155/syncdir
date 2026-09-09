@@ -3,12 +3,12 @@
 //! Defines the message types that the monitor and tray threads
 //! send to the sync worker, and the trait contract for the sync engine.
 
-use crate::config::TargetSyncConfig;
+use crate::config::{TargetSyncConfig, VerificationMode};
 use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -472,6 +472,7 @@ impl SyncEngine for MockSyncEngine {
     }
 }
 
+#[allow(dead_code)]
 fn hash_file_streamed(path: &Path) -> Result<blake3::Hash, SyncError> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -489,6 +490,7 @@ fn hash_file_streamed(path: &Path) -> Result<blake3::Hash, SyncError> {
     Ok(hasher.finalize())
 }
 
+#[allow(dead_code)]
 fn verify_small_file_write(src: &Path, dest: &Path) -> Result<(), SyncError> {
     let src_hash = hash_file_streamed(src)?;
     let dest_hash = hash_file_streamed(dest)?;
@@ -784,6 +786,7 @@ pub struct LocalSyncEngine<S: HashStore> {
     pub(crate) db: S,
     pub(crate) config: TargetSyncConfig,
     pub(crate) resolved_dest: Option<PathBuf>,
+    pub(crate) dirty_range: std::sync::Mutex<DirtyBlockRange>,
 }
 
 #[derive(Debug)]
@@ -804,10 +807,13 @@ static ARCHIVE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 impl<S: HashStore> LocalSyncEngine<S> {
     /// Create a new sync engine with the given database and config.
     pub fn new(db: S, config: impl Into<TargetSyncConfig>) -> Self {
+        let config = config.into();
+        let block_size = config.block_size_bytes();
         Self {
             db,
-            config: config.into(),
+            config,
             resolved_dest: None,
+            dirty_range: std::sync::Mutex::new(DirtyBlockRange::new(block_size)),
         }
     }
 
@@ -869,17 +875,76 @@ impl<S: HashStore> LocalSyncEngine<S> {
         false
     }
 
-    fn sync_small_file(&self, task: &FileSyncTask<'_>) -> Result<(), SyncError> {
+    fn sync_small_file_core(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
         if let Some(parent) = task.dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes_copied = fs::copy(task.src_path, task.dest_path)?;
+        let mut src_file = File::open(task.src_path)?;
+        let mut dest_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(task.dest_path)?;
 
-        if self.config.verify_writes() {
-            verify_small_file_write(task.src_path, task.dest_path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut total_bytes_copied: u64 = 0;
+        let mut stack_chunk = [0u8; 64 * 1024];
+        let buf: &mut [u8] = if scratch.len() >= 64 * 1024 {
+            &mut scratch[..64 * 1024]
+        } else {
+            &mut stack_chunk[..]
+        };
+
+        loop {
+            let n = match src_file.read(buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SyncError::Io(e)),
+            };
+            hasher.update(&buf[..n]);
+            dest_file.write_all(&buf[..n])?;
+            total_bytes_copied += n as u64;
         }
 
-        let dest_file = OpenOptions::new().write(true).open(task.dest_path)?;
+        match self.config.verification_mode() {
+            VerificationMode::Disabled => {}
+            VerificationMode::MetadataAndFlush => {
+                let dest_meta = dest_file.metadata()?;
+                if dest_meta.len() != total_bytes_copied {
+                    return Err(SyncError::write_verification_failed(
+                        task.dest_path.to_path_buf(),
+                    ));
+                }
+                dest_file.sync_all()?;
+            }
+            VerificationMode::Sampled | VerificationMode::Full => {
+                let src_hash = hasher.finalize();
+                dest_file.seek(SeekFrom::Start(0))?;
+                let mut dest_hasher = blake3::Hasher::new();
+                loop {
+                    let n = match dest_file.read(buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(SyncError::Io(e)),
+                    };
+                    dest_hasher.update(&buf[..n]);
+                }
+                if src_hash != dest_hasher.finalize() {
+                    return Err(SyncError::write_verification_failed(
+                        task.dest_path.to_path_buf(),
+                    ));
+                }
+                dest_file.sync_all()?;
+            }
+        }
+
         dest_file.set_times(
             fs::FileTimes::new()
                 .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod)),
@@ -888,28 +953,35 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let record = FileRecord {
             id: task.cached_id,
             relative_path: task.rel_path.to_path_buf(),
-            file_size: bytes_copied as i64,
+            file_size: total_bytes_copied as i64,
             last_modified: task.src_mod,
         };
-        self.db.save_file(&record, &[])?;
         tracing::info!(
             path = %task.rel_path.display(),
             target = %task.dest_dir.display(),
-            size = bytes_copied,
+            size = total_bytes_copied,
             "Synced file to destination"
         );
+        Ok((record, Vec::new()))
+    }
+
+    #[allow(dead_code)]
+    fn sync_small_file(&self, task: &FileSyncTask<'_>) -> Result<(), SyncError> {
+        let mut stack_scratch = [0u8; 64 * 1024];
+        let (record, _) = self.sync_small_file_core(task, &mut stack_scratch)?;
+        self.db.save_file(&record, &[])?;
         Ok(())
     }
 
-    pub(crate) fn sync_delta_large_file(
+    pub(crate) fn sync_delta_large_file_core(
         &self,
         task: &FileSyncTask<'_>,
         scratch: &mut [u8],
-    ) -> Result<(), SyncError> {
+    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
         if let Some(parent) = task.dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let dest_existed = task.dest_path.exists();
+        let mut src_file = File::open(task.src_path)?;
         let mut dest_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -917,46 +989,42 @@ impl<S: HashStore> LocalSyncEngine<S> {
             .truncate(false)
             .open(task.dest_path)?;
 
-        let dest_len = dest_file.metadata().map(|m| m.len()).unwrap_or(0);
-
-        let old_hashes = if dest_existed && task.cached_id.is_some() {
-            self.db.get_block_hashes(task.rel_path)?
-        } else {
-            Vec::new() // Force all blocks written if destination was deleted
-        };
-
-        let mut src_file = File::open(task.src_path)?;
         let block_size = self.config.block_size_bytes();
-        let buf_size = block_size as usize;
-        let mut heap_buf;
-        let buffer: &mut [u8] = if scratch.len() >= buf_size {
-            &mut scratch[..buf_size]
-        } else {
-            heap_buf = vec![0; buf_size];
-            &mut heap_buf
-        };
-        let mut range = DirtyBlockRange::new(block_size);
-        let mut modified_block_indices = Vec::new();
+        let initial_dest_len = dest_file.metadata().map(|m| m.len()).unwrap_or(0);
+        let cached_hashes = self.db.get_block_hashes(task.rel_path)?;
+
+        let buffer = scratch;
         let mut new_hashes = Vec::new();
-        let mut block_idx = 0u64;
-        let mut total_bytes_read = 0u64;
+        let mut block_idx: u64 = 0;
+        let mut range_guard = self
+            .dirty_range
+            .lock()
+            .map_err(|_| SyncError::lock_poison("dirty_range"))?;
+        range_guard.reset();
+        let range = &mut *range_guard;
+        let mut total_bytes_read: u64 = 0;
+        let mut modified_block_indices: Vec<(u64, usize, [u8; 32])> = Vec::new();
 
         loop {
-            let bytes_read = read_block(&mut src_file, &mut *buffer)?;
+            let bytes_read = read_block(&mut src_file, buffer)?;
             if bytes_read == 0 {
                 break;
             }
             total_bytes_read += bytes_read as u64;
-            let chunk = &buffer[..bytes_read];
-            let hash = *blake3::hash(chunk).as_bytes();
+            let hash = *blake3::hash(&buffer[..bytes_read]).as_bytes();
             new_hashes.push(hash);
 
-            let is_truncated_on_dest = dest_len < (block_idx * block_size + bytes_read as u64);
-            let is_dirty = old_hashes.get(block_idx as usize) != Some(&hash);
+            let cached = cached_hashes.get(block_idx as usize);
+            let block_changed = match cached {
+                Some(cached_hash) => cached_hash != &hash,
+                None => true,
+            };
+            let is_truncated_on_dest =
+                initial_dest_len < (block_idx * block_size + bytes_read as u64);
 
-            if is_dirty || is_truncated_on_dest {
-                range.add_block(block_idx, chunk, &mut dest_file)?;
-                if self.config.verify_writes() {
+            if block_changed || is_truncated_on_dest {
+                range.add_block(block_idx, &buffer[..bytes_read], &mut dest_file)?;
+                if self.config.verification_mode() != VerificationMode::Disabled {
                     modified_block_indices.push((block_idx, bytes_read, hash));
                 }
             }
@@ -996,26 +1064,50 @@ impl<S: HashStore> LocalSyncEngine<S> {
             ));
         }
 
-        if self.config.verify_writes() {
-            for &(b_idx, bytes_len, expected_hash) in &modified_block_indices {
-                dest_file.seek(SeekFrom::Start(b_idx * block_size))?;
-                if dest_file.read_exact(&mut buffer[..bytes_len]).is_err() {
-                    return Err(SyncError::write_verification_failed_block(
-                        task.dest_path.to_path_buf(),
-                        b_idx,
-                        expected_hash,
-                        [0u8; 32],
-                    ));
+        let verification_mode = self.config.verification_mode();
+        let indices_to_verify: Vec<&(u64, usize, [u8; 32])> = match verification_mode {
+            VerificationMode::Disabled => Vec::new(),
+            VerificationMode::MetadataAndFlush => {
+                dest_file.sync_all()?;
+                Vec::new()
+            }
+            VerificationMode::Full => modified_block_indices.iter().collect(),
+            VerificationMode::Sampled => {
+                dest_file.sync_all()?;
+                let n = modified_block_indices.len();
+                if n <= 4 {
+                    modified_block_indices.iter().collect()
+                } else {
+                    let mut sample = Vec::with_capacity(4);
+                    sample.push(&modified_block_indices[0]);
+                    let mid1 = n / 3;
+                    let mid2 = (2 * n) / 3;
+                    sample.push(&modified_block_indices[mid1]);
+                    sample.push(&modified_block_indices[mid2]);
+                    sample.push(&modified_block_indices[n - 1]);
+                    sample
                 }
-                let actual_hash = *blake3::hash(&buffer[..bytes_len]).as_bytes();
-                if actual_hash != expected_hash {
-                    return Err(SyncError::write_verification_failed_block(
-                        task.dest_path.to_path_buf(),
-                        b_idx,
-                        expected_hash,
-                        actual_hash,
-                    ));
-                }
+            }
+        };
+
+        for &(b_idx, bytes_len, expected_hash) in indices_to_verify {
+            dest_file.seek(SeekFrom::Start(b_idx * block_size))?;
+            if dest_file.read_exact(&mut buffer[..bytes_len]).is_err() {
+                return Err(SyncError::write_verification_failed_block(
+                    task.dest_path.to_path_buf(),
+                    b_idx,
+                    expected_hash,
+                    [0u8; 32],
+                ));
+            }
+            let actual_hash = *blake3::hash(&buffer[..bytes_len]).as_bytes();
+            if actual_hash != expected_hash {
+                return Err(SyncError::write_verification_failed_block(
+                    task.dest_path.to_path_buf(),
+                    b_idx,
+                    expected_hash,
+                    actual_hash,
+                ));
             }
         }
 
@@ -1046,23 +1138,45 @@ impl<S: HashStore> LocalSyncEngine<S> {
             file_size: total_bytes_read as i64,
             last_modified: task.src_mod,
         };
-        self.db.save_file(&record, &new_hashes)?;
         tracing::info!(
             path = %task.rel_path.display(),
             target = %task.dest_dir.display(),
             size = total_bytes_read,
             "Synced file to destination (delta)"
         );
+        Ok((record, new_hashes))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sync_delta_large_file(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
+        let (record, hashes) = self.sync_delta_large_file_core(task, scratch)?;
+        self.db.save_file(&record, &hashes)?;
         Ok(())
     }
 
-    fn sync_file_to_dest_buffered_with_record(
+    pub(crate) fn sync_file_core(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
+        if (task.src_size as u64) < self.config.block_sync_threshold_bytes {
+            self.sync_small_file_core(task, scratch)
+        } else {
+            self.sync_delta_large_file_core(task, scratch)
+        }
+    }
+
+    fn sync_file_to_dest_core(
         &self,
         rel_path: &Path,
         dest_dir: &Path,
         scratch: &mut [u8],
         file_record: Option<&FileRecord>,
-    ) -> Result<(), SyncError> {
+    ) -> Result<Option<(FileRecord, Vec<crate::db::BlockHash>)>, SyncError> {
         if !is_safe_relative_path(rel_path) {
             return Err(SyncError::validation(format!(
                 "Unsafe path traversal detected: {}",
@@ -1075,7 +1189,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let sym_meta = fs::symlink_metadata(&src_path).map_err(SyncError::Io)?;
         if is_reparse_or_symlink_meta(&sym_meta) {
             tracing::debug!(path = %src_path.display(), "Skipping symlink or reparse point");
-            return Ok(());
+            return Ok(None);
         }
         verify_source_not_reparse(self.config.source_dir(), rel_path)?;
         if sym_meta.is_dir() {
@@ -1093,7 +1207,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             for child_rel in &dir_files {
                 self.sync_file_to_dest_buffered(child_rel, dest_dir, scratch)?;
             }
-            return Ok(());
+            return Ok(None);
         }
 
         let dest_meta = verify_destination_not_reparse(dest_dir, rel_path)?;
@@ -1103,7 +1217,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         if Self::is_metadata_up_to_date(dest_meta.as_ref(), src_size, src_mod, file_record) {
             tracing::debug!(path = %rel_path.display(), "Metadata unchanged, skipping sync");
-            return Ok(());
+            return Ok(None);
         }
 
         let cached_id = file_record.and_then(|r| r.id);
@@ -1117,11 +1231,23 @@ impl<S: HashStore> LocalSyncEngine<S> {
             cached_id,
         };
 
-        if (src_size as u64) < self.config.block_sync_threshold_bytes {
-            self.sync_small_file(&task)
-        } else {
-            self.sync_delta_large_file(&task, scratch)
+        let (record, hashes) = self.sync_file_core(&task, scratch)?;
+        Ok(Some((record, hashes)))
+    }
+
+    fn sync_file_to_dest_buffered_with_record(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+        file_record: Option<&FileRecord>,
+    ) -> Result<(), SyncError> {
+        if let Some((record, hashes)) =
+            self.sync_file_to_dest_core(rel_path, dest_dir, scratch, file_record)?
+        {
+            self.db.save_file(&record, &hashes)?;
         }
+        Ok(())
     }
 
     /// Synchronize a file or directory tree using a reusable scratch buffer.
@@ -1203,6 +1329,23 @@ impl<S: HashStore> LocalSyncEngine<S> {
     pub fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
         let archive_dir = dest_dir.join(".syncdir_archive");
         prune_archive(&archive_dir, 30, 10 * 1024 * 1024 * 1024)
+    }
+
+    /// Flush accumulated file records and hashes to the database in a single batch.
+    fn flush_record_batch(
+        &self,
+        batch: &mut Vec<(FileRecord, Vec<crate::db::BlockHash>)>,
+    ) -> Result<(), SyncError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<(&FileRecord, &[crate::db::BlockHash])> = batch
+            .iter()
+            .map(|(rec, hashes)| (rec, hashes.as_slice()))
+            .collect();
+        self.db.save_files_batch(&refs)?;
+        batch.clear();
+        Ok(())
     }
 }
 
@@ -1301,18 +1444,27 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         let mut failed_count = 0usize;
         let mut sync_skip_count = 0usize;
         let mut scratch = vec![0u8; self.config.block_size_bytes() as usize];
+        let mut batch: Vec<(FileRecord, Vec<crate::db::BlockHash>)> = Vec::with_capacity(500);
         for rel_path in &source_files {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                self.flush_record_batch(&mut batch)?;
                 return Err(SyncError::Cancelled);
             }
             let normalized_key = PathBuf::from(rel_path.to_string_lossy().replace('\\', "/"));
-            match self.sync_file_to_dest_buffered_with_record(
+            match self.sync_file_to_dest_core(
                 rel_path,
                 &active_dest,
                 &mut scratch,
                 cached_records.get(&normalized_key),
             ) {
-                Ok(()) => {
+                Ok(Some((record, hashes))) => {
+                    synced_count += 1;
+                    batch.push((record, hashes));
+                    if batch.len() >= 500 {
+                        self.flush_record_batch(&mut batch)?;
+                    }
+                }
+                Ok(None) => {
                     synced_count += 1;
                 }
                 Err(e) => {
@@ -1344,6 +1496,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
                 }
             }
         }
+        self.flush_record_batch(&mut batch)?;
         if sync_skip_count > 0 {
             tracing::warn!(
                 skipped = sync_skip_count,
@@ -2358,7 +2511,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, VerificationMode};
     use crate::db::{BlockHash, MockHashStore, SqliteHashStore};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
@@ -3710,6 +3863,283 @@ mod tests {
         assert!(res.is_ok());
         assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_none());
         assert!(unprop_file.exists());
+    }
+
+    #[test]
+    fn test_verification_mode_metadata_and_flush() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        // 2-block file (block size 512, file size 1024, threshold 512)
+        let file_name = "large_2block.bin";
+        let content = vec![0xABu8; 1024];
+        std::fs::write(src.join(file_name), &content).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+            .block_size_bytes(512)
+            .block_sync_threshold_bytes(512)
+            .verification_mode(VerificationMode::MetadataAndFlush)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            target_cfg.verification_mode(),
+            VerificationMode::MetadataAndFlush
+        );
+
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        let src_file_path = src.join(file_name);
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
+
+        let mut scratch = vec![0u8; 512];
+        let task = FileSyncTask {
+            rel_path: Path::new(file_name),
+            src_path: &src_file_path,
+            dest_path: &dst.join(file_name),
+            dest_dir: &dst,
+            src_size: 1024,
+            src_mod,
+            cached_id: None,
+        };
+
+        engine.sync_delta_large_file(&task, &mut scratch).unwrap();
+
+        let dst_file = dst.join(file_name);
+        assert!(dst_file.exists());
+        assert_eq!(std::fs::metadata(&dst_file).unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn test_verification_mode_sampled() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        // 6-block file (block size 256, file size 1536, threshold 256)
+        let file_name = "large_6block.bin";
+        let content = vec![0xCDu8; 1536];
+        let src_file_path = src.join(file_name);
+        std::fs::write(&src_file_path, &content).unwrap();
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+            .block_size_bytes(256)
+            .block_sync_threshold_bytes(256)
+            .verification_mode(VerificationMode::Sampled)
+            .build()
+            .unwrap();
+
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        let mut scratch = vec![0u8; 256];
+        let task = FileSyncTask {
+            rel_path: Path::new(file_name),
+            src_path: &src_file_path,
+            dest_path: &dst.join(file_name),
+            dest_dir: &dst,
+            src_size: 1536,
+            src_mod,
+            cached_id: None,
+        };
+
+        engine.sync_delta_large_file(&task, &mut scratch).unwrap();
+
+        let dst_file = dst.join(file_name);
+        assert!(dst_file.exists());
+        assert_eq!(std::fs::metadata(&dst_file).unwrap().len(), 1536);
+    }
+
+    #[test]
+    fn test_verification_mode_disabled() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let file_name = "small.txt";
+        let src_file_path = src.join(file_name);
+        std::fs::write(&src_file_path, b"hello world").unwrap();
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+            .verification_mode(VerificationMode::Disabled)
+            .build()
+            .unwrap();
+
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        let task = FileSyncTask {
+            rel_path: Path::new(file_name),
+            src_path: &src_file_path,
+            dest_path: &dst.join(file_name),
+            dest_dir: &dst,
+            src_size: 11,
+            src_mod,
+            cached_id: None,
+        };
+
+        engine.sync_small_file(&task).unwrap();
+
+        let dst_file = dst.join(file_name);
+        assert!(dst_file.exists());
+        assert_eq!(std::fs::read(&dst_file).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn test_local_sync_engine_dirty_range_buffer_reuse() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+            .block_size_bytes(512)
+            .block_sync_threshold_bytes(512)
+            .verification_mode(VerificationMode::Disabled)
+            .build()
+            .unwrap();
+
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        // Sync file 1
+        let f1 = "file1.bin";
+        let src1 = src.join(f1);
+        std::fs::write(&src1, vec![0x11u8; 1024]).unwrap();
+        let m1 = safe_modified_millis(&std::fs::metadata(&src1).unwrap()).unwrap();
+        let mut scratch = vec![0u8; 512];
+        let task1 = FileSyncTask {
+            rel_path: Path::new(f1),
+            src_path: &src1,
+            dest_path: &dst.join(f1),
+            dest_dir: &dst,
+            src_size: 1024,
+            src_mod: m1,
+            cached_id: None,
+        };
+        engine.sync_delta_large_file(&task1, &mut scratch).unwrap();
+
+        let cap1 = engine.dirty_range.lock().unwrap().capacity();
+        assert!(
+            cap1 >= 512,
+            "dirty_range buffer must have allocated capacity"
+        );
+
+        // Sync file 2
+        let f2 = "file2.bin";
+        let src2 = src.join(f2);
+        std::fs::write(&src2, vec![0x22u8; 1024]).unwrap();
+        let m2 = safe_modified_millis(&std::fs::metadata(&src2).unwrap()).unwrap();
+        let task2 = FileSyncTask {
+            rel_path: Path::new(f2),
+            src_path: &src2,
+            dest_path: &dst.join(f2),
+            dest_dir: &dst,
+            src_size: 1024,
+            src_mod: m2,
+            cached_id: None,
+        };
+        engine.sync_delta_large_file(&task2, &mut scratch).unwrap();
+
+        let cap2 = engine.dirty_range.lock().unwrap().capacity();
+        assert_eq!(
+            cap1, cap2,
+            "dirty_range buffer capacity must be preserved across syncs without realloc"
+        );
+    }
+
+    #[derive(Clone)]
+    struct BatchTrackingStore {
+        inner: MockHashStore,
+        save_file_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        save_files_batch_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl BatchTrackingStore {
+        fn new() -> Self {
+            Self {
+                inner: MockHashStore::new(),
+                save_file_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                save_files_batch_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl HashStore for BatchTrackingStore {
+        fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
+            self.inner.get_file(path)
+        }
+        fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
+            self.save_file_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.save_file(record, hashes)
+        }
+        fn get_block_hashes(&self, path: &Path) -> Result<Vec<BlockHash>, SyncError> {
+            self.inner.get_block_hashes(path)
+        }
+        fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
+            self.inner.delete_file(path)
+        }
+        fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+            self.inner.list_files()
+        }
+        fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
+            self.inner.list_all_records()
+        }
+        fn save_files_batch(
+            &self,
+            records: &[(&FileRecord, &[BlockHash])],
+        ) -> Result<(), SyncError> {
+            self.save_files_batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.save_files_batch(records)
+        }
+    }
+
+    #[test]
+    fn test_run_full_scan_uses_save_files_batch() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        for i in 0..5 {
+            std::fs::write(src.join(format!("file_{i}.txt")), format!("content {i}")).unwrap();
+        }
+
+        let store = BatchTrackingStore::new();
+        let config = Config::builder(src).dest_dir(dst).build();
+        let engine = LocalSyncEngine::new(store.clone(), config);
+
+        let outcome = engine.run_full_scan().unwrap();
+        assert!(matches!(outcome, ScanOutcome::Success { synced: 5 }));
+
+        assert_eq!(
+            store
+                .save_file_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "Full scan must not call save_file individually"
+        );
+        assert!(
+            store
+                .save_files_batch_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
+            "Full scan must call save_files_batch"
+        );
     }
 
     #[cfg(windows)]

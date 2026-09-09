@@ -12,6 +12,33 @@ fn default_retry_interval() -> u64 {
     10
 }
 
+/// Write verification strategy for synced files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationMode {
+    /// Skip write verification entirely.
+    Disabled,
+    /// Verify file size metadata and issue fsync/flush (default).
+    #[default]
+    MetadataAndFlush,
+    /// Sampled block verification (first, last, stratified interior blocks).
+    Sampled,
+    /// Full block readback verification (legacy verify_writes = true).
+    Full,
+}
+
+impl VerificationMode {
+    /// Map legacy boolean `verify_writes` flag to a `VerificationMode`.
+    #[must_use]
+    pub const fn from_legacy_flag(verify_writes: bool) -> Self {
+        if verify_writes {
+            Self::Full
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 /// Isolated target sync configuration for a specific destination directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSyncConfig {
@@ -20,6 +47,7 @@ pub struct TargetSyncConfig {
     pub(crate) block_size_bytes: u64,
     pub(crate) block_sync_threshold_bytes: u64,
     pub(crate) verify_writes: bool,
+    pub(crate) verification_mode: VerificationMode,
     pub(crate) debounce_seconds: u64,
     pub(crate) retry_interval_seconds: u64,
     pub(crate) propagate_deletions: bool,
@@ -50,6 +78,7 @@ impl TargetSyncConfig {
             block_size_bytes: config.block_size_bytes(),
             block_sync_threshold_bytes: config.block_sync_threshold_bytes(),
             verify_writes: config.verify_writes(),
+            verification_mode: config.verification_mode(),
             debounce_seconds: config.debounce_seconds(),
             retry_interval_seconds: config.retry_interval_seconds(),
             propagate_deletions: config.propagate_deletions(),
@@ -86,6 +115,11 @@ impl TargetSyncConfig {
         self.verify_writes
     }
 
+    /// Verification mode getter.
+    pub fn verification_mode(&self) -> VerificationMode {
+        self.verification_mode
+    }
+
     /// Debounce seconds getter.
     pub fn debounce_seconds(&self) -> u64 {
         self.debounce_seconds
@@ -104,6 +138,14 @@ impl TargetSyncConfig {
     /// Sets write verification flag.
     pub fn with_verify_writes(mut self, verify: bool) -> Self {
         self.verify_writes = verify;
+        self.verification_mode = VerificationMode::from_legacy_flag(verify);
+        self
+    }
+
+    /// Sets verification mode.
+    pub fn with_verification_mode(mut self, mode: VerificationMode) -> Self {
+        self.verification_mode = mode;
+        self.verify_writes = mode != VerificationMode::Disabled;
         self
     }
 }
@@ -131,6 +173,7 @@ pub struct TargetSyncConfigBuilder {
     block_size_bytes: u64,
     block_sync_threshold_bytes: u64,
     verify_writes: bool,
+    verification_mode: Option<VerificationMode>,
     debounce_seconds: u64,
     retry_interval_seconds: u64,
     propagate_deletions: bool,
@@ -145,6 +188,7 @@ impl TargetSyncConfigBuilder {
             block_size_bytes: 1024 * 1024,
             block_sync_threshold_bytes: 10 * 1024 * 1024,
             verify_writes: true,
+            verification_mode: None,
             debounce_seconds: 3,
             retry_interval_seconds: 10,
             propagate_deletions: true,
@@ -166,6 +210,13 @@ impl TargetSyncConfigBuilder {
     /// Set write verification flag.
     pub fn verify_writes(mut self, val: bool) -> Self {
         self.verify_writes = val;
+        self
+    }
+
+    /// Set verification mode.
+    pub fn verification_mode(mut self, mode: VerificationMode) -> Self {
+        self.verification_mode = Some(mode);
+        self.verify_writes = mode != VerificationMode::Disabled;
         self
     }
 
@@ -207,12 +258,16 @@ impl TargetSyncConfigBuilder {
         let src_target = TargetDir::new(&self.source_dir);
         src_target.validate("source")?;
         self.dest_dir.validate("destination")?;
+        let verification_mode = self
+            .verification_mode
+            .unwrap_or_else(|| VerificationMode::from_legacy_flag(self.verify_writes));
         Ok(TargetSyncConfig {
             source_dir: src_target.to_path_buf(),
             dest_dir: self.dest_dir,
             block_size_bytes: self.block_size_bytes,
             block_sync_threshold_bytes: self.block_sync_threshold_bytes,
             verify_writes: self.verify_writes,
+            verification_mode,
             debounce_seconds: self.debounce_seconds,
             retry_interval_seconds: self.retry_interval_seconds,
             propagate_deletions: self.propagate_deletions,
@@ -470,6 +525,7 @@ pub struct Config {
     block_sync_threshold_bytes: u64,
     block_size_bytes: u64,
     verify_writes: bool,
+    verification_mode: Option<VerificationMode>,
     retry_interval_seconds: u64,
 }
 
@@ -485,6 +541,8 @@ struct RawConfig {
     block_sync_threshold_bytes: u64,
     block_size_bytes: u64,
     verify_writes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_mode: Option<VerificationMode>,
     #[serde(default = "default_retry_interval")]
     retry_interval_seconds: u64,
 }
@@ -499,6 +557,7 @@ impl From<RawConfig> for Config {
             block_sync_threshold_bytes: raw.block_sync_threshold_bytes,
             block_size_bytes: raw.block_size_bytes,
             verify_writes: raw.verify_writes,
+            verification_mode: raw.verification_mode,
             retry_interval_seconds: raw.retry_interval_seconds,
         }
     }
@@ -527,6 +586,7 @@ impl From<Config> for RawConfig {
             block_sync_threshold_bytes: cfg.block_sync_threshold_bytes,
             block_size_bytes: cfg.block_size_bytes,
             verify_writes: cfg.verify_writes,
+            verification_mode: cfg.verification_mode,
             retry_interval_seconds: cfg.retry_interval_seconds,
         }
     }
@@ -542,6 +602,7 @@ pub struct ConfigBuilder {
     block_sync_threshold_bytes: u64,
     block_size_bytes: u64,
     verify_writes: bool,
+    verification_mode: Option<VerificationMode>,
     retry_interval_seconds: u64,
     dest_dirs: Option<Vec<PathBuf>>,
 }
@@ -557,6 +618,7 @@ impl ConfigBuilder {
             block_sync_threshold_bytes: 10 * 1024 * 1024,
             block_size_bytes: 1024 * 1024,
             verify_writes: true,
+            verification_mode: None,
             retry_interval_seconds: default_retry_interval(),
             dest_dirs: None,
         }
@@ -604,6 +666,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set write verification mode explicitly.
+    pub fn verification_mode(mut self, mode: VerificationMode) -> Self {
+        self.verification_mode = Some(mode);
+        self.verify_writes = mode != VerificationMode::Disabled;
+        self
+    }
+
     /// Set retry interval in seconds.
     pub fn retry_interval_seconds(mut self, val: u64) -> Self {
         self.retry_interval_seconds = val;
@@ -630,6 +699,7 @@ impl ConfigBuilder {
             block_sync_threshold_bytes: self.block_sync_threshold_bytes,
             block_size_bytes: self.block_size_bytes,
             verify_writes: self.verify_writes,
+            verification_mode: self.verification_mode,
             retry_interval_seconds: self.retry_interval_seconds,
         }
     }
@@ -734,6 +804,15 @@ impl Config {
     /// Write verification flag getter.
     pub fn verify_writes(&self) -> bool {
         self.verify_writes
+    }
+
+    /// Return the resolved verification mode.
+    ///
+    /// If `verification_mode` was explicitly configured, returns it.
+    /// Otherwise, resolves based on the legacy `verify_writes` boolean flag.
+    pub fn verification_mode(&self) -> VerificationMode {
+        self.verification_mode
+            .unwrap_or_else(|| VerificationMode::from_legacy_flag(self.verify_writes))
     }
 
     /// Retry interval in seconds getter.
@@ -1740,5 +1819,66 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].to_string_lossy(), r"D:\Backup[1]\Data");
         assert_eq!(resolved[1].to_string_lossy(), r"E:\Backup[2]\Data");
+    }
+
+    #[test]
+    fn test_verification_mode_config_resolution() {
+        // Legacy verify_writes = true resolves to Full
+        let cfg1 = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .verify_writes(true)
+            .build();
+        assert_eq!(cfg1.verification_mode(), VerificationMode::Full);
+
+        // Legacy verify_writes = false resolves to Disabled
+        let cfg2 = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .verify_writes(false)
+            .build();
+        assert_eq!(cfg2.verification_mode(), VerificationMode::Disabled);
+
+        // Explicit verification_mode overrides verify_writes
+        let cfg3 = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .verify_writes(true)
+            .verification_mode(VerificationMode::MetadataAndFlush)
+            .build();
+        assert_eq!(cfg3.verification_mode(), VerificationMode::MetadataAndFlush);
+
+        // TOML parsing with verification_mode
+        let toml_str = r#"
+            source_dir = "C:\\source"
+            dest_dir = "D:\\dest"
+            debounce_seconds = 1
+            propagate_deletions = true
+            block_sync_threshold_bytes = 10
+            block_size_bytes = 4
+            verify_writes = false
+            verification_mode = "sampled"
+        "#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.verification_mode(), VerificationMode::Sampled);
+    }
+
+    #[test]
+    fn test_verification_mode_target_sync_config_plumbing() {
+        let config = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .verification_mode(VerificationMode::MetadataAndFlush)
+            .build();
+        let target = TargetSyncConfig::from_config(&config, r"D:\dest");
+        assert_eq!(
+            target.verification_mode(),
+            VerificationMode::MetadataAndFlush
+        );
+
+        let target_builder = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
+            .verification_mode(VerificationMode::Sampled)
+            .build()
+            .unwrap();
+        assert_eq!(
+            target_builder.verification_mode(),
+            VerificationMode::Sampled
+        );
     }
 }
