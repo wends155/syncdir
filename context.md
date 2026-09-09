@@ -253,5 +253,41 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Obsolete review findings discussions, pre-normalization path separator mismatch bugs, unindexed SQL substring scan overhead, parameter transposition hazards, and unhandled permission denied subtree deletion hazards are resolved and closed.
 
+---
+
+> 📝 **Context Update (2026-09-09):**
+> * **Feature:** Deferred Findings Remediation (F1–F15) & `src/sync/` Submodule Decomposition
+> * **Changes:**
+>   - Remediated all 15 deferred review findings (F1–F15) across synchronization algorithms, concurrency, performance, security, and architectural cohesion.
+>   - Encapsulated `StoreConfig` and `DirtyBlockRange` with private fields, validated constructor invariants, and read-only accessors.
+>   - Added cooperative cancellation token (`SyncEngine::run_cancellable_full_scan`) accepting `&AtomicBool` to interrupt long-running directory scans gracefully during shutdown.
+>   - Added $O(1)$ peek `DebounceQueue` min-heap auxiliary index (`BinaryHeap<Reverse<(Instant, PathBuf)>>`) with lazy stale eviction, eliminating $O(N)$ CPU starvation under load.
+>   - Implemented worker queue overflow recovery triggering an automated catch-up full scan once the queue drains below threshold.
+>   - Added post-stream source metadata re-verification (`post_meta.len()` and `safe_modified_millis`) in delta sync to prevent chimeric stale mtime commits.
+>   - Added post-write destination length validation (`dest_file.metadata()?.len() == total_bytes_read`) preventing truncated delta sync corruption.
+>   - Bound `bytes_copied` in `sync_small_file` to actual stream byte counts, preventing corrupted metadata recording on truncated copies.
+>   - Replaced non-atomic archive destination check-then-act with an incrementing thread-safe nonce (`ARCHIVE_NONCE`) and atomic rename.
+>   - Guarded database record deletion in `delete_file_from_dest` with destination reachability checks, preventing cache purge on transient network disconnects.
+>   - Introduced tiered write verification (`VerificationMode`: `Disabled`, `MetadataAndFlush`, `Sampled`, `Full`), reducing SMB bandwidth saturation.
+>   - Reused `DirtyBlockRange` buffer allocation across files in `SyncWorkerState`, eliminating 16MB allocation churn.
+>   - Consolidated small-file SMB operations into a single open handle with streaming Blake3 hashing and inline timestamp alignment.
+>   - Integrated `HashStore::save_files_batch` into full scan loops with 500-record batch commits, minimizing SQLite transaction overhead.
+>   - Implemented atomic small-file write staging via RAII `TempFileGuard` writing to sibling `.syncdir_tmp` files before atomic rename.
+>   - Decomposed monolithic 3,619-line `src/sync.rs` into 9 high-cohesion submodules in `src/sync/` (`mod.rs`, `engine.rs`, `delta.rs`, `small_file.rs`, `archive.rs`, `path_safety.rs`, `scanner.rs`, `worker.rs`, `mock.rs`) while preserving 100% public API compatibility.
+>   - Expanded automated test suite to 230 passing tests (184 lib unit, 3 bin unit, 10 integration, 8 property, 20 snapshot, 5 doctests) with zero warnings.
+> * **New Constraints:**
+>   - Trait methods for `LocalSyncEngine` reside in `src/sync/engine.rs` delegating to specialized inherent methods in submodules.
+>   - Directory scanning functions (`scan_dir`, `run_cancellable_full_scan_impl`) are scoped to `pub(crate)` in `src/sync/scanner.rs`.
+>   - Worker coordination structures (`DebounceQueue`, `ReachabilityMonitor`, `SyncWorkerState`, `SyncWorkerContext`) are scoped to `pub(crate)` in `src/sync/worker.rs`.
+>   - Small-file writes MUST stage to sibling `.syncdir_tmp` files and atomically replace destination via `fs::rename`.
+>   - Delta synchronization MUST re-verify source file metadata post-stream and confirm destination file length before committing hashes to SQLite.
+>   - Archive file paths MUST incorporate unique thread-safe timestamps and nonces to guarantee atomic rename isolation.
+> * **Pruned:**
+>   - Monolithic `src/sync.rs` file removed and superseded by modular `src/sync/` hierarchy.
+>   - Unindexed linear scan in `DebounceQueue::earliest_deadline()` replaced by min-heap index.
+>   - Transient network drop signature purge in `delete_file_from_dest` eliminated.
+>   - Single-file unbatched SQLite transactions in `run_full_scan` replaced by batch persistence.
+
+
 
 
