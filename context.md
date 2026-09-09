@@ -195,3 +195,34 @@ This file documents the chronological history, design decisions, and rules conte
   - Worker debounce loop must compute dynamic sleep deadlines rather than busy-polling O(N) retain.
 * **Pruned:** Manual checks for unwraps, env variables, filesystem operations, release packaging, mock testing structures, LaTeX rendering defects, single-destination configuration constraints, startup scan timing race conditions, startup tray status flicker, process restart ghost tray icons, duplicate process launches, architecture module boundary status drift, all-or-nothing destination offline status misrepresentation, un-normalized mapped drive path handling, SMB logon credential authentication failures, duplicate offline scan warning loops, raw ANSI log escape character corruption, unclarified README Windows path formatting gotchas, Knowledge-RAG workflow integration checks, uncoalesced block seeks over network shares, host registry test pollution, monolithic main loop coupling, unpreserved error causes, dual-pass I/O inefficiencies, truncated destination zero-fill corruption, directory rename recursion gaps, unbounded worker queues, asymmetric SyncError design, lossy error stringification, split-brain configuration path management, Unicode UNC slice panics, empty watcher path loops, circular config-net dependencies, surrogate database key leakage, N+1 full scan database queries, full block hash DELETE+INSERT churn, orphaned child SQLite records, TOCTOU length truncation, Windows junction/symlink write traversal, and UI startup blocking on offline shares are now resolved and automated.
 
+---
+
+> 📝 **Context Update (2026-09-09):**
+> * **Feature:** 45-Finding Comprehensive Review Remediation, Architecture Audit, and Documentation Synchronization
+> * **Changes:**
+>   - Remediated all 45 findings across logic, security, performance, design, API, and testing according to approved implementation plan.
+>   - Introduced `SyncError::WriteVerificationFailed` and exponential backoff retry loop in `start_sync_worker` (Findings 1, 31).
+>   - Plumbed active resolved UNC paths to worker sync and delete operations (Finding 2).
+>   - Fixed SQL LIKE wildcard injection via exact prefix comparison `substr(relative_path, 1, length(?1) + 1) = ?1 || '/'` (Finding 3).
+>   - Decoupled `prune_archive` from deletion hot-path to periodic/post-scan maintenance; added depth cap (32) and symlink/junction skipping (Findings 4, 8).
+>   - Intermediate ancestor directory junction verification in `verify_destination_not_reparse` (Finding 9).
+>   - 64KB streamed small-file verification; worker scratch buffer reuse in delta sync (Findings 7, 21).
+>   - Resilient directory scanning in `scan_dir`; case-insensitive deletion tracking in `run_full_scan` (Findings 16, 17).
+>   - Decomposed `start_sync_worker` into `DebounceQueue`, `ReachabilityMonitor`, `SyncWorkerState` (Finding 11).
+>   - Extracted `TrayController` from `run_tray`; qualified `%SystemRoot%\explorer.exe` in `open_path` (Findings 12, 41).
+>   - Defined `trait NetworkResolver` (`Win32NetworkResolver`, `MockNetworkResolver`) and implemented `MockSyncEngine` (Findings 13, 14).
+>   - Encapsulated `TargetSyncConfig` with `TargetSyncConfigBuilder` and `TargetDir::new` (Findings 19, 27).
+>   - Replaced stdlib arithmetic property tests with domain invariant evaluations; updated snapshot goldens (Findings 44, 45).
+>   - Fully synchronized `architecture.md` (all 16 sections, layout, boundaries, mocks) and `spec.md` (`> Last verified against: 8633ddd`).
+> * **New Constraints:**
+>   - All write verification failures must use `SyncError::WriteVerificationFailed` and be retried via exponential backoff; permanent eviction is reserved for `SyncError::Validation`.
+>   - Database directory prefix queries must use `substr(relative_path, 1, length(?1) + 1) = ?1 || '/'` to avoid LIKE wildcard expansion.
+>   - `verify_destination_not_reparse` must traverse all intermediate ancestor directories between destination root and target path.
+>   - `prune_archive` must strictly enforce `depth <= 32` and skip symlinks/junctions.
+>   - External process spawning for system files (`explorer.exe`) must use fully verified absolute paths (`%SystemRoot%\explorer.exe`).
+>   - `TargetSyncConfig` fields are private; callers must use getters or `TargetSyncConfigBuilder`.
+>   - All four inter-module boundaries (`HashStore`, `RegistryBackend`, `NetworkResolver`, `SyncEngine`) must maintain in-memory mock implementations.
+> * **Pruned:**
+>   - Intermediate review finding discussions, preliminary plan iterations, tautological property tests, and obsolete db_version "3" references.
+
+
