@@ -138,23 +138,51 @@ impl DirtyBlockRange {
     }
 
     /// Return the starting block index of this contiguous range.
+    #[must_use]
     pub fn start_block(&self) -> u64 {
         self.start_block
     }
 
+    /// Return the end block index (exclusive) of this contiguous range.
+    #[must_use]
+    pub fn end_block(&self) -> u64 {
+        self.start_block + self.block_count
+    }
+
     /// Return the number of contiguous blocks coalesced in this range.
+    #[must_use]
     pub fn block_count(&self) -> u64 {
         self.block_count
     }
 
+    /// Return the pinned block size in bytes for this range.
+    #[must_use]
+    pub fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
     /// Check whether the range is currently empty (contains 0 blocks).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.block_count == 0
     }
 
     /// Return the cumulative byte length of all coalesced blocks.
+    #[must_use]
     pub fn byte_len(&self) -> usize {
         self.data.len()
+    }
+
+    /// Return the current allocated capacity of the underlying dirty buffer.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Return a read-only slice of the accumulated dirty block bytes.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Append a block to the dirty range, automatically flushing to the writer if non-contiguous or full.
@@ -2728,6 +2756,66 @@ mod tests {
         assert_eq!(&data[0..8], b"AAAABBBB");
         assert_eq!(&data[8..16], &[0u8; 8]); // blocks 2 & 3 untouched
         assert_eq!(&data[16..20], b"EEEE");
+    }
+
+    #[test]
+    fn test_dirty_block_range_new_getters() {
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(Vec::new());
+        let mut range = DirtyBlockRange::new(512);
+
+        assert_eq!(range.block_size(), 512);
+        assert_eq!(range.start_block(), 0);
+        assert_eq!(range.end_block(), 0);
+        assert!(range.is_empty());
+        assert_eq!(range.byte_len(), 0);
+        assert!(range.data().is_empty());
+
+        let block = vec![0xEE; 512];
+        range.add_block(3, &block, &mut cursor).unwrap();
+
+        assert_eq!(range.start_block(), 3);
+        assert_eq!(range.end_block(), 4);
+        assert_eq!(range.block_count(), 1);
+        assert!(!range.is_empty());
+        assert_eq!(range.byte_len(), 512);
+        assert_eq!(range.data().len(), 512);
+
+        range.add_block(4, &block, &mut cursor).unwrap();
+        assert_eq!(range.start_block(), 3);
+        assert_eq!(range.end_block(), 5);
+        assert_eq!(range.block_count(), 2);
+        assert_eq!(range.byte_len(), 1024);
+        assert_eq!(range.data().len(), 1024);
+    }
+
+    #[test]
+    fn test_dirty_block_range_buffer_reuse_preserves_capacity() {
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(Vec::new());
+        let mut range = DirtyBlockRange::new(1024);
+
+        for i in 0..8 {
+            range.add_block(i, &vec![0xAA; 1024], &mut cursor).unwrap();
+        }
+        assert_eq!(range.byte_len(), 8192);
+        assert_eq!(range.block_count(), 8);
+
+        let cap_before = range.capacity();
+        assert!(cap_before >= 8192, "Initial capacity must be at least 8KB");
+
+        range.reset();
+
+        assert_eq!(range.byte_len(), 0);
+        assert_eq!(range.block_count(), 0);
+        assert_eq!(range.start_block(), 0);
+        assert_eq!(range.end_block(), 0);
+        assert!(range.is_empty());
+        assert_eq!(
+            range.capacity(),
+            cap_before,
+            "Buffer capacity must be preserved across reset() calls"
+        );
     }
 
     #[test]

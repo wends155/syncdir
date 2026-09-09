@@ -75,6 +75,10 @@ pub enum SyncError {
         String,
         #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
     ),
+
+    /// Operation was cancelled cooperatively.
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 impl From<rusqlite::Error> for SyncError {
@@ -220,6 +224,16 @@ impl SyncError {
         source: E,
     ) -> Self {
         SyncError::Registry(msg.into(), Some(Box::new(source)))
+    }
+
+    /// Create a `SyncError::Cancelled` error.
+    pub fn cancelled() -> Self {
+        SyncError::Cancelled
+    }
+
+    /// Returns `true` if the error represents a cooperative cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, SyncError::Cancelled)
     }
 
     /// Returns `true` if the error represents an SMB/network connectivity loss.

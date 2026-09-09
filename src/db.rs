@@ -66,35 +66,51 @@ pub(crate) fn path_to_sqlite_key(path: &Path) -> Result<String, SyncError> {
 /// Minimal configuration parameters required by `SqliteHashStore`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreConfig {
-    pub block_size_bytes: u64,
-    pub block_sync_threshold_bytes: u64,
+    block_size_bytes: u64,
+    block_sync_threshold_bytes: u64,
 }
 
 impl StoreConfig {
     /// Create a new store configuration with specified block size and threshold.
-    pub fn new(block_size_bytes: u64, block_sync_threshold_bytes: u64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Returns `SyncError::Validation` if `block_size_bytes` is 0.
+    pub fn new(block_size_bytes: u64, block_sync_threshold_bytes: u64) -> Result<Self, SyncError> {
+        if block_size_bytes == 0 {
+            return Err(SyncError::validation(
+                "block_size_bytes must be greater than zero",
+            ));
+        }
+        Ok(Self {
             block_size_bytes,
             block_sync_threshold_bytes,
-        }
+        })
+    }
+
+    /// Return configured block size in bytes.
+    #[must_use]
+    pub fn block_size_bytes(&self) -> u64 {
+        self.block_size_bytes
+    }
+
+    /// Return configured block sync threshold in bytes.
+    #[must_use]
+    pub fn block_sync_threshold_bytes(&self) -> u64 {
+        self.block_sync_threshold_bytes
     }
 }
 
 impl From<&Config> for StoreConfig {
     fn from(cfg: &Config) -> Self {
-        Self {
-            block_size_bytes: cfg.block_size_bytes(),
-            block_sync_threshold_bytes: cfg.block_sync_threshold_bytes(),
-        }
+        Self::new(cfg.block_size_bytes(), cfg.block_sync_threshold_bytes())
+            .expect("Config guarantees non-zero block_size_bytes")
     }
 }
 
 impl From<&crate::config::TargetSyncConfig> for StoreConfig {
     fn from(cfg: &crate::config::TargetSyncConfig) -> Self {
-        Self {
-            block_size_bytes: cfg.block_size_bytes(),
-            block_sync_threshold_bytes: cfg.block_sync_threshold_bytes(),
-        }
+        Self::new(cfg.block_size_bytes(), cfg.block_sync_threshold_bytes())
+            .expect("TargetSyncConfig guarantees non-zero block_size_bytes")
     }
 }
 
@@ -199,8 +215,8 @@ impl SqliteHashStore {
         let cached_threshold = self.get_meta_value("block_sync_threshold_bytes")?;
         let cached_version = self.get_meta_value("db_version")?;
 
-        let current_block_size = config.block_size_bytes.to_string();
-        let current_threshold = config.block_sync_threshold_bytes.to_string();
+        let current_block_size = config.block_size_bytes().to_string();
+        let current_threshold = config.block_sync_threshold_bytes().to_string();
         let current_version = "4";
 
         // Treat any missing key or mismatch as requiring a full purge
@@ -781,14 +797,14 @@ mod tests {
 
     #[test]
     fn test_store_config_conversions() {
-        let sc = StoreConfig::new(4096, 8192);
-        assert_eq!(sc.block_size_bytes, 4096);
-        assert_eq!(sc.block_sync_threshold_bytes, 8192);
+        let sc = StoreConfig::new(4096, 8192).unwrap();
+        assert_eq!(sc.block_size_bytes(), 4096);
+        assert_eq!(sc.block_sync_threshold_bytes(), 8192);
 
         let cfg = dummy_config(2048);
         let from_cfg = StoreConfig::from(&cfg);
-        assert_eq!(from_cfg.block_size_bytes, 2048);
-        assert_eq!(from_cfg.block_sync_threshold_bytes, 4096);
+        assert_eq!(from_cfg.block_size_bytes(), 2048);
+        assert_eq!(from_cfg.block_sync_threshold_bytes(), 4096);
     }
 
     #[test]
@@ -997,7 +1013,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteHashStore::new(
             &dir.path().join("test.db"),
-            StoreConfig::new(1_048_576, 10_485_760),
+            StoreConfig::new(1_048_576, 10_485_760).unwrap(),
         )
         .unwrap();
         // Insert a file and its "child" directory file
@@ -1020,7 +1036,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteHashStore::new(
             &dir.path().join("test.db"),
-            StoreConfig::new(1_048_576, 10_485_760),
+            StoreConfig::new(1_048_576, 10_485_760).unwrap(),
         )
         .unwrap();
         let records: Vec<(FileRecord, Vec<BlockHash>)> = (0..100)
@@ -1036,5 +1052,22 @@ mod tests {
         store.save_files_batch(&batch).unwrap();
         let all = store.list_all_records().unwrap();
         assert_eq!(all.len(), 100);
+    }
+
+    #[test]
+    fn test_store_config_validation_rejects_zero() {
+        let res_zero = StoreConfig::new(0, 10_485_760);
+        assert!(
+            res_zero.is_err(),
+            "StoreConfig::new must reject block_size_bytes == 0"
+        );
+        let valid = StoreConfig::new(1_048_576, 10_485_760);
+        assert!(
+            valid.is_ok(),
+            "StoreConfig::new must accept positive block_size_bytes"
+        );
+        let cfg = valid.unwrap();
+        assert_eq!(cfg.block_size_bytes(), 1_048_576);
+        assert_eq!(cfg.block_sync_threshold_bytes(), 10_485_760);
     }
 }

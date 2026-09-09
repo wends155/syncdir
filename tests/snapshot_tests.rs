@@ -159,6 +159,12 @@ fn test_sync_error_display_lock_poison() {
 }
 
 #[test]
+fn test_sync_error_display_cancelled() {
+    let err = SyncError::Cancelled;
+    assert_snapshot!(err.to_string());
+}
+
+#[test]
 fn test_sync_error_display_write_verification_failed() {
     let err = SyncError::write_verification_failed(PathBuf::from(r"D:\backup\data.bin"));
     assert_snapshot!(err.to_string());
