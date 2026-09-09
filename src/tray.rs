@@ -1,3 +1,5 @@
+pub(crate) mod assets;
+
 use crate::error::SyncError;
 use crate::sync::{ConnectivityState, WatcherState};
 use std::cell::Cell;
@@ -54,17 +56,36 @@ pub(crate) fn open_path(path: &Path) -> Result<(), SyncError> {
 /// Communicates the connectivity state of the source and destination directories
 /// to the tray interface for visual tray signaling and tooltips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[repr(usize)]
 pub enum EngineStatus {
     /// Both source and destination directories are online and accessible.
-    Healthy,
+    Healthy = 0,
     /// Some (but not all) destination directories are offline.
-    Degraded,
+    Degraded = 1,
     /// The source directory is missing or unmounted.
-    SourceOffline,
+    SourceOffline = 2,
     /// The destination directory is missing or unmounted.
-    DestinationOffline,
+    DestinationOffline = 3,
     /// Both directories are missing or unmounted.
-    BothOffline,
+    BothOffline = 4,
+}
+
+impl EngineStatus {
+    pub const COUNT: usize = 5;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Healthy,
+        Self::Degraded,
+        Self::SourceOffline,
+        Self::DestinationOffline,
+        Self::BothOffline,
+    ];
+
+    #[inline]
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// Reason the tray event loop exited.
