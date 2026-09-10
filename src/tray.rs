@@ -880,6 +880,48 @@ impl TrayEventLoop {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn system_root() -> PathBuf {
+    std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("windir"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+}
+
+/// Launches the system file explorer targeting the specified path.
+///
+/// Returns `Err(std::io::Error)` with `ErrorKind::NotFound` if the path does not exist
+/// or if explorer is not found.
+pub fn open_path(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Path does not exist: {}", path.display()),
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let explorer = system_root().join("explorer.exe");
+        if !explorer.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Explorer executable not found at {}", explorer.display()),
+            ));
+        }
+        std::process::Command::new(explorer).arg(path).spawn()?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(opener).arg(path).spawn()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,8 +1038,16 @@ mod tests {
 
     #[test]
     fn test_tray_open_path_nonexistent() {
-        let res = crate::path_util::open_path(Path::new("Z:\\nonexistent_dir_12345\\missing"));
+        let res = crate::tray::open_path(Path::new("Z:\\nonexistent_dir_12345\\missing"));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_tray_open_path_nonexistent_returns_err() {
+        let non_existent = std::path::Path::new("C:\\definitely_does_not_exist_tray_test_12345");
+        let res = crate::tray::open_path(non_existent);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

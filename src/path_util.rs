@@ -173,6 +173,7 @@ pub fn system_root() -> PathBuf {
 ///
 /// Returns `Err(std::io::Error)` with `ErrorKind::NotFound` if the path does not exist
 /// or if explorer is not found.
+#[deprecated(since = "0.1.13", note = "Use tray::open_path instead")]
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Err(std::io::Error::new(

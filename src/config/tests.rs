@@ -2,7 +2,6 @@
 
 use super::validation::preprocess_config_toml;
 use super::*;
-use crate::path_util::system_root;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -654,12 +653,6 @@ fn test_validate_rejects_zero_threshold() {
             .to_string()
             .contains("block_sync_threshold_bytes")
     );
-}
-
-#[test]
-fn test_system_root() {
-    let root = system_root();
-    assert!(!root.as_os_str().is_empty());
 }
 
 #[test]

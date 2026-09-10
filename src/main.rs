@@ -10,10 +10,11 @@ use syncdir::config::Config;
 use syncdir::daemon::{DaemonHandle, SyncDaemon};
 use syncdir::error::SyncError;
 use syncdir::net::{NetworkResolver, Win32NetworkResolver};
-use syncdir::path_util::open_path;
 use syncdir::startup::RegistryBackend;
 use syncdir::sync::ConnectivityState;
-use syncdir::tray::{DestinationState, TrayActionHandler, TrayEventLoop, TrayExitReason};
+use syncdir::tray::{
+    open_path, DestinationState, TrayActionHandler, TrayEventLoop, TrayExitReason,
+};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
