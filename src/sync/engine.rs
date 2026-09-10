@@ -444,6 +444,55 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
     }
 
+    pub(crate) fn verify_destination_cached(
+        &self,
+        dest_dir: &Path,
+        rel_path: &Path,
+    ) -> Result<Option<std::fs::Metadata>, SyncError> {
+        let (root_verified, unverified_ancestors) = {
+            let cache = self
+                .verified_dirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let root_ok = cache.contains(dest_dir);
+            let mut unverified = Vec::new();
+            let mut curr = dest_dir.to_path_buf();
+            let components: Vec<_> = rel_path.components().collect();
+            let total = components.len();
+            for (i, c) in components.into_iter().enumerate() {
+                curr.push(c);
+                if i + 1 < total && !cache.contains(&curr) {
+                    unverified.push(curr.clone());
+                }
+            }
+            (root_ok, unverified)
+        };
+
+        if !root_verified || !unverified_ancestors.is_empty() {
+            let mut cache = self
+                .verified_dirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            verify_destination_not_reparse_cached(dest_dir, rel_path, &mut cache)
+        } else {
+            let leaf_path = dest_dir.join(rel_path);
+            let meta = match fs::symlink_metadata(&leaf_path) {
+                Ok(m) => {
+                    if is_reparse_or_symlink_meta(&m) {
+                        return Err(SyncError::validation(format!(
+                            "Destination component '{}' is a symlink or reparse point; refusing to write",
+                            leaf_path.display()
+                        )));
+                    }
+                    Some(m)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(SyncError::Io(e)),
+            };
+            Ok(meta)
+        }
+    }
+
     pub(crate) fn sync_file_to_dest_core(
         &self,
         rel_path: &Path,
@@ -467,13 +516,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
         verify_source_not_reparse(self.config.source_dir(), rel_path)?;
         if sym_meta.is_dir() {
-            let _ = {
-                let mut cache = self
-                    .verified_dirs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                verify_destination_not_reparse_cached(dest_dir, rel_path, &mut cache)?
-            };
+            let _ = self.verify_destination_cached(dest_dir, rel_path)?;
             fs::create_dir_all(&dest_path)?;
             let mut dir_files = HashSet::new();
             let mut scan_complete = true;
@@ -490,30 +533,37 @@ impl<S: HashStore> LocalSyncEngine<S> {
             return Ok(None);
         }
 
-        let dest_meta = {
-            let mut cache = self
-                .verified_dirs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            verify_destination_not_reparse_cached(dest_dir, rel_path, &mut cache)?
-        };
+        let dest_meta = self.verify_destination_cached(dest_dir, rel_path)?;
 
         let src_size = sym_meta.len() as i64;
         let src_mod = safe_modified_millis(&sym_meta)?;
 
-        if dest_meta.is_some()
-            && let Some(record) = file_record
-            && record.is_tracked()
-            && record.file_size == src_size
-            && record.last_modified == src_mod
-        {
-            tracing::debug!(path = %rel_path.display(), "Local signature cache hit, skipping destination check");
-            return Ok(None);
-        }
+        if let Some(dest_meta_ref) = dest_meta.as_ref() {
+            let dest_size = dest_meta_ref.len() as i64;
+            let dest_mod = safe_modified_millis(dest_meta_ref).unwrap_or(0);
+            if dest_size == src_size && dest_mod.abs_diff(src_mod) <= 2000 {
+                if let Some(record) = file_record
+                    && record.is_tracked()
+                    && record.file_size == src_size
+                    && record.last_modified == src_mod
+                {
+                    tracing::debug!(path = %rel_path.display(), "Local signature cache hit and destination matches, skipping sync");
+                    return Ok(None);
+                }
 
-        if Self::is_metadata_up_to_date(dest_meta.as_ref(), src_size, src_mod, file_record) {
-            tracing::debug!(path = %rel_path.display(), "Metadata unchanged, skipping sync");
-            return Ok(None);
+                if Self::is_metadata_up_to_date(Some(dest_meta_ref), src_size, src_mod, file_record)
+                {
+                    tracing::debug!(path = %rel_path.display(), "Metadata unchanged, skipping sync");
+                    return Ok(None);
+                }
+            } else {
+                tracing::debug!(
+                    path = %rel_path.display(),
+                    src_size,
+                    dest_size,
+                    "Destination file size or timestamp mismatch; re-synchronizing"
+                );
+            }
         }
 
         let cached_id = file_record.and_then(|r| r.id);
@@ -903,7 +953,7 @@ mod tests {
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let dst_file = dst.join(file_rel);
-        fs::write(&dst_file, b"existing dest payload").unwrap();
+        fs::write(&dst_file, b"cache hit payload").unwrap();
 
         let mut scratch = vec![0u8; 4096];
         let res = engine.sync_file_to_dest_core(file_rel, &dst, &mut scratch, Some(&record));
@@ -911,8 +961,46 @@ mod tests {
         assert_eq!(res.unwrap(), None);
         assert_eq!(
             fs::read(&dst_file).unwrap(),
-            b"existing dest payload",
+            b"cache hit payload",
             "Fast path should not overwrite destination when cache hits"
+        );
+    }
+
+    #[test]
+    fn test_sync_file_to_dest_core_repairs_truncated_dest_file() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        let file_rel = Path::new("truncated.txt");
+        let src_file = src.join(file_rel);
+        let payload = b"complete source payload of substantial length";
+        fs::write(&src_file, payload).unwrap();
+        let meta = fs::symlink_metadata(&src_file).unwrap();
+        let src_size = meta.len() as i64;
+        let src_mod = safe_modified_millis(&meta).unwrap();
+
+        let record = FileRecord::new(file_rel.to_path_buf(), src_size, src_mod).with_id(99);
+        let config = Config::test_default(src, dst.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        let dst_file = dst.join(file_rel);
+        fs::write(&dst_file, b"truncated").unwrap(); // 9 bytes vs 45 bytes
+
+        let mut scratch = vec![0u8; 4096];
+        let res = engine.sync_file_to_dest_core(file_rel, &dst, &mut scratch, Some(&record));
+        assert!(res.is_ok());
+        assert!(
+            res.unwrap().is_some(),
+            "Truncated destination must trigger synchronization"
+        );
+        assert_eq!(
+            fs::read(&dst_file).unwrap(),
+            payload,
+            "Destination file must be repaired to match source"
         );
     }
 
