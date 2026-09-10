@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::TargetSyncConfig;
 use crate::db::HashStore;
 use crate::error::SyncError;
 
@@ -125,7 +126,17 @@ pub(crate) fn prune_archive(
     Ok(())
 }
 
-impl<S: HashStore> LocalSyncEngine<S> {
+/// Dedicated collaborating manager for timestamped archive file creation, path resolution, and retention pruning.
+#[derive(Debug, Clone)]
+pub(crate) struct ArchiveManager {
+    config: TargetSyncConfig,
+}
+
+impl ArchiveManager {
+    pub(crate) fn new(config: TargetSyncConfig) -> Self {
+        Self { config }
+    }
+
     /// Build the archive path: `<dest>/.syncdir_archive/<ts>_<relative_path>`.
     pub(crate) fn get_archive_path(
         &self,
@@ -210,6 +221,23 @@ impl<S: HashStore> LocalSyncEngine<S> {
         Ok(())
     }
 
+    /// Prune old and excess files in the destination archive.
+    pub(crate) fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
+        let archive_dir = dest_dir.join(".syncdir_archive");
+        prune_archive(&archive_dir, 30, 10 * 1024 * 1024 * 1024)
+    }
+}
+
+impl<S: HashStore> LocalSyncEngine<S> {
+    /// Archive or remove a file on destination filesystem without updating the database.
+    pub(crate) fn archive_dest_file_only(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+    ) -> Result<(), SyncError> {
+        ArchiveManager::new(self.config.clone()).archive_dest_file_only(rel_path, dest_dir)
+    }
+
     /// Handle deletion of a file on a specific destination directory.
     pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
         self.archive_dest_file_only(rel_path, dest_dir)?;
@@ -225,8 +253,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
     /// Prune old and excess files in the destination archive.
     pub fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
-        let archive_dir = dest_dir.join(".syncdir_archive");
-        prune_archive(&archive_dir, 30, 10 * 1024 * 1024 * 1024)
+        ArchiveManager::new(self.config.clone()).prune_destination_archive(dest_dir)
     }
 }
 
@@ -759,5 +786,41 @@ mod tests {
             err
         );
         assert!(err.to_string().contains("reparse point or junction"));
+    }
+
+    #[test]
+    fn test_archive_manager_standalone() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let cfg = test_config(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let manager = ArchiveManager::new(target_cfg);
+
+        let p = manager
+            .get_archive_path(&dest, Path::new("sub/doc.txt"), "20260910")
+            .unwrap();
+        assert_eq!(
+            p,
+            dest.join(".syncdir_archive")
+                .join("20260910_sub")
+                .join("doc.txt")
+        );
+
+        let file = dest.join("victim.txt");
+        fs::write(&file, b"content").unwrap();
+        manager
+            .archive_dest_file_only(Path::new("victim.txt"), &dest)
+            .unwrap();
+        assert!(!file.exists(), "Original file should be moved to archive");
+
+        let archive_dir = dest.join(".syncdir_archive");
+        assert!(archive_dir.exists());
+
+        let prune_res = manager.prune_destination_archive(&dest);
+        assert!(prune_res.is_ok());
     }
 }

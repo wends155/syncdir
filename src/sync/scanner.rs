@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::config::TargetSyncConfig;
 use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 
@@ -103,6 +104,35 @@ pub(crate) fn scan_dir(
     }
 }
 
+/// Dedicated collaborating scanner for recursive directory traversal and cancellation.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectoryScanner {
+    config: TargetSyncConfig,
+}
+
+impl DirectoryScanner {
+    pub(crate) fn new(config: TargetSyncConfig) -> Self {
+        Self { config }
+    }
+
+    /// Perform a cancellable scan of the source directory, populating `files` with relative paths.
+    pub(crate) fn scan_dir_cancellable(
+        &self,
+        source_root: &Path,
+        files: &mut HashSet<PathBuf>,
+        scan_complete: &mut bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), SyncError> {
+        scan_dir_cancellable(source_root, source_root, files, scan_complete, 0, cancel)
+    }
+
+    /// Return a reference to the configured target sync settings.
+    #[allow(dead_code)]
+    pub(crate) fn config(&self) -> &TargetSyncConfig {
+        &self.config
+    }
+}
+
 impl<S: HashStore> LocalSyncEngine<S> {
     /// Flush accumulated file records and hashes to the database in a single batch.
     pub(crate) fn flush_record_batch(
@@ -156,12 +186,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         let mut source_files: HashSet<PathBuf> = HashSet::new();
         let mut scan_complete = true;
-        scan_dir_cancellable(
-            resolved_source,
+        let scanner = DirectoryScanner::new(self.config.clone());
+        scanner.scan_dir_cancellable(
             resolved_source,
             &mut source_files,
             &mut scan_complete,
-            0,
             cancel,
         )?;
 
@@ -698,5 +727,34 @@ mod tests {
         let outcome = engine.run_full_scan().unwrap();
         assert!(matches!(outcome, ScanOutcome::Success { synced: 1 }));
         assert!(alt_dst.join("hello.txt").exists());
+    }
+
+    #[test]
+    fn test_directory_scanner_standalone() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        fs::write(src.join("file1.txt"), b"1").unwrap();
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("nested").join("file2.txt"), b"2").unwrap();
+
+        let config = Config::test_default(src.clone(), dst);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let scanner = DirectoryScanner::new(target_cfg);
+
+        let mut files = HashSet::new();
+        let mut scan_complete = true;
+        let cancel = AtomicBool::new(false);
+        scanner
+            .scan_dir_cancellable(&src, &mut files, &mut scan_complete, &cancel)
+            .unwrap();
+
+        assert!(scan_complete);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(Path::new("file1.txt")));
+        assert!(files.contains(&Path::new("nested").join("file2.txt")));
     }
 }

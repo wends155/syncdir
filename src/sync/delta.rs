@@ -3,12 +3,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::time::SystemTime;
 
-use crate::config::VerificationMode;
+use crate::config::{TargetSyncConfig, VerificationMode};
 use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 
 use super::engine::{
-    FileSyncTask, LocalSyncEngine, safe_epoch_duration_millis, safe_modified_millis,
+    DirtyRangeLease, FileSyncTask, LocalSyncEngine, safe_epoch_duration_millis,
+    safe_modified_millis,
 };
 
 /// Contiguous range of dirty blocks to coalesce delta writes and reduce seek overhead.
@@ -204,7 +205,44 @@ pub(crate) fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usiz
     Ok(total)
 }
 
-impl<S: HashStore> LocalSyncEngine<S> {
+/// Collaborating transfer engine for large-file chunk hashing and in-place delta updates.
+pub(crate) struct DeltaTransferEngine<S: HashStore> {
+    db: S,
+    config: TargetSyncConfig,
+    dirty_range_pool: std::sync::Mutex<Option<DirtyBlockRange>>,
+}
+
+impl<S: HashStore> DeltaTransferEngine<S> {
+    #[allow(dead_code)]
+    pub(crate) fn new(db: S, config: TargetSyncConfig) -> Self {
+        Self {
+            db,
+            config,
+            dirty_range_pool: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn acquire_dirty_range_lease(&self) -> DirtyRangeLease<'_> {
+        let mut pool = self
+            .dirty_range_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let range = pool
+            .take()
+            .unwrap_or_else(|| DirtyBlockRange::new(self.config.block_size_nonzero()));
+        DirtyRangeLease::new(&self.dirty_range_pool, range)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dirty_range_capacity(&self) -> usize {
+        self.dirty_range_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.capacity())
+            .unwrap_or(0)
+    }
+
     pub(crate) fn sync_delta_large_file_core(
         &self,
         task: &FileSyncTask<'_>,
@@ -410,6 +448,35 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 Err(e)
             }
         }
+    }
+}
+
+impl<S: HashStore> LocalSyncEngine<S> {
+    pub(crate) fn sync_delta_large_file_core(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
+        let pool = self
+            .dirty_range_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let engine = DeltaTransferEngine {
+            db: &self.db,
+            config: self.config.clone(),
+            dirty_range_pool: std::sync::Mutex::new(pool),
+        };
+        let res = engine.sync_delta_large_file_core(task, scratch);
+        let returned_pool = engine
+            .dirty_range_pool
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self
+            .dirty_range_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = returned_pool;
+        res
     }
 
     #[cfg(test)]
@@ -842,5 +909,54 @@ mod tests {
         );
         assert_eq!(range.block_count(), 0);
         assert_eq!(range.byte_len(), 0);
+    }
+
+    #[test]
+    fn test_delta_transfer_engine_standalone() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("test.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let cfg = test_config(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let store_cfg = crate::db::StoreConfig::new(
+            target_cfg.block_size_bytes(),
+            target_cfg.block_sync_threshold_bytes(),
+        )
+        .unwrap();
+        let db = SqliteHashStore::new(&db_path, store_cfg).unwrap();
+        let engine = DeltaTransferEngine::new(db, target_cfg);
+
+        let src_file = source.join("large.bin");
+        let dst_file = dest.join("large.bin");
+        let payload = vec![0xABu8; 1024];
+        fs::write(&src_file, &payload).unwrap();
+
+        let meta = fs::metadata(&src_file).unwrap();
+        let task = FileSyncTask {
+            rel_path: Path::new("large.bin"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dest,
+            src_size: meta.len() as i64,
+            src_mod: safe_modified_millis(&meta).unwrap(),
+            cached_id: None,
+        };
+
+        let mut scratch = vec![0u8; 512];
+        let (record, block_hashes) = engine
+            .sync_delta_large_file_core(&task, &mut scratch)
+            .unwrap();
+        assert_eq!(record.relative_path, Path::new("large.bin"));
+        assert_eq!(record.file_size, 1024);
+        assert_eq!(block_hashes.len(), 2);
+        assert_eq!(fs::read(&dst_file).unwrap(), payload);
+        assert!(
+            engine.dirty_range_capacity() >= 512,
+            "dirty_range_capacity should retain allocated buffer"
+        );
     }
 }

@@ -186,6 +186,40 @@ impl<S: HashStore + ?Sized> HashStore for std::sync::Arc<S> {
     }
 }
 
+impl<S: HashStore + ?Sized> HashStore for &S {
+    fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
+        (**self).get_file(path)
+    }
+
+    fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
+        (**self).save_file(record, hashes)
+    }
+
+    fn get_block_hashes(&self, path: &Path) -> Result<Vec<BlockHash>, SyncError> {
+        (**self).get_block_hashes(path)
+    }
+
+    fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
+        (**self).delete_file(path)
+    }
+
+    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+        (**self).list_files()
+    }
+
+    fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
+        (**self).list_all_records()
+    }
+
+    fn save_files_batch(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError> {
+        (**self).save_files_batch(records)
+    }
+
+    fn delete_files_batch(&self, paths: &[&Path]) -> Result<(), SyncError> {
+        (**self).delete_files_batch(paths)
+    }
+}
+
 /// SQLite implementation of `HashStore`.
 pub struct SqliteHashStore {
     conn: Mutex<Connection>,

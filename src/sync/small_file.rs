@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::config::VerificationMode;
+use crate::config::{TargetSyncConfig, VerificationMode};
 use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 
@@ -43,7 +43,17 @@ impl Drop for TempFileGuard {
 /// Global atomic counter for unique temporary staging file generation across threads.
 static TEMP_FILE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-impl<S: HashStore> LocalSyncEngine<S> {
+/// Dedicated collaborating engine for atomic small-file streaming and verification.
+#[derive(Debug, Clone)]
+pub(crate) struct SmallFileTransferEngine {
+    config: TargetSyncConfig,
+}
+
+impl SmallFileTransferEngine {
+    pub(crate) fn new(config: TargetSyncConfig) -> Self {
+        Self { config }
+    }
+
     pub(crate) fn sync_small_file_core(
         &self,
         task: &FileSyncTask<'_>,
@@ -192,6 +202,17 @@ impl<S: HashStore> LocalSyncEngine<S> {
             "Synced file to destination via atomic staging"
         );
         Ok((record, Vec::new()))
+    }
+}
+
+impl<S: HashStore> LocalSyncEngine<S> {
+    pub(crate) fn sync_small_file_core(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
+        let engine = SmallFileTransferEngine::new(self.config.clone());
+        engine.sync_small_file_core(task, scratch)
     }
 
     #[cfg(test)]
@@ -631,5 +652,40 @@ mod tests {
             0,
             "No .syncdir_tmp orphan files should remain in destination"
         );
+    }
+
+    #[test]
+    fn test_small_file_transfer_engine_standalone() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let cfg = test_config(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let engine = SmallFileTransferEngine::new(target_cfg);
+
+        let src_file = source.join("hello.txt");
+        let dst_file = dest.join("hello.txt");
+        fs::write(&src_file, b"Hello standalone engine!").unwrap();
+
+        let meta = fs::metadata(&src_file).unwrap();
+        let task = FileSyncTask {
+            rel_path: Path::new("hello.txt"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dest,
+            src_size: meta.len() as i64,
+            src_mod: safe_modified_millis(&meta).unwrap(),
+            cached_id: None,
+        };
+
+        let mut scratch = vec![0u8; 64 * 1024];
+        let (record, block_hashes) = engine.sync_small_file_core(&task, &mut scratch).unwrap();
+        assert_eq!(record.relative_path, Path::new("hello.txt"));
+        assert_eq!(record.file_size, meta.len() as i64);
+        assert!(block_hashes.is_empty());
+        assert_eq!(fs::read(&dst_file).unwrap(), b"Hello standalone engine!");
     }
 }

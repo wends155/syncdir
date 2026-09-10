@@ -289,6 +289,18 @@ pub struct DirtyRangeLease<'a> {
     range: Option<DirtyBlockRange>,
 }
 
+impl<'a> DirtyRangeLease<'a> {
+    pub(crate) fn new(
+        pool: &'a std::sync::Mutex<Option<DirtyBlockRange>>,
+        range: DirtyBlockRange,
+    ) -> Self {
+        Self {
+            pool,
+            range: Some(range),
+        }
+    }
+}
+
 impl<'a> std::ops::Deref for DirtyRangeLease<'a> {
     type Target = DirtyBlockRange;
 
