@@ -376,3 +376,72 @@ fn test_sync_daemon_shutdown_order() {
     let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
     daemon.shutdown();
 }
+
+#[test]
+fn test_worker_reachability_and_offline_drain_guard() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    use syncdir::net::MockNetworkResolver;
+    use syncdir::sync::mock::MockSyncEngine;
+    use syncdir::sync::{SyncWorkerContext, start_sync_worker};
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("source");
+    let dst = dir.path().join("dest");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+
+    let config = Config::builder(src)
+        .dest_dir(dst.clone())
+        .debounce_seconds(0)
+        .retry_interval_seconds(1)
+        .build();
+    let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+
+    let mock_engine = MockSyncEngine::new();
+    let mock_resolver = Arc::new(MockNetworkResolver::new());
+    // Initially mark destination inaccessible via mock resolver
+    mock_resolver.set_destination_accessible(false);
+
+    let (tx, rx) = channel();
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    let mut context = SyncWorkerContext::new(0, target_cfg, mock_engine.clone(), rx, None, true);
+    context.resolver = mock_resolver.clone();
+    context.cancellation = cancellation.clone();
+
+    let handle = start_sync_worker(context).unwrap();
+
+    // Send a sync command while offline
+    tx.send(SyncCommand::FileModified(PathBuf::from("offline_test.txt")))
+        .unwrap();
+
+    // Sleep briefly to allow worker loop tick
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Because resolver said destination was inaccessible, mock_engine must NOT have synced
+    assert_eq!(
+        mock_engine.synced_calls().len(),
+        0,
+        "Worker must not attempt sync while resolver indicates destination is inaccessible"
+    );
+
+    // Now restore accessibility via resolver
+    mock_resolver.set_destination_accessible(true);
+
+    // Wait for reachability check interval and drain
+    let start = std::time::Instant::now();
+    while mock_engine.synced_calls().is_empty() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !mock_engine.synced_calls().is_empty(),
+        "Worker must sync file once destination becomes accessible via resolver"
+    );
+
+    cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = handle.join();
+}

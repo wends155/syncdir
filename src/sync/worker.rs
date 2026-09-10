@@ -267,23 +267,19 @@ impl ReachabilityMonitor {
         let resolved = self
             .resolver
             .try_resolve_alternate_path(&self.configured_dest);
-        let online = match std::fs::metadata(&resolved) {
-            Ok(m) => m.is_dir(),
-            Err(_) => match std::fs::metadata(&self.configured_dest) {
-                Ok(m) => m.is_dir(),
-                Err(_) => false,
-            },
+        let resolved_accessible = self.resolver.is_destination_accessible(&resolved);
+        let configured_accessible = if !resolved_accessible && resolved != self.configured_dest {
+            self.resolver
+                .is_destination_accessible(&self.configured_dest)
+        } else {
+            false
         };
 
-        if online {
-            if std::fs::metadata(&resolved)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                self.active_dest = resolved;
-            } else {
-                self.active_dest = self.configured_dest.clone();
-            }
+        if resolved_accessible {
+            self.active_dest = resolved;
+            self.dest_online = true;
+        } else if configured_accessible {
+            self.active_dest = self.configured_dest.clone();
             self.dest_online = true;
         } else {
             self.active_dest = self.configured_dest.clone();
@@ -333,6 +329,7 @@ pub(crate) struct SyncWorkerState {
     pub(crate) failure_tracker: HashMap<PathBuf, u32>,
     pub(crate) hourly_prune_interval: std::time::Duration,
     pub(crate) last_archive_prune: Instant,
+    pub(crate) needs_catchup_scan: bool,
 }
 
 impl SyncWorkerState {
@@ -343,6 +340,7 @@ impl SyncWorkerState {
             failure_tracker: HashMap::new(),
             hourly_prune_interval: std::time::Duration::from_secs(3600),
             last_archive_prune: Instant::now(),
+            needs_catchup_scan: false,
         }
     }
 
@@ -366,6 +364,36 @@ impl SyncWorkerState {
     /// Reset failure count upon successful synchronization.
     pub fn reset_failure(&mut self, path: &Path) {
         self.failure_tracker.remove(path);
+    }
+
+    /// Marks that a catch-up scan is required (e.g. on queue overflow or permanent eviction).
+    pub fn mark_needs_catchup_scan(&mut self) {
+        self.needs_catchup_scan = true;
+    }
+
+    /// Clears the catch-up scan requirement flag.
+    pub fn clear_needs_catchup_scan(&mut self) {
+        self.needs_catchup_scan = false;
+    }
+
+    /// Whether a catch-up full scan is currently needed.
+    #[must_use]
+    pub fn needs_catchup_scan(&self) -> bool {
+        self.needs_catchup_scan
+    }
+
+    /// Determines if a catch-up scan should execute based on queue depth and connectivity.
+    pub fn should_trigger_catchup_scan(
+        &self,
+        queue_pending: usize,
+        drain_threshold: usize,
+        source_online: bool,
+        dest_online: bool,
+    ) -> bool {
+        self.needs_catchup_scan()
+            && queue_pending <= drain_threshold
+            && source_online
+            && dest_online
     }
 }
 
@@ -489,7 +517,6 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
             let mut state = SyncWorkerState::new(config.block_size_bytes());
             let debounce_dur = std::time::Duration::from_secs(config.debounce_seconds());
             let retry_dur = std::time::Duration::from_secs(config.retry_interval_seconds());
-            let mut needs_catchup_scan = false;
             let drain_threshold = 1_000.min(max_pending_queue / 2);
 
             loop {
@@ -552,24 +579,22 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     match cmd {
                         SyncCommand::FileModified(path) => {
                             state.reset_failure(&path);
-                            if !queue.enqueue_sync(path.clone(), debounce_dur) {
+                            if !queue.enqueue_sync(path, debounce_dur) {
                                 tracing::error!(
-                                    path = %path.display(),
                                     target_index = target_index + 1,
                                     "Debounce queue overflow on file modify; scheduling catchup scan"
                                 );
-                                needs_catchup_scan = true;
+                                state.mark_needs_catchup_scan();
                             }
                         }
                         SyncCommand::FileDeleted(path) => {
                             state.reset_failure(&path);
-                            if !queue.enqueue_delete(path.clone(), debounce_dur) {
+                            if !queue.enqueue_delete(path, debounce_dur) {
                                 tracing::error!(
-                                    path = %path.display(),
                                     target_index = target_index + 1,
                                     "Debounce queue overflow on file delete; scheduling catchup scan"
                                 );
-                                needs_catchup_scan = true;
+                                state.mark_needs_catchup_scan();
                             }
                         }
                         SyncCommand::TriggerFullScan => {
@@ -626,178 +651,196 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
 
                 let mut network_offline_detected = false;
 
-                // Drain and process ready syncs
-                let ready_syncs = queue.drain_ready_syncs(now);
-                for path in ready_syncs {
-                    if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    if network_offline_detected
-                        || !source_connectivity.is_online()
-                        || !reachability.is_dest_online()
-                    {
-                        queue.requeue_sync_retry(path, retry_dur);
-                        continue;
-                    }
-
-                    match engine.sync_file_to_dest_buffered(
-                        &path,
-                        reachability.active_dest(),
-                        &mut state.scratch,
-                    ) {
-                        Ok(()) => {
-                            state.reset_failure(&path);
+                // Drain and process ready syncs only if destination and source are online
+                if reachability.is_dest_online()
+                    && source_connectivity.is_online()
+                    && !network_offline_detected
+                {
+                    let ready_syncs = queue.drain_ready_syncs(now);
+                    for path in ready_syncs {
+                        if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
                         }
-                        Err(SyncError::WriteVerificationFailed { .. }) => {
-                            let attempts = state.record_failure(&path);
-                            if attempts <= 10 {
-                                let backoff = calculate_exponential_backoff(attempts, retry_dur);
-                                tracing::warn!(
-                                    path = %path.display(),
-                                    attempt = attempts,
-                                    ?backoff,
-                                    "Write verification failed; rescheduling retry"
-                                );
-                                queue.requeue_sync_retry(path, backoff);
-                            } else {
+                        if network_offline_detected
+                            || !source_connectivity.is_online()
+                            || !reachability.is_dest_online()
+                        {
+                            queue.requeue_sync_retry(path, retry_dur);
+                            continue;
+                        }
+
+                        match engine.sync_file_to_dest_buffered(
+                            &path,
+                            reachability.active_dest(),
+                            &mut state.scratch,
+                        ) {
+                            Ok(()) => {
+                                state.reset_failure(&path);
+                            }
+                            Err(SyncError::WriteVerificationFailed { .. }) => {
+                                let attempts = state.record_failure(&path);
+                                if attempts <= 10 {
+                                    let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                                    tracing::warn!(
+                                        path = %path.display(),
+                                        attempt = attempts,
+                                        ?backoff,
+                                        "Write verification failed; rescheduling retry"
+                                    );
+                                    queue.requeue_sync_retry(path, backoff);
+                                } else {
+                                    tracing::error!(
+                                        path = %path.display(),
+                                        "Write verification permanently failed after 10 retries"
+                                    );
+                                    state.reset_failure(&path);
+                                    if let Some(ref obs) = observer {
+                                        obs.on_write_verification_failed(&path);
+                                    }
+                                }
+                            }
+                            Err(SyncError::Validation(msg)) => {
                                 tracing::error!(
                                     path = %path.display(),
-                                    "Write verification permanently failed after 10 retries"
+                                    target = %reachability.active_dest().display(),
+                                    error = %msg,
+                                    "Permanent validation failure; evicting from sync queue without retry"
                                 );
-                                if let Some(ref obs) = observer {
-                                    obs.on_write_verification_failed(&path);
+                                state.reset_failure(&path);
+                            }
+                            Err(e) if e.is_network_offline() => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "Target offline detected; bailing out queue"
+                                );
+                                network_offline_detected = true;
+                                reachability.mark_offline(observer.as_ref());
+                                queue.requeue_sync_retry(path, retry_dur);
+                            }
+                            Err(e) => {
+                                let os_code = match &e {
+                                    SyncError::Io(io_err) => io_err.raw_os_error(),
+                                    _ => None,
+                                };
+                                let attempts = state.record_failure(&path);
+                                if attempts <= 10 {
+                                    let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                                    tracing::warn!(
+                                        path = %path.display(),
+                                        target = %reachability.active_dest().display(),
+                                        error = %e,
+                                        os_error = ?os_code,
+                                        attempt = attempts,
+                                        ?backoff,
+                                        "Sync failed, scheduling retry with backoff"
+                                    );
+                                    queue.requeue_sync_retry(path, backoff);
+                                } else {
+                                    tracing::error!(
+                                        path = %path.display(),
+                                        target = %reachability.active_dest().display(),
+                                        error = %e,
+                                        os_error = ?os_code,
+                                        "Sync permanently failed after 10 retries; evicting and scheduling catchup scan"
+                                    );
+                                    state.reset_failure(&path);
+                                    state.mark_needs_catchup_scan();
                                 }
                             }
                         }
-                        Err(SyncError::Validation(msg)) => {
-                            tracing::error!(
-                                path = %path.display(),
-                                target = %reachability.active_dest().display(),
-                                error = %msg,
-                                "Permanent validation failure; evicting from sync queue without retry"
-                            );
-                        }
-                        Err(e) if e.is_network_offline() => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %e,
-                                "Target offline detected; bailing out queue"
-                            );
-                            network_offline_detected = true;
-                            reachability.mark_offline(observer.as_ref());
-                            queue.requeue_sync_retry(path, retry_dur);
-                        }
-                        Err(e) => {
-                            let os_code = match &e {
-                                SyncError::Io(io_err) => io_err.raw_os_error(),
-                                _ => None,
-                            };
-                            let attempts = state.record_failure(&path);
-                            if attempts <= 10 {
-                                let backoff = calculate_exponential_backoff(attempts, retry_dur);
-                                tracing::warn!(
-                                    path = %path.display(),
-                                    target = %reachability.active_dest().display(),
-                                    error = %e,
-                                    os_error = ?os_code,
-                                    attempt = attempts,
-                                    ?backoff,
-                                    "Sync failed, scheduling retry with backoff"
-                                );
-                                queue.requeue_sync_retry(path, backoff);
-                            } else {
-                                tracing::error!(
-                                    path = %path.display(),
-                                    target = %reachability.active_dest().display(),
-                                    error = %e,
-                                    os_error = ?os_code,
-                                    "Sync permanently failed after 10 retries; evicting"
-                                );
-                            }
-                        }
                     }
                 }
 
-                // Drain and process ready deletes
-                let ready_deletes = queue.drain_ready_deletes(now);
-                for path in ready_deletes {
-                    if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    if network_offline_detected
-                        || !source_connectivity.is_online()
-                        || !reachability.is_dest_online()
-                    {
-                        queue.requeue_delete_retry(path, retry_dur);
-                        continue;
-                    }
-
-                    match engine.delete_file_from_dest(&path, reachability.active_dest()) {
-                        Ok(()) => {
-                            state.reset_failure(&path);
-                        }
-                        Err(SyncError::Validation(msg)) => {
-                            tracing::error!(
-                                path = %path.display(),
-                                target = %reachability.active_dest().display(),
-                                error = %msg,
-                                "Permanent validation failure; evicting from deletion queue without retry"
-                            );
-                        }
-                        Err(e) if e.is_network_offline() => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %e,
-                                "Target offline detected during deletion; bailing out queue"
-                            );
-                            network_offline_detected = true;
-                            reachability.mark_offline(observer.as_ref());
-                            queue.requeue_delete_retry(path, retry_dur);
-                        }
-                        Err(e) => {
-                            let os_code = match &e {
-                                SyncError::Io(io_err) => io_err.raw_os_error(),
-                                _ => None,
-                            };
-                            let attempts = state.record_failure(&path);
-                            if attempts <= 10 {
-                                let backoff = calculate_exponential_backoff(attempts, retry_dur);
-                                tracing::warn!(
-                                    path = %path.display(),
-                                    target = %reachability.active_dest().display(),
-                                    error = %e,
-                                    os_error = ?os_code,
-                                    attempt = attempts,
-                                    ?backoff,
-                                    "Deletion failed, scheduling retry with backoff"
-                                );
-                                queue.requeue_delete_retry(path, backoff);
-                            } else {
-                                tracing::error!(
-                                    path = %path.display(),
-                                    target = %reachability.active_dest().display(),
-                                    error = %e,
-                                    os_error = ?os_code,
-                                    "Deletion permanently failed after 10 retries; evicting"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                if needs_catchup_scan
-                    && queue.pending_count() <= drain_threshold
+                // Drain and process ready deletes only if destination and source are online
+                if reachability.is_dest_online()
                     && source_connectivity.is_online()
-                    && reachability.is_dest_online()
+                    && !network_offline_detected
                 {
+                    let ready_deletes = queue.drain_ready_deletes(now);
+                    for path in ready_deletes {
+                        if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if network_offline_detected
+                            || !source_connectivity.is_online()
+                            || !reachability.is_dest_online()
+                        {
+                            queue.requeue_delete_retry(path, retry_dur);
+                            continue;
+                        }
+
+                        match engine.delete_file_from_dest(&path, reachability.active_dest()) {
+                            Ok(()) => {
+                                state.reset_failure(&path);
+                            }
+                            Err(SyncError::Validation(msg)) => {
+                                tracing::error!(
+                                    path = %path.display(),
+                                    target = %reachability.active_dest().display(),
+                                    error = %msg,
+                                    "Permanent validation failure; evicting from deletion queue without retry"
+                                );
+                                state.reset_failure(&path);
+                            }
+                            Err(e) if e.is_network_offline() => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "Target offline detected during deletion; bailing out queue"
+                                );
+                                network_offline_detected = true;
+                                reachability.mark_offline(observer.as_ref());
+                                queue.requeue_delete_retry(path, retry_dur);
+                            }
+                            Err(e) => {
+                                let os_code = match &e {
+                                    SyncError::Io(io_err) => io_err.raw_os_error(),
+                                    _ => None,
+                                };
+                                let attempts = state.record_failure(&path);
+                                if attempts <= 10 {
+                                    let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                                    tracing::warn!(
+                                        path = %path.display(),
+                                        target = %reachability.active_dest().display(),
+                                        error = %e,
+                                        os_error = ?os_code,
+                                        attempt = attempts,
+                                        ?backoff,
+                                        "Deletion failed, scheduling retry with backoff"
+                                    );
+                                    queue.requeue_delete_retry(path, backoff);
+                                } else {
+                                    tracing::error!(
+                                        path = %path.display(),
+                                        target = %reachability.active_dest().display(),
+                                        error = %e,
+                                        os_error = ?os_code,
+                                        "Deletion permanently failed after 10 retries; evicting and scheduling catchup scan"
+                                    );
+                                    state.reset_failure(&path);
+                                    state.mark_needs_catchup_scan();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if state.should_trigger_catchup_scan(
+                    queue.pending_count(),
+                    drain_threshold,
+                    source_connectivity.is_online(),
+                    reachability.is_dest_online(),
+                ) {
                     tracing::info!(
                         target_index = target_index + 1,
-                        "Triggering catch-up full scan following queue overflow recovery"
+                        "Triggering catch-up full scan following queue overflow recovery or eviction"
                     );
                     match engine.run_cancellable_full_scan(reachability.active_dest(), &cancellation) {
                         Ok(ScanOutcome::Success { .. })
                         | Ok(ScanOutcome::PartialFailure { .. }) => {
-                            needs_catchup_scan = false;
+                            state.clear_needs_catchup_scan();
                         }
                         Ok(ScanOutcome::DestinationUnreachable) => {
                             reachability.mark_offline(observer.as_ref());
@@ -1156,6 +1199,16 @@ mod tests {
         assert_eq!(state.record_failure(p), 2);
         state.reset_failure(p);
         assert_eq!(state.record_failure(p), 1);
+
+        assert!(!state.needs_catchup_scan());
+        state.mark_needs_catchup_scan();
+        assert!(state.needs_catchup_scan());
+        assert!(!state.should_trigger_catchup_scan(100, 50, true, true));
+        assert!(!state.should_trigger_catchup_scan(50, 50, false, true));
+        assert!(!state.should_trigger_catchup_scan(50, 50, true, false));
+        assert!(state.should_trigger_catchup_scan(50, 50, true, true));
+        state.clear_needs_catchup_scan();
+        assert!(!state.needs_catchup_scan());
     }
 
     #[test]
