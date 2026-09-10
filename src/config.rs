@@ -250,7 +250,8 @@ impl TargetSyncConfigBuilder {
     /// Builds and validates the `TargetSyncConfig`.
     ///
     /// # Errors
-    /// Returns `SyncError::Validation` if parameters or paths fail validation.
+    /// Returns `SyncError::Validation` if parameters, timeouts, block sizes, or paths fail validation,
+    /// or if the destination directory is identical to or nested within the source directory.
     pub fn build(self) -> Result<TargetSyncConfig, SyncError> {
         let max_block_size = 64 * 1024 * 1024;
         if self.block_size_bytes == 0 || self.block_size_bytes > max_block_size {
@@ -261,12 +262,38 @@ impl TargetSyncConfigBuilder {
         }
         if self.block_sync_threshold_bytes == 0 {
             return Err(SyncError::validation(
-                "block_sync_threshold_bytes must be greater than 0",
+                "block_sync_threshold_bytes must be greater than zero",
+            ));
+        }
+        if self.block_sync_threshold_bytes < self.block_size_bytes {
+            return Err(SyncError::validation(
+                "block_sync_threshold_bytes must be greater than or equal to block_size_bytes",
+            ));
+        }
+        if self.debounce_seconds == 0 {
+            return Err(SyncError::validation(
+                "debounce_seconds must be greater than zero",
+            ));
+        }
+        if self.retry_interval_seconds == 0 {
+            return Err(SyncError::validation(
+                "retry_interval_seconds must be greater than zero",
             ));
         }
         let src_target = TargetDir::new(&self.source_dir);
         src_target.validate(TargetRole::Source)?;
         self.dest_dir.validate(TargetRole::Destination)?;
+
+        if is_same_or_descendant(src_target.as_path(), self.dest_dir.as_path())
+            || is_same_or_descendant(self.dest_dir.as_path(), src_target.as_path())
+        {
+            return Err(SyncError::validation(format!(
+                "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
+                self.dest_dir.display(),
+                src_target.display()
+            )));
+        }
+
         let verification_mode = self
             .verification_mode
             .unwrap_or_else(|| VerificationMode::from_legacy_flag(self.verify_writes));
@@ -1875,6 +1902,58 @@ mod tests {
             .block_sync_threshold_bytes(0)
             .build();
         assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn test_target_sync_config_builder_validation_invariants() {
+        // 1. Threshold < block size fails
+        let err = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
+            .block_size_bytes(1024 * 1024)
+            .block_sync_threshold_bytes(512 * 1024)
+            .build();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("greater than or equal to block_size_bytes")
+        );
+
+        // 2. Debounce seconds == 0 fails
+        let err = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
+            .debounce_seconds(0)
+            .build();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("debounce_seconds must be greater than zero")
+        );
+
+        // 3. Retry interval seconds == 0 fails
+        let err = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
+            .retry_interval_seconds(0)
+            .build();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("retry_interval_seconds must be greater than zero")
+        );
+
+        // 4. Source == Destination fails
+        let err = TargetSyncConfig::builder(r"C:\source", r"C:\source").build();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("recursive sync loop"));
+
+        // 5. Dest nested inside Source fails
+        let err = TargetSyncConfig::builder(r"C:\source", r"C:\source\nested_dest").build();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("recursive sync loop"));
+
+        // 6. Source nested inside Dest fails
+        let err = TargetSyncConfig::builder(r"C:\source\nested_src", r"C:\source").build();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("recursive sync loop"));
     }
 
     #[test]
