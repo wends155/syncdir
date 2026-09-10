@@ -409,4 +409,18 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Undocumented builder parameters and missing `# Returns` sections resolved.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Architecture Documentation Synchronization (`/architecture` Audit Remediation)
+> * **Changes:**
+>   - Updated `architecture.md § 4 Project Layout` to replace the outdated monolithic `src/sync.rs` entry with the decomposed `src/sync/` directory tree (9 submodules: `mod.rs`, `archive.rs`, `delta.rs`, `engine.rs`, `mock.rs`, `path_safety.rs`, `scanner.rs`, `small_file.rs`, `worker.rs`) and updated test suite metrics (12 integration tests, 20 snapshot tests).
+>   - Updated `architecture.md § 5 Module Boundaries` to document `TargetSyncConfigBuilder`'s newly enforced validation invariants (recursive sync loop containment, interval positivity, and block threshold bounds) and corrected `MockSyncEngine` location to `src/sync/mock.rs`.
+>   - Updated `architecture.md § 10 Testing Strategy` to reflect 274 total automated tests (224 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, and 7 doc-tests) and enumerated `src/sync/` co-located unit test submodules.
+> * **New Constraints:**
+>   - `architecture.md` must continuously reflect decomposed module layouts and exact automated test suite counts.
+> * **Pruned:**
+>   - Stale references to monolithic `src/sync.rs`, 197 test count metric, and outdated integration/snapshot counts eliminated.
+
+
 

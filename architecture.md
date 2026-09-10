@@ -46,9 +46,9 @@ syncdir/
 ├── context.md            # Decisions and history
 ├── .agents/              # TARS rules, workflows, and scripts
 ├── tests/
-│   ├── integration_tests.rs # Integration testing suite (10 scenarios)
+│   ├── integration_tests.rs # Integration testing suite (12 scenarios)
 │   ├── property_tests.rs    # Proptest generative invariant suites (8 properties)
-│   ├── snapshot_tests.rs    # Insta golden snapshot tests (18 snapshots)
+│   ├── snapshot_tests.rs    # Insta golden snapshot tests (20 snapshots)
 │   └── snapshots/           # Insta snapshot golden files
 └── src/
     ├── lib.rs            # Crate library root and module declarations
@@ -61,7 +61,16 @@ syncdir/
     ├── error.rs          # Project-wide error definitions
     ├── monitor.rs        # ReadDirectoryChangesW event monitor
     ├── startup.rs        # Platform-specific registry auto-start hook
-    ├── sync.rs           # Block delta sync engine and background worker
+    ├── sync/             # Block delta sync engine and background workers
+    │   ├── mod.rs        # Module facade and public exports
+    │   ├── archive.rs    # Deletion archiving and archive retention pruning
+    │   ├── delta.rs      # Blake3 block hashing and delta sync logic
+    │   ├── engine.rs     # Core SyncEngine trait implementation and file operations
+    │   ├── mock.rs       # In-memory MockSyncEngine for unit and integration testing
+    │   ├── path_safety.rs# Reparse point and path traversal security checks
+    │   ├── scanner.rs    # Recursive directory scanning and change detection
+    │   ├── small_file.rs # Fast path small file copying and verification
+    │   └── worker.rs     # Worker thread lifecycle, debouncing, and retry queues
     ├── tray.rs           # System tray icon event loop, menus, and process execution
     └── tray/
         └── assets.rs     # Compile-time icon RGBA buffer generation, .rdata tables, and icon cache
@@ -70,7 +79,7 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, strongly-typed path domain modeling via `TargetDir` (`TargetDir::new` enforcing drive roots `R:\`, UNC repair `\\172...`, and slash conversion at construction) and `DestinationCollection` (encapsulating destination lists with Windows case-insensitive deduplication while strictly preserving insertion order), encapsulated `TargetSyncConfig` with private fields and `TargetSyncConfigBuilder`, zero-copy `destinations()` slice, Serde backward-compatibility bridging via `RawConfig`, quote-aware TOML bracket parsing (`preprocess_config_toml`), strict path format validation (`Config::validate()` and `TargetDir::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\`), path containment/overlap validation preventing recursive sync loops, block size cap (64MB) and threshold positivity validation, and runtime settings.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, strongly-typed path domain modeling via `TargetDir` (`TargetDir::new` enforcing drive roots `R:\`, UNC repair `\\172...`, and slash conversion at construction) and `DestinationCollection` (encapsulating destination lists with Windows case-insensitive deduplication while strictly preserving insertion order), encapsulated `TargetSyncConfig` with private fields and `TargetSyncConfigBuilder` enforcing construction invariants (non-empty destination collections, path format validation, recursive sync loop containment via `validate_target_containment`, strictly positive debounce and retry intervals, block size caps $\le 64$MB and positivity, and `block_sync_threshold_bytes >= block_size_bytes`), zero-copy `destinations()` slice, Serde backward-compatibility bridging via `RawConfig`, quote-aware TOML bracket parsing (`preprocess_config_toml`), strict path format validation (`Config::validate()` and `TargetDir::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\`), and runtime settings.
 * **Does NOT own**: Network path resolution (delegated to `net`), filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 
@@ -101,11 +110,20 @@ syncdir/
 
 ### `sync`
 * **Owns**: Scanning directory trees with symlink and intermediate directory junction skipping (`verify_destination_not_reparse` validating all ancestor components) and recursion depth limits (`scan_dir` skipping `PermissionDenied` folders), path safety validation (`is_safe_relative_path`), comparing source/destination state with ±2000 ms SMB timestamp tolerance (`is_metadata_up_to_date_raw`), fast-path metadata bypass before hashing, 64KB streamed small-file write verification (`verify_small_file_write`), worker scratch buffer reuse in delta sync, TOCTOU file length truncation protection using actual streamed byte counts, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, reusable dirty range buffer memory management (`DirtyBlockRange::reset`), decoupled periodic and post-full-scan archive pruning (`prune_archive` enforcing recursion depth $\le 32$), Windows case-insensitive deletion detection in `run_full_scan`, worker sub-components (`DebounceQueue`, `ReachabilityMonitor`, `SyncWorkerState`), thread-safe source presence tracking (`SourceConnectivityTracker`), and running background worker loops (`start_sync_worker`) with exponential backoff retries on `WriteVerificationFailed` and permanent validation error eviction.
+* **Submodules**:
+  * `sync::engine`: Core `SyncEngine` trait and concrete implementation for file sync/deletion and scan execution.
+  * `sync::delta`: In-place delta synchronization, chunked file reading, Blake3 block hashing, and dirty range management.
+  * `sync::small_file`: Fast-path atomic small-file streaming, write verification, and staging.
+  * `sync::scanner`: Directory traversal, case-insensitive deletion detection, cancellation, and safety threshold checks.
+  * `sync::archive`: Retention-based archive subfolder management, timestamped backups, and safe directory pruning.
+  * `sync::path_safety`: Win32 reparse point validation, ancestor junction guards, and path traversal defenses.
+  * `sync::worker`: Background worker lifecycle, debounce priority queues, exponential backoff, and reachability tracking.
+  * `sync::mock`: Thread-safe mock implementation (`MockSyncEngine`) for unit and integration testing.
 * **Does NOT own**: Watching directories, UI interactions, daemon lifecycle.
 * **Trait Interfaces**:
   * `SyncEngine`: Core sync execution controller (featuring `sync_file`, `sync_file_buffered`, `sync_file_to_dest_buffered`, `delete_file`, `delete_file_from_dest`, `prune_archive`, `run_full_scan`).
   * `SyncStatusObserver`: Decoupled listener interface for target destination connectivity transitions.
-* **Mock Availability**: `MockSyncEngine` (implemented in `src/sync.rs`) with dynamic sync/delete handlers, failure injection, and thread-safe call recording.
+* **Mock Availability**: `MockSyncEngine` (implemented in `src/sync/mock.rs`) with dynamic sync/delete handlers, failure injection, and thread-safe call recording.
 
 ### `monitor`
 * **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`) wrapped in `#[must_use]` `DirectoryWatcher`, empty relative path filtering, debouncing file events, and broadcasting `SyncCommand` events to destination sync workers via crossbeam/std mpsc channels. Visibility of `dispatch_event` restricted to `pub(crate)`. Decoupled from `Config` (ISP fix accepting `impl AsRef<Path>`).
@@ -179,10 +197,17 @@ syncdir/
 * **Log Levels**: `INFO` for file copy telemetry and target reachability, `WARN` for recoverable errors/unreachable targets, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
-* **Test Suite Metrics**: 197 total automated tests passing with zero regressions and zero warnings across all targets.
-* **Unit Tests**: Co-located `#[cfg(test)]` modules in `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/sync.rs` (buffered reads via `read_block`, symlink and junction skipping, path safety via `is_safe_relative_path`, metadata fast-path, streamed verification), `src/startup.rs`, and `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting).
-* **Integration Tests**: `tests/integration_tests.rs` (10 tests) simulating standard files, deletions, directory updates, configuration reload validation, and `run_tray` interface compilation.
-* **Snapshot Tests**: `tests/snapshot_tests.rs` (18 tests) using `insta` (v1) for regression-guarding snapshot assertions on `Config` debug formatting, validation errors (including zero block size/threshold), `SyncError` display output (including `SyncError::WriteVerificationFailed` and `SyncError::Registry`), and `FileRecord` structures.
+* **Test Suite Metrics**: 274 total automated tests passing with zero regressions and zero warnings across all targets (224 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, and 7 doc-tests).
+* **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing), `src/startup.rs`, `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), and the decomposed `src/sync/` submodules:
+  * `src/sync/engine.rs`: Metadata timestamp tolerances, TOCTOU size protection, and directory creation.
+  * `src/sync/delta.rs`: Blake3 chunk hashing, delta sync dirty block updates, and read-back verification.
+  * `src/sync/small_file.rs`: Fast-path atomic staging, sampled verification, and zero-byte files.
+  * `src/sync/scanner.rs`: Directory traversal recursion limits, permission bypass, and case-insensitive deletion detection.
+  * `src/sync/path_safety.rs`: Traversal defense, reserved DOS devices, ADS rejection, and ancestor junction caching.
+  * `src/sync/worker.rs`: Debounce min-heap queue stress testing, exponential backoff, and reachability tracking.
+  * `src/sync/mock.rs`: Recording mock engine verification.
+* **Integration Tests**: `tests/integration_tests.rs` (12 tests) simulating standard files, deletions, directory updates, configuration reload validation, rename event pairing, worker reachability offline drain guards, subsecond precision, and `run_tray` interface compilation.
+* **Snapshot Tests**: `tests/snapshot_tests.rs` (20 tests) using `insta` (v1) for regression-guarding snapshot assertions on `Config` debug formatting, validation errors (including zero block size/threshold and zero debounce), `SyncError` display output (including `SyncError::WriteVerificationFailed` and `SyncError::Registry`), `TargetSyncConfig`, and `FileRecord` structures.
 * **Property-Based Tests**: `tests/property_tests.rs` (8 tests) using `proptest` (v1) for invariant validation (block boundary division, TOML round-tripping, `is_metadata_up_to_date_raw` timestamp delta evaluation across ±10000ms, `DirtyBlockRange` chunk coalescing, path traversal safety wired directly to `is_safe_relative_path`, sync idempotency, and delta sync single-block isolation).
 * **Assertions & Structural Diffing**: `pretty_assertions` (v1) for colorized diff output on test failure assertions across all test modules.
 * **Shared Test Fixtures**: `Config::test_default()` helper for consistent test configuration across unit and integration tests.
@@ -190,7 +215,7 @@ syncdir/
   * `MockHashStore` (`src/db.rs`): In-memory signature store without SQLite I/O.
   * `MockStartupRegistry` (`src/startup.rs`): In-memory registry backend without HKCU mutation.
   * `MockNetworkResolver` (`src/net.rs`): In-memory drive/UNC translator and SMB failure simulator.
-  * `MockSyncEngine` (`src/sync.rs`): Thread-safe recording sync engine with dynamic handler injection.
+  * `MockSyncEngine` (`src/sync/mock.rs`): Thread-safe recording sync engine with dynamic handler injection.
 
 ## 11. Documentation Conventions
 * Every public struct, trait, and function must be documented using standard triple-slash `///` comments.
