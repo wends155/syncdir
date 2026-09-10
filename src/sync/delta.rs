@@ -7,9 +7,8 @@ use crate::config::{TargetSyncConfig, VerificationMode};
 use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 
-use super::engine::{
-    DirtyRangeLease, FileSyncTask, safe_epoch_duration_millis, safe_modified_millis,
-};
+use super::engine::DirtyRangeLease;
+use super::types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
 
 /// Contiguous range of dirty blocks to coalesce delta writes and reduce seek overhead.
 #[derive(Debug)]
@@ -883,7 +882,7 @@ mod tests {
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dest,
-            src_size: meta.len() as i64,
+            src_size: meta.len(),
             src_mod: safe_modified_millis(&meta).unwrap(),
             cached_id: None,
         };
@@ -961,7 +960,7 @@ mod tests {
                 src_path: &src_file,
                 dest_path: &dst_file,
                 dest_dir: &dest,
-                src_size: meta.len() as i64,
+                src_size: meta.len(),
                 src_mod: safe_modified_millis(&meta).unwrap(),
                 cached_id: None,
             };

@@ -271,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_path_util_hierarchies_and_system_root() {
         assert!(is_same_or_descendant(
             Path::new(r"C:\Users\Documents"),

@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::UNIX_EPOCH;
 
 use crate::config::TargetSyncConfig;
 use crate::db::{FileRecord, HashStore};
@@ -16,28 +15,7 @@ use super::path_safety::{
 };
 use super::scanner::scan_dir;
 
-/// Extract file modified time as milliseconds since UNIX epoch.
-///
-/// Pre-1970 timestamps are clamped to 0 (epoch) with a warning log.
-///
-/// # Errors
-///
-/// Returns `SyncError::Io` if the file's modified time cannot be read.
-pub(crate) fn safe_modified_millis(metadata: &std::fs::Metadata) -> Result<i64, SyncError> {
-    let modified = metadata.modified().map_err(SyncError::Io)?;
-    match modified.duration_since(UNIX_EPOCH) {
-        Ok(dur) => Ok(dur.as_millis() as i64),
-        Err(_) => {
-            tracing::warn!("File has pre-1970 modified timestamp, clamping to epoch");
-            Ok(0)
-        }
-    }
-}
-
-/// Convert a millisecond timestamp to a `Duration`, clamping negative values to zero.
-pub(crate) fn safe_epoch_duration_millis(millis: i64) -> std::time::Duration {
-    std::time::Duration::from_millis(millis.max(0) as u64)
-}
+pub use super::types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
 
 /// Commands sent from the file watcher or tray UI to the sync worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,17 +358,6 @@ pub struct LocalSyncEngine<S: HashStore> {
     scanner: crate::sync::scanner::DirectoryScanner,
 }
 
-#[derive(Debug)]
-pub(crate) struct FileSyncTask<'a> {
-    pub rel_path: &'a Path,
-    pub src_path: &'a Path,
-    pub dest_path: &'a Path,
-    pub dest_dir: &'a Path,
-    pub src_size: i64,
-    pub src_mod: i64,
-    pub cached_id: Option<i64>,
-}
-
 impl<S: HashStore> LocalSyncEngine<S> {
     /// Create a new sync engine with the given database and config.
     pub fn new(db: S, config: impl Into<TargetSyncConfig>) -> Self {
@@ -516,7 +483,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         task: &FileSyncTask<'_>,
         scratch: &mut [u8],
     ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
-        if (task.src_size as u64) < self.config.block_sync_threshold_bytes() {
+        if task.src_size < self.config.block_sync_threshold_bytes() {
             self.small_file_engine.sync_small_file_core(task, scratch)
         } else {
             self.delta_engine.sync_delta_large_file_core(task, scratch)
@@ -696,7 +663,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             src_path: &src_path,
             dest_path: &dest_path,
             dest_dir,
-            src_size,
+            src_size: sym_meta.len(),
             src_mod,
             cached_id,
         };
@@ -1866,7 +1833,7 @@ mod tests {
             src_path: &src.join(f1),
             dest_path: &dst.join(f1),
             dest_dir: &dst,
-            src_size: src_meta1.len() as i64,
+            src_size: src_meta1.len(),
             src_mod: safe_modified_millis(&src_meta1).unwrap(),
             cached_id: None,
         };
@@ -1888,7 +1855,7 @@ mod tests {
             src_path: &src.join(f2),
             dest_path: &dst.join(f2),
             dest_dir: &dst,
-            src_size: src_meta2.len() as i64,
+            src_size: src_meta2.len(),
             src_mod: safe_modified_millis(&src_meta2).unwrap(),
             cached_id: None,
         };

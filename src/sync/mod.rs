@@ -10,6 +10,7 @@ pub(crate) mod mock;
 pub(crate) mod path_safety;
 pub(crate) mod scanner;
 pub(crate) mod small_file;
+pub mod types;
 pub(crate) mod worker;
 
 pub use delta::DirtyBlockRange;
@@ -19,6 +20,7 @@ pub use engine::{
 };
 pub use mock::MockSyncEngine;
 pub use path_safety::is_safe_relative_path;
+pub use types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
 pub use worker::{
     SourceConnectivityTracker, SyncWorkerContext, SyncWorkerContextBuilder, start_sync_worker,
 };

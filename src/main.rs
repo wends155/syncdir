@@ -13,7 +13,7 @@ use syncdir::net::{NetworkResolver, Win32NetworkResolver};
 use syncdir::startup::RegistryBackend;
 use syncdir::sync::ConnectivityState;
 use syncdir::tray::{
-    open_path, DestinationState, TrayActionHandler, TrayEventLoop, TrayExitReason,
+    DestinationState, TrayActionHandler, TrayEventLoop, TrayExitReason, open_path,
 };
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;

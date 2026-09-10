@@ -7,7 +7,7 @@ use crate::config::{TargetSyncConfig, VerificationMode};
 use crate::db::FileRecord;
 use crate::error::SyncError;
 
-use super::engine::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
+use super::types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
 
 /// RAII guard for temporary staging files during atomic small-file sync.
 /// Automatically removes the temporary file on drop unless disarmed.
@@ -335,7 +335,7 @@ mod tests {
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
-            src_size: src_meta.len() as i64,
+            src_size: src_meta.len(),
             src_mod: safe_modified_millis(&src_meta).unwrap(),
             cached_id: None,
         };
@@ -385,7 +385,7 @@ mod tests {
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dest,
-            src_size: meta.len() as i64,
+            src_size: meta.len(),
             src_mod: safe_modified_millis(&meta).unwrap(),
             cached_id: None,
         };
@@ -423,7 +423,7 @@ mod tests {
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dest,
-            src_size: meta.len() as i64,
+            src_size: meta.len(),
             src_mod: safe_modified_millis(&meta).unwrap(),
             cached_id: None,
         };
