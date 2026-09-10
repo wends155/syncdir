@@ -7,10 +7,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use syncdir::config::Config;
-use syncdir::daemon::{DaemonTrayHandler, SyncDaemon};
+use syncdir::daemon::{DaemonHandle, SyncDaemon};
 use syncdir::error::SyncError;
+use syncdir::net::{NetworkResolver, Win32NetworkResolver};
+use syncdir::path_util::open_path;
+use syncdir::startup::RegistryBackend;
 use syncdir::sync::ConnectivityState;
-use syncdir::tray::{DestinationState, TrayEventLoop, TrayExitReason};
+use syncdir::tray::{DestinationState, TrayActionHandler, TrayEventLoop, TrayExitReason};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -102,6 +105,80 @@ retry_interval_seconds = 10
     daemon.shutdown();
 
     Ok(exit_reason)
+}
+
+/// Tray action handler connecting UI context menu callbacks to daemon and registry operations.
+struct DaemonTrayHandler<R: RegistryBackend> {
+    config_path: PathBuf,
+    log_dir: PathBuf,
+    handle: DaemonHandle,
+    registry: R,
+    resolver: Arc<dyn NetworkResolver>,
+}
+
+impl<R: RegistryBackend> DaemonTrayHandler<R> {
+    /// Create a new tray handler with target config path, log directory, daemon handle, and registry backend.
+    fn new(config_path: PathBuf, log_dir: PathBuf, handle: DaemonHandle, registry: R) -> Self {
+        Self::with_resolver(
+            config_path,
+            log_dir,
+            handle,
+            registry,
+            Arc::new(Win32NetworkResolver),
+        )
+    }
+
+    /// Create a new tray handler with a custom network resolver.
+    fn with_resolver(
+        config_path: PathBuf,
+        log_dir: PathBuf,
+        handle: DaemonHandle,
+        registry: R,
+        resolver: Arc<dyn NetworkResolver>,
+    ) -> Self {
+        Self {
+            config_path,
+            log_dir,
+            handle,
+            registry,
+            resolver,
+        }
+    }
+}
+
+impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTrayHandler<R> {
+    fn on_sync_now(&self) -> Result<(), SyncError> {
+        self.handle.trigger_full_scan()
+    }
+
+    fn on_reload_config(&self) -> Result<(), SyncError> {
+        let new_config = Config::load(&self.config_path)?;
+        new_config.validate()?;
+        SyncDaemon::validate_target_loops(&new_config, self.resolver.as_ref())?;
+        Ok(())
+    }
+
+    fn on_toggle_startup(&self, enable: bool) -> Result<bool, SyncError> {
+        if enable {
+            self.registry.register()?;
+            Ok(true)
+        } else {
+            self.registry.unregister()?;
+            Ok(false)
+        }
+    }
+
+    fn is_startup_enabled(&self) -> Result<bool, SyncError> {
+        self.registry.is_registered()
+    }
+
+    fn on_open_config(&self) -> Result<(), SyncError> {
+        open_path(&self.config_path).map_err(SyncError::Io)
+    }
+
+    fn on_view_logs(&self) -> Result<(), SyncError> {
+        open_path(&self.log_dir).map_err(SyncError::Io)
+    }
 }
 
 /// RAII guard holding the single-instance Windows mutex handle.
@@ -465,6 +542,76 @@ mod tests {
 
         handler.on_sync_now().unwrap();
         assert_eq!(rx.recv().unwrap(), SyncCommand::TriggerFullScan);
+    }
+
+    #[test]
+    fn test_daemon_tray_handler_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+source_dir = "C:\\dummy_source"
+dest_dir = "C:\\dummy_dest"
+debounce_seconds = 3
+propagate_deletions = true
+block_sync_threshold_bytes = 10485760
+block_size_bytes = 1048576
+verify_writes = true
+"#,
+        )
+        .unwrap();
+
+        let (tx, rx) = channel();
+        let mock_registry = MockStartupRegistry::new(false);
+        let handle = DaemonHandle::new(tx);
+        let handler = DaemonTrayHandler::new(
+            config_path,
+            dir.path().join("logs"),
+            handle.clone(),
+            mock_registry,
+        );
+
+        assert!(!handler.is_startup_enabled().unwrap());
+        assert!(handler.on_toggle_startup(true).unwrap());
+        assert!(handler.is_startup_enabled().unwrap());
+        assert!(!handler.on_toggle_startup(false).unwrap());
+        assert!(!handler.is_startup_enabled().unwrap());
+
+        handler.on_sync_now().unwrap();
+        let cmd = rx.try_recv().unwrap();
+        assert_eq!(cmd, SyncCommand::TriggerFullScan);
+
+        // Valid reload
+        assert!(handler.on_reload_config().is_ok());
+
+        // Recursive loop reload should fail
+        let loop_config_path = dir.path().join("loop_config.toml");
+        std::fs::write(
+            &loop_config_path,
+            r#"
+source_dir = "C:\\dummy_source"
+dest_dir = "C:\\dummy_source\\nested"
+debounce_seconds = 3
+propagate_deletions = true
+block_sync_threshold_bytes = 10485760
+block_size_bytes = 1048576
+verify_writes = true
+"#,
+        )
+        .unwrap();
+        let loop_handler = DaemonTrayHandler::new(
+            loop_config_path,
+            dir.path().join("logs"),
+            handle,
+            MockStartupRegistry::new(false),
+        );
+        let reload_err = loop_handler.on_reload_config().unwrap_err();
+        assert!(
+            reload_err.to_string().contains("recursive sync loop"),
+            "Expected recursive sync loop error, got: {}",
+            reload_err
+        );
     }
 
     #[test]

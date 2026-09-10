@@ -549,3 +549,22 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Dead `tray::open_path` wrapper eliminated.
 >   - Unchecked mutex lock panics in `MockSyncEngine` eliminated.
 >   - Clutter in `syncdir::sync` crate facade eliminated.
+
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Bucket 2: Architectural Decoupling (`daemon` $\longleftrightarrow$ `tray`) (`review_report.md` Findings 1, 6)
+> * **Changes:**
+>   - **Composition Root Relocation of `DaemonTrayHandler` (O1)**: Moved `DaemonTrayHandler<R: RegistryBackend>` from `src/daemon.rs` into the binary entrypoint `src/main.rs`. Implemented `DaemonTrayHandler` as a private struct connecting UI callbacks to `DaemonHandle`, `RegistryBackend`, and `NetworkResolver`. Added `test_daemon_tray_handler_actions` to `src/main.rs::mod tests` verifying all tray actions in-memory.
+>   - **Severed `daemon` Dependency on `tray` & Facade Clean-Up (O2)**: Completely removed `tray` and `startup` imports from `src/daemon.rs`. Deleted `DaemonTrayHandler` and associated tests from `src/daemon.rs`. Promoted `DaemonHandle` to `syncdir::daemon::{DaemonHandle, SyncDaemon}` in `src/lib.rs`. Enriched `DaemonHandle::trigger_full_scan` with `# Errors` doc comments. Retained `use std::path::PathBuf;` in `daemon.rs::mod tests` so `TrackingResolver` cleanly compiles.
+>   - **Encapsulated Windowing Subsystem in `tray` (O3)**: Restricted `run_tray`, `create_proxy`, `TargetStatusUpdate`, and `UserEvent` to `pub(crate)` within `src/tray.rs`. Completely hid all `winit` types behind `TrayEventLoop`. Annotated `TrayEventLoop::status_observer` with `#[must_use]`, enriched `new()` and `run()` with `# Arguments`, `# Returns`, and `# Errors` doc comments, and updated `TrayExitReason` doc comment.
+>   - **Updated Integration Test Suite (O3)**: Migrated `test_tray_module_compiles` in `tests/integration_tests.rs` from `TrayRunner` (testing `run_tray` accepting raw `winit::event_loop::EventLoop`) to `TrayLoopRunner` (testing `TrayEventLoop::run`), eliminating `winit` references from integration tests.
+>   - **Synchronized Architectural Governance (O4)**: Updated `architecture.md §6 Dependency Direction Rules` table and Cycle Resolution Note to record `main` importing `net` and `path_util` as the composition root, and `daemon` being strictly prohibited from importing `tray` or `startup`. Synchronized `architecture.md §13 Module Interaction Graph` Mermaid diagram.
+>   - **Full Verification Pipeline (O5)**: Zero formatting diffs (`cargo fmt`), zero lint warnings (`cargo clippy`), and all 299 tests passing (`cargo test --all-features`).
+> * **New Constraints:**
+>   - `src/daemon.rs` must NEVER import `tray` or `startup`. All UI and startup dispatching is owned by the composition root in `src/main.rs`.
+>   - Windowing types (`winit`, `UserEvent`, `TargetStatusUpdate`) must remain encapsulated within `src/tray.rs`. External consumers interact solely with `TrayEventLoop`.
+> * **Pruned:**
+>   - Prohibited `daemon -> tray` architectural dependency eliminated.
+>   - Public exposure of `winit` event types and proxies eliminated.
+>   - Dead `startup` imports in `daemon.rs` eliminated.

@@ -51,7 +51,7 @@ impl EngineStatus {
 
 /// Reason the tray event loop exited.
 ///
-/// Returned by [`run_tray`] so the caller can decide whether to
+/// Returned by [`TrayEventLoop::run`] so the caller can decide whether to
 /// re-launch the process after the tray icon has been cleanly dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayExitReason {
@@ -120,7 +120,7 @@ impl DestinationState {
 
 /// Per-target status report sent from worker threads to the tray event loop.
 #[derive(Debug, Clone)]
-pub struct TargetStatusUpdate {
+pub(crate) struct TargetStatusUpdate {
     pub target_index: usize,
     pub dest_online: ConnectivityState,
 }
@@ -130,7 +130,7 @@ pub struct TargetStatusUpdate {
 /// This enum allows background worker threads and OS menu clicks to safely signal
 /// the main thread UI event loop.
 #[derive(Debug)]
-pub enum UserEvent {
+pub(crate) enum UserEvent {
     /// A menu item click event forwarded from the tray menu callback.
     Menu(MenuEvent),
     /// A directory status change signal sent by the sync worker thread.
@@ -763,7 +763,7 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
 /// # Errors
 ///
 /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
-pub fn run_tray<H: TrayActionHandler + ?Sized>(
+pub(crate) fn run_tray<H: TrayActionHandler + ?Sized>(
     event_loop: winit::event_loop::EventLoop<UserEvent>,
     destinations: Vec<DestinationState>,
     handler: Arc<H>,
@@ -831,6 +831,10 @@ pub struct TrayEventLoop {
 
 impl TrayEventLoop {
     /// Create a new tray event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Tray`] if the underlying windowing event loop fails to initialize.
     pub fn new() -> Result<Self, SyncError> {
         let inner = winit::event_loop::EventLoopBuilder::<UserEvent>::with_user_event()
             .build()
@@ -839,18 +843,34 @@ impl TrayEventLoop {
     }
 
     /// Create an event proxy for dispatching events from background threads.
-    pub fn create_proxy(&self) -> winit::event_loop::EventLoopProxy<UserEvent> {
+    pub(crate) fn create_proxy(&self) -> winit::event_loop::EventLoopProxy<UserEvent> {
         self.inner.create_proxy()
     }
 
     /// Create a status observer handle that dispatches status updates to the tray event loop.
+    #[must_use]
     pub fn status_observer(&self) -> Arc<dyn SyncStatusObserver> {
         Arc::new(WinitStatusObserver {
             proxy: self.create_proxy(),
         })
     }
 
-    /// Run the tray event loop, blocking the main thread.
+    /// Run the tray event loop, blocking the main thread until exit is requested.
+    ///
+    /// Initializes tray icon, context menu, and background event handling loop.
+    ///
+    /// # Arguments
+    ///
+    /// * `destinations` - Configured target destination display states for menu indicators.
+    /// * `handler` - Action handler dispatching context menu actions to the daemon and registry.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`TrayExitReason`] specifying whether the user requested normal shutdown or process restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Tray`] if the tray menu, icon, or event loop builder fails.
     pub fn run<H: TrayActionHandler + ?Sized>(
         self,
         destinations: Vec<DestinationState>,

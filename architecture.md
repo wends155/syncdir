@@ -153,8 +153,8 @@ syncdir/
 
 | Module | May Import | Must NOT Import |
 |--------|-----------|-----------------|
-| `main` | `daemon`, `tray`, `config`, `sync`, `startup`, `error` | `db` (direct), `winit` |
-| `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `startup`, `path_util`, `error` | `main`, `tray` |
+| `main` | `daemon`, `tray`, `config`, `sync`, `startup`, `net`, `path_util`, `error` | `db` (direct), `winit` |
+| `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `path_util`, `error` | `main`, `tray`, `startup` |
 | `tray` | `sync`, `config`, `error`, `startup` (trait), `path_util`, `tray::assets` | `db` (direct), `main`, `daemon` |
 | `tray::assets` | `EngineStatus` (super), `error`, `tray-icon` | All other modules |
 | `monitor` | `sync`, `error` | `config`, `db`, `tray`, `main`, `daemon` |
@@ -166,7 +166,7 @@ syncdir/
 | `path_util` | `error` | All other internal modules |
 | `error` | None | All |
 
-> **Cycle Resolution Note**: The historical circular dependency between `config` and `net` is permanently resolved by extracting path canonicalization into `path_util`. `db` is completely decoupled from `config`, importing `error` only. `daemon` is decoupled from `tray`, using `path_util::open_path`. `main` is decoupled from `winit`, consuming `Arc<dyn SyncStatusObserver>` from `tray`.
+> **Cycle Resolution Note**: The historical circular dependency between `config` and `net` is permanently resolved by extracting path canonicalization into `path_util`. `db` is completely decoupled from `config`, importing `error` only. `daemon` is decoupled from `tray` and `startup`, using `path_util::open_path` and delegating UI/startup dispatching to `main`. `main` acts as the composition root, decoupled from `winit`, consuming `Arc<dyn SyncStatusObserver>` from `tray`.
 
 ---
 
@@ -249,8 +249,8 @@ syncdir/
 ### Module Interaction Graph
 ```mermaid
 graph TD
-    main --> daemon & tray & config & sync & startup & error
-    daemon --> config & net & monitor & sync & startup & path_util & error
+    main --> daemon & tray & config & sync & startup & net & path_util & error
+    daemon --> config & net & monitor & sync & path_util & error
     daemon -.->|via factory| db
     tray --> sync & config & path_util & startup & error
     monitor --> sync & error

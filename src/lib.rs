@@ -15,12 +15,12 @@
 //! - **Resilient Windows Networking**: Bidirectional UNC $\longleftrightarrow$ mapped drive translation and
 //!   session authentication via Win32 `WNetAddConnection2W` and `WNetGetConnectionW`.
 //! - **Daemon Orchestration**: Clean lifecycle management via [`SyncDaemon`] and windowless system tray
-//!   integration via [`tray::run_tray`].
+//!   integration via [`tray::TrayEventLoop::run`].
 //!
 //! ## Core Modules
 //!
 //! - [`config`]: Configuration parsing, validation, and [`config::ConfigBuilder`].
-//! - [`daemon`]: Background worker orchestration, lifecycle control, and tray action dispatch.
+//! - [`daemon`]: Background worker orchestration and lifecycle control.
 //! - [`db`]: SQLite-backed signature cache and [`db::HashStore`] trait.
 //! - [`error`]: Typed error hierarchy and causal error chaining with [`error::SyncError`].
 //! - [`monitor`]: Real-time filesystem watcher and debounced event dispatch.
@@ -62,7 +62,7 @@ pub mod startup;
 pub mod sync;
 pub mod tray;
 
-pub use daemon::{DaemonTrayHandler, SyncDaemon};
+pub use daemon::{DaemonHandle, SyncDaemon};
 
 /// Copyright notice for syncdir.
 pub const COPYRIGHT: &str = "(c) 2026 Wendell Saligan";

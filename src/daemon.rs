@@ -1,4 +1,4 @@
-//! Background sync daemon and tray action handling.
+//! Background sync daemon orchestrator and worker management.
 //!
 //! Owns background daemon lifecycle, worker thread spawning, watcher event loops,
 //! reconnect scan triggers, and RAII shutdown.
@@ -7,13 +7,11 @@ use crate::config::Config;
 use crate::db::{SqliteHashStore, StoreConfig};
 use crate::error::SyncError;
 use crate::path_util::is_same_or_descendant;
-use crate::startup::RegistryBackend;
 use crate::sync::{
     LocalSyncEngine, SyncCommand, SyncEngine, SyncStatusObserver, SyncWorkerContext,
     start_sync_worker,
 };
-use crate::tray::TrayActionHandler;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -32,86 +30,14 @@ impl DaemonHandle {
     }
 
     /// Trigger an immediate full synchronization scan across all targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Tray`] if the internal worker channel has disconnected.
     pub fn trigger_full_scan(&self) -> Result<(), SyncError> {
         self.command_tx
             .send(SyncCommand::TriggerFullScan)
             .map_err(|e| SyncError::tray_with_source("Sync worker channel disconnected", e))
-    }
-}
-
-/// Tray action handler connecting UI context menu callbacks to daemon and registry operations.
-pub struct DaemonTrayHandler<R: RegistryBackend> {
-    config_path: PathBuf,
-    log_dir: PathBuf,
-    handle: DaemonHandle,
-    registry: R,
-    resolver: Arc<dyn crate::net::NetworkResolver>,
-}
-
-impl<R: RegistryBackend> DaemonTrayHandler<R> {
-    /// Create a new tray handler with target config path, log directory, daemon handle, and registry backend.
-    ///
-    /// Defaults to `Win32NetworkResolver`.
-    pub fn new(config_path: PathBuf, log_dir: PathBuf, handle: DaemonHandle, registry: R) -> Self {
-        Self::with_resolver(
-            config_path,
-            log_dir,
-            handle,
-            registry,
-            Arc::new(crate::net::Win32NetworkResolver),
-        )
-    }
-
-    /// Create a new tray handler with a custom network resolver.
-    pub fn with_resolver(
-        config_path: PathBuf,
-        log_dir: PathBuf,
-        handle: DaemonHandle,
-        registry: R,
-        resolver: Arc<dyn crate::net::NetworkResolver>,
-    ) -> Self {
-        Self {
-            config_path,
-            log_dir,
-            handle,
-            registry,
-            resolver,
-        }
-    }
-}
-
-impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTrayHandler<R> {
-    fn on_sync_now(&self) -> Result<(), SyncError> {
-        self.handle.trigger_full_scan()
-    }
-
-    fn on_reload_config(&self) -> Result<(), SyncError> {
-        let new_config = Config::load(&self.config_path)?;
-        new_config.validate()?;
-        SyncDaemon::validate_target_loops(&new_config, self.resolver.as_ref())?;
-        Ok(())
-    }
-
-    fn on_toggle_startup(&self, enable: bool) -> Result<bool, SyncError> {
-        if enable {
-            self.registry.register()?;
-            Ok(true)
-        } else {
-            self.registry.unregister()?;
-            Ok(false)
-        }
-    }
-
-    fn is_startup_enabled(&self) -> Result<bool, SyncError> {
-        self.registry.is_registered()
-    }
-
-    fn on_open_config(&self) -> Result<(), SyncError> {
-        crate::path_util::open_path(&self.config_path).map_err(SyncError::Io)
-    }
-
-    fn on_view_logs(&self) -> Result<(), SyncError> {
-        crate::path_util::open_path(&self.log_dir).map_err(SyncError::Io)
     }
 }
 
@@ -533,7 +459,7 @@ impl Drop for SyncDaemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::startup::MockStartupRegistry;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -548,76 +474,6 @@ mod tests {
         let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
         assert_eq!(daemon.worker_handles.len(), 1);
         daemon.shutdown();
-    }
-
-    #[test]
-    fn test_daemon_tray_handler_actions() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-source_dir = "C:\\dummy_source"
-dest_dir = "C:\\dummy_dest"
-debounce_seconds = 3
-propagate_deletions = true
-block_sync_threshold_bytes = 10485760
-block_size_bytes = 1048576
-verify_writes = true
-"#,
-        )
-        .unwrap();
-
-        let (tx, rx) = channel();
-        let mock_registry = MockStartupRegistry::new(false);
-        let handle = DaemonHandle::new(tx);
-        let handler = DaemonTrayHandler::new(
-            config_path,
-            dir.path().join("logs"),
-            handle.clone(),
-            mock_registry,
-        );
-
-        assert!(!handler.is_startup_enabled().unwrap());
-        assert!(handler.on_toggle_startup(true).unwrap());
-        assert!(handler.is_startup_enabled().unwrap());
-        assert!(!handler.on_toggle_startup(false).unwrap());
-        assert!(!handler.is_startup_enabled().unwrap());
-
-        handler.on_sync_now().unwrap();
-        let cmd = rx.try_recv().unwrap();
-        assert_eq!(cmd, SyncCommand::TriggerFullScan);
-
-        // Valid reload
-        assert!(handler.on_reload_config().is_ok());
-
-        // Recursive loop reload should fail
-        let loop_config_path = dir.path().join("loop_config.toml");
-        std::fs::write(
-            &loop_config_path,
-            r#"
-source_dir = "C:\\dummy_source"
-dest_dir = "C:\\dummy_source\\nested"
-debounce_seconds = 3
-propagate_deletions = true
-block_sync_threshold_bytes = 10485760
-block_size_bytes = 1048576
-verify_writes = true
-"#,
-        )
-        .unwrap();
-        let loop_handler = DaemonTrayHandler::new(
-            loop_config_path,
-            dir.path().join("logs"),
-            handle.clone(),
-            MockStartupRegistry::new(false),
-        );
-        let reload_err = loop_handler.on_reload_config().unwrap_err();
-        assert!(
-            reload_err.to_string().contains("recursive sync loop"),
-            "Expected recursive sync loop error, got: {}",
-            reload_err
-        );
     }
 
     #[test]

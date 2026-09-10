@@ -123,15 +123,15 @@ fn test_watcher_and_sync_engine_flow() {
     );
 }
 
-type TrayRunner<H> = fn(
-    winit::event_loop::EventLoop<syncdir::tray::UserEvent>,
+type TrayLoopRunner<H> = fn(
+    syncdir::tray::TrayEventLoop,
     std::vec::Vec<syncdir::tray::DestinationState>,
     std::sync::Arc<H>,
 ) -> Result<syncdir::tray::TrayExitReason, syncdir::error::SyncError>;
 
 #[test]
 fn test_tray_module_compiles() {
-    // Since run_tray blocks the thread, we only smoke-test compiling it and verifying exports.
+    // Since TrayEventLoop::run blocks the thread, we only smoke-test compiling it and verifying exports.
     // This is a static analysis verification.
     struct DummyHandler;
     impl syncdir::tray::TrayActionHandler for DummyHandler {
@@ -149,7 +149,7 @@ fn test_tray_module_compiles() {
         }
     }
 
-    let _func: TrayRunner<DummyHandler> = syncdir::tray::run_tray::<DummyHandler>;
+    let _func: TrayLoopRunner<DummyHandler> = syncdir::tray::TrayEventLoop::run::<DummyHandler>;
 }
 
 #[test]
