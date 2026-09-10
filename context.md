@@ -360,3 +360,20 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Unchecked `u64` block size division and modulo in `DirtyBlockRange` eliminated.
 >   - Raw OS error code limitation in `is_network_offline_io` eliminated.
 >   - Blocking SMB resolution during daemon loop validation eliminated.
+
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Documentation Synchronization & Behavioral Contract Harmonization (`/update-doc`)
+> * **Changes:**
+>   - Synchronized rustdoc comments across all modified public APIs: documented `# Arguments` and `# Returns` for `is_network_offline_io` (`src/error.rs`), `# Returns` for `TargetSyncConfig::block_size_nonzero` (`src/config.rs`), `# Arguments`, `# Returns`, `# Errors`, and `# Panics` for `DirtyBlockRange` constructors (`src/sync/delta.rs`), and `# Returns` for `LocalSyncEngine::acquire_dirty_range_lease` (`src/sync/engine.rs`).
+>   - Updated `spec.md` with current verification hash (`> Last verified against: 15e2d61`) and date (`2026-09-10`).
+>   - Synchronized `spec.md` Public API tables: added `TargetSyncConfig::block_size_nonzero`, `DirtyBlockRange` constructors and helpers (`new`, `new_nonzero`, `try_new`, `block_size_nonzero`), `LocalSyncEngine::acquire_dirty_range_lease`, and `verify_destination_not_reparse_cached`. Clarified `validate_target_loops` non-blocking UNC semantics and `is_network_offline_io` `ErrorKind` mappings.
+>   - Added Data Model contracts for `DirtyBlockRange` (strongly typed `NonZeroU64`) and `DirtyRangeLease<'a>` (RAII zero-lock checkout pool).
+>   - Added 4 new behavioral scenarios to `spec.md`: zero block size validation, worker offline anti-spin timeout, SQLite cache hit fast-path, and RAII lease zero-lock delta streaming.
+>   - Synchronized automated testing metrics in `spec.md`: 273 automated tests (223 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, 7 doc-tests).
+> * **New Constraints:**
+>   - All new or modified public functions and structs must maintain rustdoc `# Arguments`, `# Returns`, `# Errors`, and `# Panics` sections per `doc-rules.md §1`.
+>   - Behavioral scenarios in `spec.md` must be updated whenever public API contracts or error semantics change.
+> * **Pruned:**
+>   - Stale test counts, undocumented public API items, and verification hash drift in `spec.md` resolved and synchronized.
