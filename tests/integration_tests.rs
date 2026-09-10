@@ -445,3 +445,104 @@ fn test_worker_reachability_and_offline_drain_guard() {
     cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = handle.join();
 }
+
+#[test]
+fn test_delta_sync_interrupted_write_invalidates_cache() {
+    use std::path::Path;
+    use syncdir::config::{Config, TargetSyncConfig};
+    use syncdir::db::{HashStore, SqliteHashStore, StoreConfig};
+    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LockFile(
+                hFile: std::os::windows::raw::HANDLE,
+                dwFileOffsetLow: u32,
+                dwFileOffsetHigh: u32,
+                nNumberOfBytesToLockLow: u32,
+                nNumberOfBytesToLockHigh: u32,
+            ) -> i32;
+            fn UnlockFile(
+                hFile: std::os::windows::raw::HANDLE,
+                dwFileOffsetLow: u32,
+                dwFileOffsetHigh: u32,
+                nNumberOfBytesToUnlockLow: u32,
+                nNumberOfBytesToUnlockHigh: u32,
+            ) -> i32;
+        }
+
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        let db_path = dir.path().join("sigcache.db");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(512)
+            .build();
+
+        let store =
+            SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+
+        let rel_path = Path::new("large.bin");
+        let src_file = src.join("large.bin");
+        let dst_file = dst.join("large.bin");
+
+        // Create 2048-byte files (4 blocks of 512 bytes)
+        std::fs::write(&src_file, vec![1u8; 2048]).unwrap();
+        std::fs::write(&dst_file, vec![1u8; 2048]).unwrap();
+
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        // Initial sync populates SQLite cache
+        engine.sync_file(rel_path).unwrap();
+
+        let verify_store_initial =
+            SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+        assert!(
+            verify_store_initial.get_file(rel_path).unwrap().is_some(),
+            "Record must be present in SQLite cache after initial sync"
+        );
+
+        // Modify source file to have differing blocks
+        std::fs::write(&src_file, vec![2u8; 2048]).unwrap();
+
+        // Lock byte range [1024..2048] of the destination file using Windows LockFile
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dst_file)
+            .unwrap();
+        let lock_success = unsafe { LockFile(lock_file.as_raw_handle(), 1024, 0, 1024, 0) };
+        assert_ne!(lock_success, 0, "LockFile must succeed");
+
+        // Sync will start writing dirty block 0, but fail writing dirty block 1 due to lock violation
+        let sync_res = engine.sync_file(rel_path);
+        assert!(
+            sync_res.is_err(),
+            "Sync must fail when destination file block is locked"
+        );
+
+        // Unlock the file
+        unsafe {
+            UnlockFile(lock_file.as_raw_handle(), 1024, 0, 1024, 0);
+        }
+        drop(lock_file);
+
+        // Because dirty blocks were written before the failure, SQLite cache record must be deleted
+        let verify_store_after =
+            SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+        assert!(
+            verify_store_after.get_file(rel_path).unwrap().is_none(),
+            "SQLite cache record must be invalidated (deleted) after interrupted delta sync"
+        );
+    }
+}

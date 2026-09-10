@@ -346,84 +346,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
 mod tests {
     use super::*;
     use crate::config::{Config, TargetSyncConfig};
-    use crate::db::{BlockHash, MockHashStore};
+    use crate::db::MockHashStore;
     use crate::sync::SyncEngine;
-    use std::collections::HashMap;
     use tempfile::tempdir;
-
-    #[derive(Clone)]
-    struct BatchTrackingStore {
-        inner: MockHashStore,
-        save_file_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        save_files_batch_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl BatchTrackingStore {
-        fn new() -> Self {
-            Self {
-                inner: MockHashStore::new(),
-                save_file_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                save_files_batch_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            }
-        }
-    }
-
-    impl HashStore for BatchTrackingStore {
-        fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
-            self.inner.get_file(path)
-        }
-        fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
-            self.save_file_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.save_file(record, hashes)
-        }
-        fn get_block_hashes(&self, path: &Path) -> Result<Vec<BlockHash>, SyncError> {
-            self.inner.get_block_hashes(path)
-        }
-        fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
-            self.inner.delete_file(path)
-        }
-        fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
-            self.inner.list_files()
-        }
-        fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
-            self.inner.list_all_records()
-        }
-        fn save_files_batch(
-            &self,
-            records: &[(&FileRecord, &[BlockHash])],
-        ) -> Result<(), SyncError> {
-            self.save_files_batch_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.save_files_batch(records)
-        }
-    }
-
-    struct FailingHashStore;
-    impl HashStore for FailingHashStore {
-        fn get_file(&self, _path: &Path) -> Result<Option<FileRecord>, SyncError> {
-            Ok(None)
-        }
-        fn save_file(&self, _record: &FileRecord, _hashes: &[BlockHash]) -> Result<(), SyncError> {
-            Ok(())
-        }
-        fn get_block_hashes(&self, _path: &Path) -> Result<Vec<BlockHash>, SyncError> {
-            Ok(vec![])
-        }
-        fn delete_file(&self, _path: &Path) -> Result<(), SyncError> {
-            Ok(())
-        }
-        fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
-            Ok(vec![])
-        }
-        fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
-            Err(SyncError::db("Forced list_all_records failure"))
-        }
-        fn save_files_batch(
-            &self,
-            _records: &[(&FileRecord, &[BlockHash])],
-        ) -> Result<(), SyncError> {
-            Ok(())
-        }
-    }
 
     #[test]
     fn test_scan_dir_skips_symlinks() {
@@ -606,7 +531,7 @@ mod tests {
             std::fs::write(src.join(format!("file_{i}.txt")), format!("content {i}")).unwrap();
         }
 
-        let store = BatchTrackingStore::new();
+        let store = MockHashStore::new();
         let config = Config::builder(src).dest_dir(dst).build();
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
@@ -615,12 +540,12 @@ mod tests {
         assert!(matches!(outcome, ScanOutcome::Success { synced: 5 }));
 
         assert_eq!(
-            store.save_file_calls.load(Ordering::Relaxed),
+            store.save_file_count(),
             0,
             "Full scan must not call save_file individually"
         );
         assert!(
-            store.save_files_batch_calls.load(Ordering::Relaxed) >= 1,
+            store.batch_save_count() >= 1,
             "Full scan must call save_files_batch"
         );
     }
@@ -734,8 +659,16 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::create_dir_all(&dst).unwrap();
         let config = Config::test_default(src, dst);
+        let store = MockHashStore::new();
+        store.set_error_hook(Some(Box::new(|op| {
+            if op == "list_all_records" {
+                Some(SyncError::db("Forced list_all_records failure"))
+            } else {
+                None
+            }
+        })));
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
-        let engine = LocalSyncEngine::new(FailingHashStore, target_cfg);
+        let engine = LocalSyncEngine::new(store, target_cfg);
         let result = engine.run_full_scan();
         assert!(matches!(result, Err(SyncError::Db(..))));
     }

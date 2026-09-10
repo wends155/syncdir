@@ -370,7 +370,6 @@ mod tests {
     use crate::config::{Config, TargetSyncConfig};
     use crate::db::{MockHashStore, SqliteHashStore};
     use crate::sync::SyncEngine;
-    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
@@ -576,49 +575,6 @@ mod tests {
         let src_file = src.join("large.bin");
         let dst_file = dst.join("large.bin");
 
-        struct TruncatingMockStore {
-            inner: MockHashStore,
-            target_to_truncate: PathBuf,
-        }
-        impl HashStore for TruncatingMockStore {
-            fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
-                self.inner.get_file(path)
-            }
-            fn save_file(
-                &self,
-                record: &FileRecord,
-                hashes: &[crate::db::BlockHash],
-            ) -> Result<(), SyncError> {
-                self.inner.save_file(record, hashes)
-            }
-            fn get_block_hashes(
-                &self,
-                path: &Path,
-            ) -> Result<Vec<crate::db::BlockHash>, SyncError> {
-                let f = OpenOptions::new()
-                    .write(true)
-                    .open(&self.target_to_truncate)
-                    .unwrap();
-                f.set_len(512).unwrap();
-                self.inner.get_block_hashes(path)
-            }
-            fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
-                self.inner.delete_file(path)
-            }
-            fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
-                self.inner.list_files()
-            }
-            fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
-                self.inner.list_all_records()
-            }
-            fn save_files_batch(
-                &self,
-                records: &[(&FileRecord, &[crate::db::BlockHash])],
-            ) -> Result<(), SyncError> {
-                self.inner.save_files_batch(records)
-            }
-        }
-
         let store = MockHashStore::new();
         let h0 = *blake3::hash(&[0xEE; 512]).as_bytes();
         let h1 = *blake3::hash(&[0xEE; 512]).as_bytes();
@@ -630,11 +586,18 @@ mod tests {
         };
         store.save_file(&rec, &[h0, h1]).unwrap();
 
-        let trunc_store = TruncatingMockStore {
-            inner: store,
-            target_to_truncate: dst_file.clone(),
-        };
-        let engine = LocalSyncEngine::new(trunc_store, target_cfg);
+        let dst_file_clone = dst_file.clone();
+        store.set_error_hook(Some(Box::new(move |op| {
+            if op == "get_block_hashes" {
+                let f = OpenOptions::new()
+                    .write(true)
+                    .open(&dst_file_clone)
+                    .unwrap();
+                f.set_len(512).unwrap();
+            }
+            None
+        })));
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // Pre-create destination with 1024 bytes matching source
         std::fs::write(&src_file, vec![0xEE; 1024]).unwrap();

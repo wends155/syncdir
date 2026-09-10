@@ -869,45 +869,6 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    struct StubValidationFailEngine {
-        call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl SyncEngine for StubValidationFailEngine {
-        fn sync_file(&self, _path: &Path) -> Result<(), SyncError> {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(SyncError::validation("Permanent validation failure"))
-        }
-        fn delete_file(&self, _path: &Path) -> Result<(), SyncError> {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(SyncError::validation("Permanent validation failure"))
-        }
-        fn sync_file_to_dest_buffered(
-            &self,
-            _path: &Path,
-            _dest_dir: &Path,
-            _scratch: &mut [u8],
-        ) -> Result<(), SyncError> {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(SyncError::validation("Permanent validation failure"))
-        }
-        fn delete_file_from_dest(&self, _path: &Path, _dest_dir: &Path) -> Result<(), SyncError> {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(SyncError::validation("Permanent validation failure"))
-        }
-        fn run_cancellable_full_scan(
-            &self,
-            _dest_dir: &Path,
-            _cancel: &std::sync::atomic::AtomicBool,
-        ) -> Result<ScanOutcome, SyncError> {
-            Ok(ScanOutcome::Success { synced: 0 })
-        }
-    }
-
     #[test]
     fn test_worker_queue_debouncing_storm() {
         let dir = tempdir().unwrap();
@@ -1051,10 +1012,8 @@ mod tests {
 
     #[test]
     fn test_sync_worker_evicts_validation_errors_without_retry() {
-        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let engine = StubValidationFailEngine {
-            call_count: call_count.clone(),
-        };
+        let engine = MockSyncEngine::new();
+        engine.set_sync_error(|| SyncError::validation("Permanent validation failure"));
         let (tx, rx) = std::sync::mpsc::channel();
         let dir = tempdir().unwrap();
         let src = dir.path().join("src");
@@ -1068,7 +1027,7 @@ mod tests {
             .build();
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+        let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
         let handle = start_sync_worker(ctx).unwrap();
         tx.send(SyncCommand::FileModified(PathBuf::from(
             "unsafe/../file.txt",
@@ -1078,7 +1037,7 @@ mod tests {
         drop(tx);
         handle.join().unwrap();
         assert_eq!(
-            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            engine.failed_calls().len(),
             1,
             "Validation error must be evicted after 1 attempt, not retried"
         );
