@@ -477,6 +477,25 @@ pub fn calculate_exponential_backoff(
 }
 
 /// Spawns a background synchronization worker thread.
+/// Compute the channel receive timeout for the background worker event loop.
+///
+/// If there are pending expired sync items in the debounce queue, `Duration::ZERO`
+/// is returned only if both destination and source are currently reachable (`can_drain`).
+/// If either is offline, the timeout is clamped to 1 second to prevent CPU busy-spinning.
+pub(crate) fn calculate_worker_poll_timeout(
+    queue_earliest: Option<std::time::Instant>,
+    now: std::time::Instant,
+    can_drain: bool,
+) -> std::time::Duration {
+    match queue_earliest {
+        Some(dl) if dl > now => (dl - now).min(std::time::Duration::from_secs(1)),
+        Some(_) if can_drain => std::time::Duration::ZERO,
+        Some(_) => std::time::Duration::from_secs(1),
+        None => std::time::Duration::from_secs(1),
+    }
+}
+
+/// Start a dedicated background worker thread for a specific target destination.
 ///
 /// The worker listens for filesystem events (file changes/deletions) on its channel
 /// and triggers block-level sync operations to its specific destination directory.
@@ -528,6 +547,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     break;
                 }
                 let now = Instant::now();
+                let mut network_offline_detected = false;
 
                 let was_offline = !reachability.is_dest_online();
                 if reachability.should_check_reachability(now) {
@@ -563,11 +583,12 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     }
                 }
 
-                let timeout = match queue.earliest_deadline() {
-                    Some(dl) if dl > now => (dl - now).min(std::time::Duration::from_secs(1)),
-                    Some(_) => std::time::Duration::ZERO,
-                    None => std::time::Duration::from_secs(1),
-                };
+                let can_drain = reachability.is_dest_online()
+                    && source_connectivity.is_online()
+                    && !network_offline_detected;
+
+                let timeout =
+                    calculate_worker_poll_timeout(queue.earliest_deadline(), now, can_drain);
 
                 let mut cmd_opt = match rx.recv_timeout(timeout) {
                     Ok(cmd) => Some(cmd),
@@ -649,10 +670,9 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                     let _ = engine.prune_archive(reachability.active_dest());
                 }
 
-                let mut network_offline_detected = false;
-
                 // Drain and process ready syncs only if destination and source are online
-                if reachability.is_dest_online()
+                if can_drain
+                    && reachability.is_dest_online()
                     && source_connectivity.is_online()
                     && !network_offline_detected
                 {
@@ -867,7 +887,50 @@ mod tests {
     use crate::sync::mock::MockSyncEngine;
     use pretty_assertions::assert_eq;
     use std::fs;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[test]
+    fn test_calculate_worker_poll_timeout() {
+        let now = Instant::now();
+
+        // Case 1: Empty queue (None) -> 1 second
+        assert_eq!(
+            calculate_worker_poll_timeout(None, now, true),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            calculate_worker_poll_timeout(None, now, false),
+            Duration::from_secs(1)
+        );
+
+        // Case 2: Future deadline -> min(deadline - now, 1s)
+        let future_500ms = now + Duration::from_millis(500);
+        let timeout_future = calculate_worker_poll_timeout(Some(future_500ms), now, true);
+        assert!(timeout_future <= Duration::from_millis(500));
+        assert!(timeout_future >= Duration::from_millis(400));
+
+        let future_2s = now + Duration::from_secs(2);
+        assert_eq!(
+            calculate_worker_poll_timeout(Some(future_2s), now, true),
+            Duration::from_secs(1)
+        );
+
+        // Case 3: Expired deadline (deadline <= now)
+        let past = now - Duration::from_millis(100);
+
+        // When can_drain is true -> Duration::ZERO
+        assert_eq!(
+            calculate_worker_poll_timeout(Some(past), now, true),
+            Duration::ZERO
+        );
+
+        // When can_drain is false (destination or source offline) -> clamped to 1 second
+        assert_eq!(
+            calculate_worker_poll_timeout(Some(past), now, false),
+            Duration::from_secs(1)
+        );
+    }
 
     #[test]
     fn test_worker_queue_debouncing_storm() {
