@@ -214,6 +214,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
     pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
         self.archive_dest_file_only(rel_path, dest_dir)?;
         let dest_path = dest_dir.join(rel_path);
+        if let Some(parent) = dest_path.parent() {
+            self.evict_verified_dir(parent);
+        }
         if self.config.propagate_deletions() || !dest_path.exists() {
             self.db.delete_file(rel_path)?;
         }

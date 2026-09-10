@@ -159,6 +159,34 @@ impl SyncError {
         SyncError::Validation(msg.into())
     }
 
+    /// Create a `SyncError::Validation` error for security violations.
+    pub fn validation_security(msg: impl Into<String>) -> Self {
+        SyncError::Validation(msg.into())
+    }
+
+    /// Create a `SyncError::Validation` error for domain invariant violations.
+    pub fn validation_invariant(msg: impl Into<String>) -> Self {
+        SyncError::Validation(msg.into())
+    }
+
+    /// Check if this error is a permanent validation failure that should not be retried.
+    #[must_use]
+    pub fn is_permanent_validation_failure(&self) -> bool {
+        match self {
+            Self::Validation(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                lower.contains("traversal")
+                    || lower.contains("reserved")
+                    || lower.contains("reparse point")
+                    || lower.contains("junction")
+                    || lower.contains("invalid encoding")
+                    || lower.contains("refusing to write")
+                    || lower.contains("refusing to prune")
+            }
+            _ => false,
+        }
+    }
+
     /// Create a `SyncError::WriteVerificationFailed` error.
     pub fn write_verification_failed(path: impl Into<std::path::PathBuf>) -> Self {
         SyncError::WriteVerificationFailed {
@@ -503,5 +531,29 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn test_sync_error_permanent_validation_failure_classification() {
+        let perm1 = SyncError::validation_security("Unsafe path traversal detected: ../secret");
+        assert!(perm1.is_permanent_validation_failure());
+
+        let perm2 = SyncError::validation_security(
+            "Destination component 'C:\\dest\\junction' is a symlink or reparse point; refusing to write",
+        );
+        assert!(perm2.is_permanent_validation_failure());
+
+        let perm3 =
+            SyncError::validation_security("Filename contains reserved DOS device name: AUX");
+        assert!(perm3.is_permanent_validation_failure());
+
+        let transient = SyncError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "network timeout",
+        ));
+        assert!(!transient.is_permanent_validation_failure());
+
+        let transient_val = SyncError::Validation("Temporary lock acquisition delay".into());
+        assert!(!transient_val.is_permanent_validation_failure());
     }
 }

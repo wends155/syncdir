@@ -206,11 +206,18 @@ pub trait SyncEngine: Send + Sync {
     ///
     /// # Errors
     /// Returns `SyncError` on directory traversal or synchronization failure.
+    /// Perform a full directory scan on `dest_dir` and sync all changed files.
+    ///
+    /// # Errors
+    /// Returns `SyncError` on directory traversal or synchronization failure.
     fn run_full_scan(&self, dest_dir: &Path) -> Result<ScanOutcome, SyncError> {
         static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         self.run_cancellable_full_scan(dest_dir, &NEVER_CANCELLED)
     }
+
+    /// Invalidate any cached directory metadata (e.g. reparse point checks).
+    fn invalidate_verified_dirs(&self) {}
 }
 
 /// Snapshot of a file's size and modification timestamp for drift detection.
@@ -349,6 +356,24 @@ impl<S: HashStore> LocalSyncEngine<S> {
             dirty_range_pool: std::sync::Mutex::new(None),
             verified_dirs: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Invalidate any cached directory metadata (e.g. reparse point checks).
+    pub fn invalidate_verified_dirs(&self) {
+        let mut cache = self
+            .verified_dirs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.clear();
+    }
+
+    /// Evict a specific directory and its children from the verified directory cache.
+    pub fn evict_verified_dir(&self, dir: &Path) {
+        let mut cache = self
+            .verified_dirs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|p| !p.starts_with(dir));
     }
 
     /// Acquire an exclusive RAII lease on a `DirtyBlockRange` buffer.
@@ -653,6 +678,10 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ScanOutcome, SyncError> {
         self.run_cancellable_full_scan_impl(dest_dir, cancel)
+    }
+
+    fn invalidate_verified_dirs(&self) {
+        self.invalidate_verified_dirs();
     }
 }
 
@@ -1034,5 +1063,49 @@ mod tests {
             assert_eq!(engine.dirty_range_capacity(), 0);
         }
         assert!(engine.dirty_range_capacity() > 0);
+    }
+
+    #[test]
+    fn test_verified_dirs_junction_substitution_detection_and_invalidation() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let sub = dst.join("sub");
+        let nested = sub.join("nested");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+
+        let config = Config::test_default(src, dst.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        // Populate verified_dirs cache via verify_destination_cached
+        let _ = engine.verify_destination_cached(&dst, Path::new("sub/nested/file.txt"));
+        {
+            let cache = engine.verified_dirs.lock().unwrap();
+            assert!(cache.contains(&dst));
+            assert!(cache.contains(&sub));
+            assert!(cache.contains(&nested));
+        }
+
+        // Test prefix eviction: evicting sub must remove sub and sub/nested, keeping dst
+        engine.evict_verified_dir(&sub);
+        {
+            let cache = engine.verified_dirs.lock().unwrap();
+            assert!(cache.contains(&dst), "Root destination must remain cached");
+            assert!(!cache.contains(&sub), "Evicted dir must be removed");
+            assert!(
+                !cache.contains(&nested),
+                "Child of evicted dir must be removed"
+            );
+        }
+
+        // Test full cache invalidation via SyncEngine trait
+        let engine_trait: &dyn SyncEngine = &engine;
+        engine_trait.invalidate_verified_dirs();
+        {
+            let cache = engine.verified_dirs.lock().unwrap();
+            assert!(cache.is_empty(), "Full invalidation must clear all entries");
+        }
     }
 }

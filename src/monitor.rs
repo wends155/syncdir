@@ -50,16 +50,34 @@ impl DirectoryWatcher {
         let source_root = source_dir.as_ref().to_path_buf();
         let source_clone = source_root.clone();
 
-        let mut watcher =
-            notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
-                Ok(event) => Self::dispatch_event(event, &source_clone, &tx),
-                Err(e) => {
-                    tracing::error!(error = %e, "Watcher error");
-                }
-            })?;
+        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            Self::handle_watcher_result(res, &source_clone, &tx);
+        })?;
 
         watcher.watch(&source_root, RecursiveMode::Recursive)?;
         Ok(DirectoryWatcher { _watcher: watcher })
+    }
+
+    pub(crate) fn handle_watcher_result(
+        res: Result<Event, notify::Error>,
+        source_root: &Path,
+        tx: &Sender<SyncCommand>,
+    ) {
+        match res {
+            Ok(event) => Self::dispatch_event(event, source_root, tx),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Directory watcher error; triggering full scan to recover potentially missed events"
+                );
+                if let Err(send_err) = tx.send(SyncCommand::TriggerFullScan) {
+                    tracing::error!(
+                        error = %send_err,
+                        "Sync worker channel disconnected; full scan recovery command dropped"
+                    );
+                }
+            }
+        }
     }
 
     fn handle_rename_pair(
@@ -301,5 +319,17 @@ mod tests {
             let cmd2 = rx.try_recv().expect("Should have received second command");
             assert_eq!(cmd2, SyncCommand::FileModified(PathBuf::from("File.txt")));
         }
+    }
+
+    #[test]
+    fn test_directory_watcher_dispatches_full_scan_on_buffer_overflow() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = PathBuf::from(r"C:\test\source");
+
+        let notify_err = notify::Error::generic("OS buffer overflow in ReadDirectoryChangesW");
+        DirectoryWatcher::handle_watcher_result(Err(notify_err), &root, &tx);
+
+        let cmd = rx.try_recv().expect("Should have received a SyncCommand");
+        assert_eq!(cmd, SyncCommand::TriggerFullScan);
     }
 }
