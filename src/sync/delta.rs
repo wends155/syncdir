@@ -204,12 +204,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 let buffer = scratch;
                 let mut new_hashes = Vec::new();
                 let mut block_idx: u64 = 0;
-                let mut range_guard = self
-                    .dirty_range
-                    .lock()
-                    .map_err(|_| SyncError::lock_poison("dirty_range"))?;
-                range_guard.reset();
-                let range = &mut *range_guard;
+                let mut lease = self.acquire_dirty_range_lease();
+                let range = &mut *lease;
                 let mut total_bytes_read: u64 = 0;
                 let mut modified_block_indices: Vec<(u64, usize, [u8; 32])> = Vec::new();
 
@@ -240,7 +236,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                     block_idx += 1;
                 }
                 range.flush(&mut dest_file)?;
-                drop(range_guard);
+                drop(lease);
 
                 // Post-stream metadata re-verification (TOCTOU protection)
                 let post_meta = src_file.metadata()?;
@@ -745,7 +741,7 @@ mod tests {
         let mut scratch = vec![0u8; 512];
         engine.sync_delta_large_file(&task1, &mut scratch).unwrap();
 
-        let cap1 = engine.dirty_range.lock().unwrap().capacity();
+        let cap1 = engine.dirty_range_capacity();
         assert!(
             cap1 >= 512,
             "dirty_range buffer must have allocated capacity"
@@ -766,7 +762,7 @@ mod tests {
         };
         engine.sync_delta_large_file(&task2, &mut scratch).unwrap();
 
-        let cap2 = engine.dirty_range.lock().unwrap().capacity();
+        let cap2 = engine.dirty_range_capacity();
         assert!(
             cap2 >= cap1,
             "dirty_range capacity should be retained or grown across files"

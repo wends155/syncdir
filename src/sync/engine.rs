@@ -269,12 +269,61 @@ pub fn is_metadata_up_to_date_raw(
     src.is_up_to_date(dest, record)
 }
 
+/// RAII lease for a `DirtyBlockRange` buffer checked out from `LocalSyncEngine`.
+///
+/// On drop, resets the buffer and returns it to the pool, retaining whichever has
+/// greater allocation capacity if the pool is already populated.
+pub struct DirtyRangeLease<'a> {
+    pool: &'a std::sync::Mutex<Option<DirtyBlockRange>>,
+    range: Option<DirtyBlockRange>,
+}
+
+impl<'a> std::ops::Deref for DirtyRangeLease<'a> {
+    type Target = DirtyBlockRange;
+
+    fn deref(&self) -> &Self::Target {
+        self.range
+            .as_ref()
+            .expect("DirtyRangeLease invariant violated: range is None")
+    }
+}
+
+impl<'a> std::ops::DerefMut for DirtyRangeLease<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.range
+            .as_mut()
+            .expect("DirtyRangeLease invariant violated: range is None")
+    }
+}
+
+impl<'a> Drop for DirtyRangeLease<'a> {
+    fn drop(&mut self) {
+        if let Some(mut range) = self.range.take() {
+            range.reset();
+            let mut pool = self
+                .pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match pool.as_mut() {
+                Some(existing) => {
+                    if range.capacity() > existing.capacity() {
+                        *existing = range;
+                    }
+                }
+                None => {
+                    *pool = Some(range);
+                }
+            }
+        }
+    }
+}
+
 /// Delta sync engine backed by a `HashStore` for signature caching.
 pub struct LocalSyncEngine<S: HashStore> {
     pub(crate) db: S,
     pub(crate) config: TargetSyncConfig,
     pub(crate) resolved_dest: Option<PathBuf>,
-    pub(crate) dirty_range: std::sync::Mutex<DirtyBlockRange>,
+    pub(crate) dirty_range_pool: std::sync::Mutex<Option<DirtyBlockRange>>,
     pub(crate) verified_dirs: std::sync::Mutex<HashSet<PathBuf>>,
 }
 
@@ -293,14 +342,42 @@ impl<S: HashStore> LocalSyncEngine<S> {
     /// Create a new sync engine with the given database and config.
     pub fn new(db: S, config: impl Into<TargetSyncConfig>) -> Self {
         let config = config.into();
-        let block_size = config.block_size_bytes();
         Self {
             db,
             config,
             resolved_dest: None,
-            dirty_range: std::sync::Mutex::new(DirtyBlockRange::new(block_size)),
+            dirty_range_pool: std::sync::Mutex::new(None),
             verified_dirs: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Acquire an exclusive RAII lease on a `DirtyBlockRange` buffer.
+    ///
+    /// The buffer is checked out without holding locks during file I/O and returned
+    /// to the pool automatically on lease drop.
+    pub fn acquire_dirty_range_lease(&self) -> DirtyRangeLease<'_> {
+        let mut pool = self
+            .dirty_range_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let range = pool
+            .take()
+            .unwrap_or_else(|| DirtyBlockRange::new_nonzero(self.config.block_size_nonzero()));
+        DirtyRangeLease {
+            pool: &self.dirty_range_pool,
+            range: Some(range),
+        }
+    }
+
+    /// Return the capacity of the pooled buffer if present, or 0 if checked out or empty.
+    #[cfg(test)]
+    pub(crate) fn dirty_range_capacity(&self) -> usize {
+        self.dirty_range_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.capacity())
+            .unwrap_or(0)
     }
 
     /// Set a pre-resolved destination path (e.g. from ReachabilityMonitor or worker context).
@@ -419,6 +496,16 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         let src_size = sym_meta.len() as i64;
         let src_mod = safe_modified_millis(&sym_meta)?;
+
+        if dest_meta.is_some()
+            && let Some(record) = file_record
+            && record.is_tracked()
+            && record.file_size == src_size
+            && record.last_modified == src_mod
+        {
+            tracing::debug!(path = %rel_path.display(), "Local signature cache hit, skipping destination check");
+            return Ok(None);
+        }
 
         if Self::is_metadata_up_to_date(dest_meta.as_ref(), src_size, src_mod, file_record) {
             tracing::debug!(path = %rel_path.display(), "Metadata unchanged, skipping sync");
@@ -786,5 +873,72 @@ mod tests {
         let outcome = engine.run_full_scan().unwrap();
         assert!(matches!(outcome, ScanOutcome::Success { synced: 1 }));
         assert!(alt_dst.join("hello.txt").exists());
+    }
+
+    #[test]
+    fn test_sync_file_to_dest_core_cache_hit() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        let file_rel = Path::new("cached_file.txt");
+        let src_file = src.join(file_rel);
+        fs::write(&src_file, b"cache hit payload").unwrap();
+        let meta = fs::symlink_metadata(&src_file).unwrap();
+        let src_size = meta.len() as i64;
+        let src_mod = safe_modified_millis(&meta).unwrap();
+
+        let record = FileRecord::new(file_rel.to_path_buf(), src_size, src_mod).with_id(42);
+
+        let config = Config::test_default(src, dst.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        let dst_file = dst.join(file_rel);
+        fs::write(&dst_file, b"existing dest payload").unwrap();
+
+        let mut scratch = vec![0u8; 4096];
+        let res = engine.sync_file_to_dest_core(file_rel, &dst, &mut scratch, Some(&record));
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), None);
+        assert_eq!(
+            fs::read(&dst_file).unwrap(),
+            b"existing dest payload",
+            "Fast path should not overwrite destination when cache hits"
+        );
+    }
+
+    #[test]
+    fn test_dirty_range_lease_pool() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let config = Config::test_default(src, dst);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        // Initially pool is empty, capacity is 0
+        assert_eq!(engine.dirty_range_capacity(), 0);
+
+        {
+            let mut lease = engine.acquire_dirty_range_lease();
+            let mut sink = std::io::Cursor::new(Vec::new());
+            lease.add_block(0, &[1, 2, 3, 4], &mut sink).unwrap();
+            assert_eq!(lease.block_count(), 1);
+            // While checked out, pool is empty
+            assert_eq!(engine.dirty_range_capacity(), 0);
+        }
+
+        // After drop, pool has the buffer reset (block_count 0) and capacity preserved
+        assert!(engine.dirty_range_capacity() > 0);
+
+        {
+            let lease2 = engine.acquire_dirty_range_lease();
+            assert_eq!(lease2.block_count(), 0);
+            assert_eq!(engine.dirty_range_capacity(), 0);
+        }
+        assert!(engine.dirty_range_capacity() > 0);
     }
 }
