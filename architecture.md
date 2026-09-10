@@ -109,24 +109,24 @@ syncdir/
 * **Mock Availability**: `MockHashStore` (implemented in `src/db.rs`) for in-memory unit testing.
 
 ### `sync`
-* **Owns**: Scanning directory trees with symlink and intermediate directory junction skipping (`verify_destination_not_reparse` validating all ancestor components) and recursion depth limits (`scan_dir` skipping `PermissionDenied` folders), path safety validation (`is_safe_relative_path`), comparing source/destination state with ±2000 ms SMB timestamp tolerance (`is_metadata_up_to_date_raw`), fast-path metadata bypass before hashing, 64KB streamed small-file write verification (`verify_small_file_write`), worker scratch buffer reuse in delta sync, TOCTOU file length truncation protection using actual streamed byte counts, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, reusable dirty range buffer memory management (`DirtyBlockRange::reset`), decoupled periodic and post-full-scan archive pruning (`prune_archive` enforcing recursion depth $\le 32$), Windows case-insensitive deletion detection in `run_full_scan`, worker sub-components (`DebounceQueue`, `ReachabilityMonitor`, `SyncWorkerState`), thread-safe source presence tracking (`SourceConnectivityTracker`), and running background worker loops (`start_sync_worker`) with exponential backoff retries on `WriteVerificationFailed` and permanent validation error eviction.
+* **Owns**: Scanning directory trees with symlink and intermediate directory junction skipping (`verify_destination_not_reparse` validating all ancestor components) and recursion depth limits (`scan_dir` skipping `PermissionDenied` folders), path safety validation (`is_safe_relative_path`), comparing source/destination state with ±2000 ms SMB timestamp tolerance (`is_metadata_up_to_date_raw`), fast-path metadata bypass before hashing, active destination truncation/corruption repair in `sync_file_to_dest_core` (`dest_size == src_size` and timestamp verification), 64KB streamed small-file write verification (`verify_small_file_write`), worker scratch buffer reuse in delta sync, TOCTOU file length truncation protection using actual streamed byte counts, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, reusable dirty range buffer memory management (`DirtyBlockRange::reset`), decoupled periodic and post-full-scan archive pruning with root junction safety in `prune_archive` (verifying `archive_dir` itself is not a junction before traversal, enforcing recursion depth $\le 32$), Windows case-insensitive deletion detection in `run_full_scan`, worker sub-components (`DebounceQueue`, `ReachabilityMonitor`, `SyncWorkerState`), thread-safe source presence tracking (`SourceConnectivityTracker`), testable discrete worker state machine (`SyncWorkerRunner<E>` with deterministic `tick(now)` stepping and `handle_command`), and running background worker loops (`start_sync_worker`) with exponential backoff retries on `WriteVerificationFailed` and permanent validation error eviction.
 * **Submodules**:
-  * `sync::engine`: Core `SyncEngine` trait and concrete implementation for file sync/deletion and scan execution.
+  * `sync::engine`: Core `SyncEngine` trait and concrete implementation (`LocalSyncEngine`) for file sync/deletion, destination repair, scan execution, and dynamic reparse cache invalidation (`invalidate_verified_dirs`, `evict_verified_dir`).
   * `sync::delta`: In-place delta synchronization, chunked file reading, Blake3 block hashing, and dirty range management.
   * `sync::small_file`: Fast-path atomic small-file streaming, write verification, and staging.
   * `sync::scanner`: Directory traversal, case-insensitive deletion detection, cancellation, and safety threshold checks.
-  * `sync::archive`: Retention-based archive subfolder management, timestamped backups, and safe directory pruning.
-  * `sync::path_safety`: Win32 reparse point validation, ancestor junction guards, and path traversal defenses.
-  * `sync::worker`: Background worker lifecycle, debounce priority queues, exponential backoff, and reachability tracking.
+  * `sync::archive`: Retention-based archive subfolder management, timestamped backups, root junction verification, and safe directory pruning.
+  * `sync::path_safety`: Win32 reparse point validation, ancestor junction guards, two-phase non-blocking cache verification, and path traversal defenses.
+  * `sync::worker`: Discrete worker state machine (`SyncWorkerRunner`), worker lifecycle loop (`start_sync_worker`), debounce priority queues, exponential backoff, and reachability tracking.
   * `sync::mock`: Thread-safe mock implementation (`MockSyncEngine`) for unit and integration testing.
 * **Does NOT own**: Watching directories, UI interactions, daemon lifecycle.
 * **Trait Interfaces**:
-  * `SyncEngine`: Core sync execution controller (featuring `sync_file`, `sync_file_buffered`, `sync_file_to_dest_buffered`, `delete_file`, `delete_file_from_dest`, `prune_archive`, `run_full_scan`).
+  * `SyncEngine`: Core sync execution controller (featuring `sync_file`, `sync_file_buffered`, `sync_file_to_dest_buffered`, `delete_file`, `delete_file_from_dest`, `prune_archive`, `run_full_scan`, `invalidate_verified_dirs`).
   * `SyncStatusObserver`: Decoupled listener interface for target destination connectivity transitions.
 * **Mock Availability**: `MockSyncEngine` (implemented in `src/sync/mock.rs`) with dynamic sync/delete handlers, failure injection, and thread-safe call recording.
 
 ### `monitor`
-* **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`) wrapped in `#[must_use]` `DirectoryWatcher`, empty relative path filtering, debouncing file events, and broadcasting `SyncCommand` events to destination sync workers via crossbeam/std mpsc channels. Visibility of `dispatch_event` restricted to `pub(crate)`. Decoupled from `Config` (ISP fix accepting `impl AsRef<Path>`).
+* **Owns**: Starting the central directory watcher thread (`ReadDirectoryChangesW`) wrapped in `#[must_use]` `DirectoryWatcher`, empty relative path filtering, debouncing file events, broadcasting `SyncCommand` events to destination sync workers via crossbeam/std mpsc channels, and automated notify buffer overflow recovery (`ReadDirectoryChangesW` buffer overflow detection in `handle_watcher_result` dispatching `SyncCommand::TriggerFullScan` to prevent permanently dropped filesystem events). Visibility of `dispatch_event` restricted to `pub(crate)`. Decoupled from `Config` (ISP fix accepting `impl AsRef<Path>`).
 * **Does NOT own**: Config parsing, sync execution (delegates to `SyncEngine` worker threads).
 
 ### `main`
@@ -187,6 +187,7 @@ syncdir/
 * **Network Disconnect Classification**: `SyncError::is_network_offline()` inspects `std::io::Error::raw_os_error()` for Win32 SMB disconnect codes (53 `ERROR_BAD_NETPATH`, 59 `ERROR_UNEXP_NET_ERR`, 64 `ERROR_NETNAME_DELETED`, 67 `ERROR_BAD_NET_NAME`).
 * **Panic-Free Architecture**: Production code contains zero `.unwrap()` or `.expect()` calls. Worker threads return `Result<JoinHandle<()>, SyncError>` and worker execution loops handle errors gracefully with retry queues.
 * **Timestamp Safety**: File modification timestamps are normalized via `safe_modified_millis()` (clamping pre-1970 timestamps to 0 with warning logs) and restored via `safe_epoch_duration_millis()` (preventing wrapping integer underflow on `src_mod as u64`).
+* **Permanent Validation Failure Classification**: `SyncError::is_permanent_validation_failure()` identifies non-retryable security and invariant violations (path traversal, reserved DOS device names, reparse point junctions, invalid UTF-8 encodings) via semantic constructors `SyncError::validation_security` and `SyncError::validation_invariant`. This allows worker retry queues to immediately evict unrecoverable items without retry exhaustion while preserving exponential backoff retries for transient failures.
 
 
 ## 9. Observability & Logging
@@ -197,14 +198,15 @@ syncdir/
 * **Log Levels**: `INFO` for file copy telemetry and target reachability, `WARN` for recoverable errors/unreachable targets, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
-* **Test Suite Metrics**: 274 total automated tests passing with zero regressions and zero warnings across all targets (224 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, and 7 doc-tests).
-* **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing), `src/startup.rs`, `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), and the decomposed `src/sync/` submodules:
-  * `src/sync/engine.rs`: Metadata timestamp tolerances, TOCTOU size protection, and directory creation.
+* **Test Suite Metrics**: 289 total automated tests passing with zero regressions and zero warnings across all targets (235 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, and 11 doc-tests).
+* **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing), `src/startup.rs`, `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), `src/monitor.rs` (watcher buffer overflow recovery and event dispatching), and the decomposed `src/sync/` submodules:
+  * `src/sync/engine.rs`: Metadata timestamp tolerances, TOCTOU size protection, directory creation, destination file truncation repair, two-phase lock release, and reparse cache invalidation.
   * `src/sync/delta.rs`: Blake3 chunk hashing, delta sync dirty block updates, and read-back verification.
   * `src/sync/small_file.rs`: Fast-path atomic staging, sampled verification, and zero-byte files.
   * `src/sync/scanner.rs`: Directory traversal recursion limits, permission bypass, and case-insensitive deletion detection.
-  * `src/sync/path_safety.rs`: Traversal defense, reserved DOS devices, ADS rejection, and ancestor junction caching.
-  * `src/sync/worker.rs`: Debounce min-heap queue stress testing, exponential backoff, and reachability tracking.
+  * `src/sync/archive.rs`: Retention-based archive subfolder management, timestamped backups, root junction verification, and safe directory pruning.
+  * `src/sync/path_safety.rs`: Traversal defense, reserved DOS devices, ADS rejection, ancestor junction caching, and two-phase non-blocking checks.
+  * `src/sync/worker.rs`: Discrete `SyncWorkerRunner` stepping, debounce min-heap queue stress testing, exponential backoff, reachability tracking, and permanent validation error eviction.
   * `src/sync/mock.rs`: Recording mock engine verification.
 * **Integration Tests**: `tests/integration_tests.rs` (12 tests) simulating standard files, deletions, directory updates, configuration reload validation, rename event pairing, worker reachability offline drain guards, subsecond precision, and `run_tray` interface compilation.
 * **Snapshot Tests**: `tests/snapshot_tests.rs` (20 tests) using `insta` (v1) for regression-guarding snapshot assertions on `Config` debug formatting, validation errors (including zero block size/threshold and zero debounce), `SyncError` display output (including `SyncError::WriteVerificationFailed` and `SyncError::Registry`), `TargetSyncConfig`, and `FileRecord` structures.
@@ -291,6 +293,8 @@ sequenceDiagram
 * **Startup Registry Decoupling**: Fully resolved via DIP refactoring (`run_tray<H, R>` receives registry backend implementation by value, decoupling UI from static Win32 registry calls).
 * **Database Version 4 & Schema Optimization**: With `db_version` bumped to `"4"`, SQLite PRAGMAs enable WAL mode, foreign keys, normal synchronization, composite indexing on `block_hashes(file_id, block_index)`, exact prefix matching `substr(relative_path, 1, length(?1) + 1) = ?1 || '/'`, and `RETURNING id` UPSERTs. Old caches from previous schema versions are automatically invalidated and rebuilt on startup.
 * **Intermediate Ancestor Junction Protection**: Windows directory junctions and symlinks are actively audited via `verify_destination_not_reparse` along every ancestor component between the destination root and the target file, guarding against junction traversal attacks.
+* **Two-Phase Reparse Verification & SMB Latency Optimization**: Holding cache mutex locks across remote SMB `symlink_metadata` calls causes severe lock contention across worker threads. `LocalSyncEngine::verify_destination_cached` uses a two-phase check: first checking the `verified_dirs` cache under a brief lock acquisition, dropping the lock while performing remote filesystem I/O, and re-acquiring the lock only to insert verified directories.
+* **Reparse Cache Freshness & Dynamic Invalidation**: In-memory verified directory sets (`verified_dirs`) are cleared during full scans (`SyncEngine::invalidate_verified_dirs`) and have affected directory prefixes removed upon file deletion (`LocalSyncEngine::evict_verified_dir`), preventing directory substitution windows after initial validation.
 
 ## 15. Data Model
 
