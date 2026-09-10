@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 15e2d61
+> Last verified against: 778af1b
  
 | Field | Value |
 |-------|-------|
@@ -94,6 +94,12 @@ THEN `SyncError::Validation` is returned rejecting the invalid destination path 
 GIVEN a destination path `\\hostname` without a share name component
 WHEN `validate` is called on `TargetDir`
 THEN `SyncError::Validation` is returned rejecting the path
+
+[ERROR] TargetSyncConfigBuilder validation invariants failure
+GIVEN a `TargetSyncConfigBuilder` configured with a recursive sync loop (`source == dest` or nested paths), zero timeouts, or `block_sync_threshold_bytes < block_size_bytes`
+WHEN `build` is called
+THEN `SyncError::Validation` is returned
+AND construction fails
 
 ---
 

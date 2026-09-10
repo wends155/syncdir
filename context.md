@@ -377,3 +377,21 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Behavioral scenarios in `spec.md` must be updated whenever public API contracts or error semantics change.
 > * **Pruned:**
 >   - Stale test counts, undocumented public API items, and verification hash drift in `spec.md` resolved and synchronized.
+
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Safety Invariants Enforcement in `TargetSyncConfigBuilder` (Qualitative Review Finding 1 Remediation)
+> * **Changes:**
+>   - Updated `TargetSyncConfigBuilder::build` in `src/config.rs` to enforce:
+>     - Recursive sync loop detection (`is_same_or_descendant` check between source and destination in both directions).
+>     - Non-zero debounce duration (`debounce_seconds > 0`).
+>     - Non-zero retry interval (`retry_interval_seconds > 0`).
+>     - Block threshold ordering (`block_sync_threshold_bytes >= block_size_bytes`).
+>   - Added TDD unit test suite `test_target_sync_config_builder_validation_invariants` in `src/config.rs` testing all failure modes.
+>   - Verified all 273 automated tests pass with 0 failures, 0 warnings.
+> * **New Constraints:**
+>   - Standalone domain builder `TargetSyncConfigBuilder` MUST enforce identical path containment and timeout positivity invariants as top-level `Config::validate()`.
+> * **Pruned:**
+>   - Validation asymmetry between `Config::validate()` and `TargetSyncConfigBuilder::build()` permanently eliminated.
+
