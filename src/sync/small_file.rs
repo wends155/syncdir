@@ -142,7 +142,7 @@ impl SmallFileTransferEngine {
         // Flush and verify write based on VerificationMode
         match self.config.verification_mode() {
             VerificationMode::Disabled => {}
-            VerificationMode::MetadataAndFlush => {
+            VerificationMode::MetadataAndFlush | VerificationMode::Sampled => {
                 let temp_meta = temp_file.metadata()?;
                 if temp_meta.len() != total_bytes_copied {
                     return Err(SyncError::write_verification_failed(
@@ -151,7 +151,7 @@ impl SmallFileTransferEngine {
                 }
                 temp_file.sync_all()?;
             }
-            VerificationMode::Sampled | VerificationMode::Full => {
+            VerificationMode::Full => {
                 temp_file.sync_all()?;
                 temp_file.seek(SeekFrom::Start(0))?;
                 let mut written_hasher = blake3::Hasher::new();
@@ -396,5 +396,42 @@ mod tests {
         assert_eq!(record.file_size, meta.len() as i64);
         assert!(block_hashes.is_empty());
         assert_eq!(fs::read(&dst_file).unwrap(), b"Hello standalone engine!");
+    }
+
+    #[test]
+    fn test_small_file_sync_verification_mode_sampled_fast_path() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(source.clone(), dest.clone())
+            .verification_mode(crate::config::VerificationMode::Sampled)
+            .build()
+            .unwrap();
+        let engine = SmallFileTransferEngine::new(target_cfg);
+
+        let src_file = source.join("test.txt");
+        let dst_file = dest.join("test.txt");
+        let content = b"Sampled verification mode content";
+        fs::write(&src_file, content).unwrap();
+
+        let meta = fs::metadata(&src_file).unwrap();
+        let task = FileSyncTask {
+            rel_path: Path::new("test.txt"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dest,
+            src_size: meta.len() as i64,
+            src_mod: safe_modified_millis(&meta).unwrap(),
+            cached_id: None,
+        };
+
+        let mut scratch = vec![0u8; 64 * 1024];
+        let (record, hashes) = engine.sync_small_file_core(&task, &mut scratch).unwrap();
+        assert_eq!(record.file_size, content.len() as i64);
+        assert!(hashes.is_empty());
+        assert_eq!(fs::read(&dst_file).unwrap(), content);
     }
 }

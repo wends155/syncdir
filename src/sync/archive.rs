@@ -204,9 +204,15 @@ impl ArchiveManager {
                         counter += 1;
                     }
 
+                    let archive_rel = archive_path
+                        .strip_prefix(&archive_dir)
+                        .map_err(|e| SyncError::validation_security(e.to_string()))?;
+                    verify_destination_not_reparse(&archive_dir, archive_rel)?;
+
                     if let Some(parent) = archive_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
+                    verify_destination_not_reparse(&archive_dir, archive_rel)?;
                     fs::rename(&dest_path, &archive_path)?;
                 }
             }
@@ -589,5 +595,38 @@ mod tests {
 
         let prune_res = manager.prune_destination_archive(&dest);
         assert!(prune_res.is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_archive_dest_file_intermediate_subpath_ancestor_reparse_validation() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let archive_dir = dst.join(".syncdir_archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let intermediate_junction = archive_dir.join("sub_junction");
+        if create_test_junction(&outside, &intermediate_junction).is_err() {
+            return;
+        }
+
+        let res =
+            verify_destination_not_reparse(&archive_dir, Path::new("sub_junction/nested/file.txt"));
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.is_permanent_validation_failure());
+        assert!(matches!(
+            err,
+            SyncError::Validation {
+                kind: crate::error::ValidationKind::ReparsePoint,
+                ..
+            }
+        ));
     }
 }

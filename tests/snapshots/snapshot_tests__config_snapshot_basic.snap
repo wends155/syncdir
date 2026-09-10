@@ -18,6 +18,8 @@ Config {
     block_sync_threshold_bytes: 10,
     block_size_bytes: 4,
     verify_writes: true,
-    verification_mode: None,
+    verification_mode: Some(
+        Full,
+    ),
     retry_interval_seconds: 10,
 }
