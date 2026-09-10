@@ -336,8 +336,27 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Stale SQLite signature retention on in-place delta sync failure eliminated.
 >   - Worker offline queue churning (1.8M heap allocations/hr) eliminated.
 
+---
 
-
-
-
-
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Remediation of 6 Critical Findings from Multi-Lens Qualitative Codebase Review
+> * **Changes:**
+>   - Remediated all 6 🔴 Critical architectural and correctness defects identified in `review_report.md` via TDD red-green cycles across 16 implementation steps and 7 git checkpoints (`80ecb13`, `645051c`, `024d3d8`, `6e4f8da`, `3f588b9`, `fd2b734`, `6982d24`).
+>   - **Error Classification (Finding 4)**: Expanded `is_network_offline_io` in `src/error.rs` to match 9 standard `std::io::ErrorKind` variants (`TimedOut`, `ConnectionReset`, `ConnectionAborted`, `NotConnected`, `BrokenPipe`, `NetworkUnreachable`, `HostUnreachable`, `NetworkDown`, `ConnectionRefused`) before checking raw Win32 error codes, preventing spurious eviction of failed network items from worker retry queues.
+>   - **Block Size Safety & Invariants (Finding 3)**: Strongly typed `DirtyBlockRange.block_size` as `NonZeroU64` in `src/sync/delta.rs`. Added `new_nonzero(NonZeroU64)`, fallible `try_new(u64) -> Result<Self, SyncError>`, `TryFrom<u64>`, `Default`, and preserved backwards-compatible panicking `new(u64)`. Added `TargetSyncConfig::block_size_nonzero(&self) -> NonZeroU64` in `src/config.rs` defaulting safely to 64KB on zero values.
+>   - **Worker Liveness & Anti-Spin (Finding 1)**: Extracted `calculate_worker_poll_timeout` in `src/sync/worker.rs`. Evaluated `can_drain = reachability.is_dest_online() && source_connectivity.is_online() && !network_offline_detected;` before poll and clamped timeout to 1s when offline with pending queue items, eliminating 100% CPU busy-spinning during network outages.
+>   - **Daemon Startup SMB Decoupling (Finding 2)**: Modified `SyncDaemon::validate_target_loops` in `src/daemon.rs` to call `resolver.try_resolve_unc_path` instead of blocking `try_resolve_alternate_path`, eliminating 30–90+ second UI thread hangs during offline share validation.
+>   - **SMB Root Reparse Caching (Finding 5 Part A)**: Guarded root destination directory reparse checks in `src/sync/path_safety.rs` with `if !verified_dirs.contains(dest_dir)` and cached `dest_dir` on validation across both Windows and non-Windows cfgs, eliminating up to 50,000 redundant root SMB RPC stat calls per full scan.
+>   - **SQLite Signature Cache Hit Fast-Path (Finding 5 Part B)**: In `LocalSyncEngine::sync_file_to_dest_core` (`src/sync/engine.rs`), when `dest_meta.is_some()` and the local `file_record` matches source size and mtime, skipped destination re-verification and delta hashing immediately (`Ok(None)`).
+>   - **DirtyRange Mutex Elimination via RAII Lease Pool (Finding 6)**: Replaced struct-level `dirty_range: Mutex<DirtyBlockRange>` in `LocalSyncEngine` with `dirty_range_pool: Mutex<Option<DirtyBlockRange>>`. Introduced RAII `DirtyRangeLease<'a>` implementing `Deref`, `DerefMut`, and `Drop` (returning reset buffers and preserving highest capacity), allowing multi-gigabyte delta transfers and Blake3 hashing without holding any mutex during I/O.
+>   - Verified across full test suite: 272 passed (222 lib unit, 3 main unit, 12 integration, 8 property, 20 snapshot, 7 doctests), 0 failed, 1 ignored. Clean formatting (`cargo fmt --check`) and zero warnings (`cargo clippy -- -D warnings`).
+> * **New Constraints:**
+>   - `DirtyBlockRange` MUST enforce `NonZeroU64` block size to prevent divide-by-zero panics and file corruption at offset 0.
+>   - Sync worker poll timeouts MUST be clamped to at least 1s whenever `can_drain` is false to prevent CPU busy-spinning.
+>   - Daemon startup target loop validation MUST NEVER invoke blocking network discovery methods (`try_resolve_alternate_path`).
+>   - Delta sync streaming MUST NOT hold shared mutex locks across file read, hashing, or network write loops.
+> * **Pruned:**
+>   - Struct-level `dirty_range: Mutex<DirtyBlockRange>` lock contention across delta sync eliminated.
+>   - Unchecked `u64` block size division and modulo in `DirtyBlockRange` eliminated.
+>   - Raw OS error code limitation in `is_network_offline_io` eliminated.
+>   - Blocking SMB resolution during daemon loop validation eliminated.
