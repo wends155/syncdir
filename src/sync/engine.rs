@@ -848,7 +848,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                             target = %active_dest.display(),
                             error = %e,
                             os_error = ?os_code,
-                            remaining = source_files.len() - sync_skip_count - 1,
+                            remaining = calculate_remaining_files(source_files.len(), synced_count, failed_count),
                             "Target unreachable during full scan, skipping remaining files"
                         );
                         sync_skip_count = source_files.len();
@@ -1043,6 +1043,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
         self.db.save_file(&record, &[])?;
         Ok(())
     }
+}
+
+#[inline]
+pub(crate) fn calculate_remaining_files(total: usize, synced: usize, failed: usize) -> usize {
+    total.saturating_sub(synced.saturating_add(failed))
 }
 
 impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
@@ -2365,5 +2370,13 @@ mod tests {
         let engine = LocalSyncEngine::new(store, target_cfg);
         let result = engine.run_full_scan();
         assert!(matches!(result, Err(SyncError::Db(..))));
+    }
+
+    #[test]
+    fn test_run_cancellable_full_scan_arithmetic_underflow_protection() {
+        assert_eq!(calculate_remaining_files(0, 0, 1), 0);
+        assert_eq!(calculate_remaining_files(1, 1, 1), 0);
+        assert_eq!(calculate_remaining_files(5, 2, 1), 2);
+        assert_eq!(calculate_remaining_files(usize::MAX, usize::MAX, 1), 0);
     }
 }
