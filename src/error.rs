@@ -160,16 +160,76 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Validation` error for security violations.
+    ///
+    /// Used when path safety, reparse points, junctions, or directory traversal invariants
+    /// are violated, signaling a potential security risk.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - Explanatory message detailing the security violation.
+    ///
+    /// # Returns
+    ///
+    /// A [`SyncError::Validation`] instance wrapping the message string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syncdir::error::SyncError;
+    ///
+    /// let err = SyncError::validation_security("Unsafe path traversal detected: ../secret");
+    /// assert!(err.is_permanent_validation_failure());
+    /// ```
     pub fn validation_security(msg: impl Into<String>) -> Self {
         SyncError::Validation(msg.into())
     }
 
     /// Create a `SyncError::Validation` error for domain invariant violations.
+    ///
+    /// Used when configuration parameters, builder constraints, or operational invariants
+    /// are breached.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - Explanatory message detailing the invariant violation.
+    ///
+    /// # Returns
+    ///
+    /// A [`SyncError::Validation`] instance wrapping the message string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syncdir::error::SyncError;
+    ///
+    /// let err = SyncError::validation_invariant("Debounce seconds must be greater than zero");
+    /// assert_eq!(err.to_string(), "Validation error: Debounce seconds must be greater than zero");
+    /// ```
     pub fn validation_invariant(msg: impl Into<String>) -> Self {
         SyncError::Validation(msg.into())
     }
 
     /// Check if this error is a permanent validation failure that should not be retried.
+    ///
+    /// Permanent failures include security and traversal violations (such as junctions,
+    /// reparse points, reserved device names, or path traversal attempts) where retrying
+    /// would simply repeat the invariant failure and waste CPU/IO cycles.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the error represents a permanent validation failure, or `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syncdir::error::SyncError;
+    ///
+    /// let perm = SyncError::validation_security("Destination component is a symlink or reparse point");
+    /// assert!(perm.is_permanent_validation_failure());
+    ///
+    /// let transient = SyncError::Validation("Temporary lock delay".into());
+    /// assert!(!transient.is_permanent_validation_failure());
+    /// ```
     #[must_use]
     pub fn is_permanent_validation_failure(&self) -> bool {
         match self {

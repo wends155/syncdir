@@ -524,13 +524,19 @@ pub(crate) fn calculate_worker_poll_timeout(
     }
 }
 
+/// The outcome of evaluating a discrete execution tick of the [`SyncWorkerRunner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerTickOutcome {
+    /// The worker should continue processing events and polling commands.
     Continue,
+    /// The worker received a shutdown command or cancellation signal and should terminate.
     ShutdownRequested,
 }
 
 /// Testable sync worker state machine orchestrating debouncing, reachability, and execution.
+///
+/// Encapsulates worker context, debounce priority queues, reachability monitors, and execution
+/// state, allowing deterministic, zero-sleep stepping through time via [`SyncWorkerRunner::tick`].
 pub struct SyncWorkerRunner<E: SyncEngine> {
     pub context: SyncWorkerContext<E>,
     pub queue: DebounceQueue,
@@ -540,6 +546,15 @@ pub struct SyncWorkerRunner<E: SyncEngine> {
 }
 
 impl<E: SyncEngine> SyncWorkerRunner<E> {
+    /// Create a new `SyncWorkerRunner` instance initialized with the given worker context.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The worker configuration and shared state context.
+    ///
+    /// # Returns
+    ///
+    /// A configured [`SyncWorkerRunner`] ready to process commands and tick cycles.
     pub fn new(context: SyncWorkerContext<E>) -> Self {
         let max_pending_queue = context.max_pending_queue;
         let queue = DebounceQueue::new(max_pending_queue);
@@ -560,6 +575,18 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
         }
     }
 
+    /// Process an incoming synchronization command into the worker state machine.
+    ///
+    /// Routes filesystem change notifications to debounced priority queues, full scans
+    /// to immediate execution, and cancellation signals.
+    ///
+    /// # Arguments
+    ///
+    /// * `cmd` - The [`SyncCommand`] to process.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the runner should continue processing, or `false` if shutdown was requested.
     pub fn handle_command(&mut self, cmd: SyncCommand) -> bool {
         let debounce_dur = std::time::Duration::from_secs(self.context.config.debounce_seconds());
         let target_index = self.context.target_index;
@@ -629,6 +656,24 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
         }
     }
 
+    /// Execute a discrete tick of the worker state machine at simulated timestamp `now`.
+    ///
+    /// Evaluates target reachability, prunes archives, drains expired debounce queues,
+    /// triggers file transfers with exponential backoff on retryable errors, and evicts
+    /// permanent validation failures. Runs deterministically without thread sleeps.
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - The current synthetic or physical [`Instant`].
+    ///
+    /// # Returns
+    ///
+    /// Returns [`WorkerTickOutcome::Continue`] to keep running, or [`WorkerTickOutcome::ShutdownRequested`]
+    /// if cancellation or shutdown was signaled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SyncError`] if a fatal operational error occurs during tick execution.
     pub fn tick(&mut self, now: Instant) -> Result<WorkerTickOutcome, SyncError> {
         if self
             .context

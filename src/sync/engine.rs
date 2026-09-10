@@ -216,7 +216,11 @@ pub trait SyncEngine: Send + Sync {
         self.run_cancellable_full_scan(dest_dir, &NEVER_CANCELLED)
     }
 
-    /// Invalidate any cached directory metadata (e.g. reparse point checks).
+    /// Invalidate any cached directory metadata (e.g. reparse point and ancestor junction checks).
+    ///
+    /// Clears internal directory verification caches to ensure subsequent operations re-inspect
+    /// filesystem components. Called upon destination reconnection, full scan initiation, or error recovery.
+    /// Default implementation is a no-op for mock or non-caching engines.
     fn invalidate_verified_dirs(&self) {}
 }
 
@@ -358,7 +362,10 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
     }
 
-    /// Invalidate any cached directory metadata (e.g. reparse point checks).
+    /// Invalidate any cached directory metadata (e.g. reparse point and ancestor junction checks).
+    ///
+    /// Clears the internal `verified_dirs` cache so that subsequent synchronizations re-verify
+    /// the entire path tree against reparse point and symlink substitution attacks.
     pub fn invalidate_verified_dirs(&self) {
         let mut cache = self
             .verified_dirs
@@ -367,7 +374,14 @@ impl<S: HashStore> LocalSyncEngine<S> {
         cache.clear();
     }
 
-    /// Evict a specific directory and its children from the verified directory cache.
+    /// Evict a specific directory and its descendants from the verified directory cache.
+    ///
+    /// Removes `dir` and any path starting with `dir` from the cache. Called when files or
+    /// directories are deleted to close the time-of-check to time-of-use (TOCTOU) substitution window.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - The directory path whose cache entries should be purged.
     pub fn evict_verified_dir(&self, dir: &Path) {
         let mut cache = self
             .verified_dirs

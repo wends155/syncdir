@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 3905697
+> Last verified against: 7316ffc
  
 | Field | Value |
 |-------|-------|
@@ -194,9 +194,15 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `SyncEngine::delete_file_from_dest` | `(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
 | `SyncEngine::prune_archive` | `(&self, dest_dir: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
 | `SyncEngine::run_full_scan` | `(&self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
+| `SyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (default no-op clearing directory safety cache) |
 | `start_sync_worker` | `<E: SyncEngine + 'static>(context: SyncWorkerContext<E>) -> Result<JoinHandle<()>, SyncError>` | `Result<JoinHandle<()>, SyncError>` | `SyncError::Io` (thread spawn failure) |
+| `SyncWorkerRunner::new` | `(context: SyncWorkerContext<E>) -> Self` | `SyncWorkerRunner<E>` | — (discrete, testable worker state machine) |
+| `SyncWorkerRunner::handle_command` | `(&mut self, cmd: SyncCommand) -> bool` | `bool` | — (false indicates shutdown requested) |
+| `SyncWorkerRunner::tick` | `(&mut self, now: Instant) -> Result<WorkerTickOutcome, SyncError>` | `WorkerTickOutcome` | `SyncError` |
 | `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — |
 | `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (reusable scratch buffer lease for zero-lock streaming) |
+| `LocalSyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (clears reparse cache) |
+| `LocalSyncEngine::evict_verified_dir` | `(&self, dir: &Path)` | `()` | — (evicts dir and descendants from cache) |
 | `DirtyBlockRange::new` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (infallible zero-panic constructor) |
 | `DirtyBlockRange::new_nonzero` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (alias for `new`) |
 | `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` (if `block_size == 0`) |
@@ -214,7 +220,37 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | — (rejects `..`, ADS, drive letters, reserved names) |
  
 #### Behavioral Scenarios
- 
+
+[SECURITY] Archive prune root junction protection
+GIVEN an archive directory that is an NTFS junction or symlink
+WHEN `prune_archive` is called
+THEN `fs::symlink_metadata` inspects the root path before traversal
+AND `SyncError::Validation` is returned, refusing to prune arbitrary directories outside the destination tree
+
+[RECOVERY] Truncated destination file detection and repair
+GIVEN a destination file whose size does not match the source size (e.g. truncated or corrupted prior write)
+WHEN `sync_file_to_dest_core` executes
+THEN the size mismatch triggers re-synchronization rather than skipping
+AND the destination file is overwritten and repaired to match the source file
+
+[PERFORMANCE] Two-phase directory reparse verification
+GIVEN a directory path verification check via `LocalSyncEngine::verify_destination_cached`
+WHEN cache membership is verified
+THEN the mutex lock is released before querying remote filesystem metadata
+AND re-acquired only to record newly verified paths, preventing remote SMB lock contention
+
+[TESTABILITY] SyncWorkerRunner discrete tick processing
+GIVEN a `SyncWorkerRunner` state machine and an event queue
+WHEN `tick(now)` is called with synthetic timestamps
+THEN reachability, debounce expiry, file transfer, and retry backoff are processed deterministically without thread sleeps
+
+[RECOVERY] Directory reparse cache invalidation
+GIVEN a cached directory set in `LocalSyncEngine`
+WHEN `invalidate_verified_dirs` is called (upon reconnect or full scan)
+THEN all cached entries are cleared
+AND when `evict_verified_dir(dir)` is called (upon file deletion)
+THEN `dir` and all its descendants are purged from the cache
+
 [HAPPY] Single-pass streaming delta sync with contiguous block coalescing
 GIVEN a source file $\ge$ 10MB where blocks 2 and 3 were modified
 AND the destination file exists
@@ -329,7 +365,16 @@ THEN operations are executed against the active resolved UNC share path
 | Function | Signature | Returns | Errors |
 |----------|-----------|---------|--------|
 | `DirectoryWatcher::start` | `(source_path: impl AsRef<Path>, tx: Sender<SyncCommand>) -> Result<DirectoryWatcher, SyncError>` | `DirectoryWatcher` | `SyncError::Watcher` (failed to set up watcher) |
- 
+| `DirectoryWatcher::handle_watcher_result` | `(res: Result<Event, notify::Error>, source_root: &Path, tx: &Sender<SyncCommand>)` | `()` | — (dispatches events or recovery scan) |
+
+#### Behavioral Scenarios
+
+[RECOVERY] Watcher buffer overflow recovery full scan trigger
+GIVEN a directory watcher encountering an OS buffer overflow error (`notify::Error` from `ReadDirectoryChangesW`)
+WHEN `handle_watcher_result` processes the error
+THEN a warning is logged
+AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to guarantee eventually consistent state
+
 ---
 
 ### 7. Tray Module
@@ -410,7 +455,20 @@ THEN operations are executed against the active resolved UNC share path
 | `SyncError::Watcher` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Directory watcher errors |
 | `SyncError::Tray` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | GUI / Tray notification errors |
 | `SyncError::Registry` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Windows registry errors |
+| `SyncError::validation` | `(msg: impl Into<String>) -> Self` | Semantic validation error constructor |
+| `SyncError::validation_security` | `(msg: impl Into<String>) -> Self` | Security validation constructor (junctions, traversal) |
+| `SyncError::validation_invariant` | `(msg: impl Into<String>) -> Self` | Domain invariant constructor (debounce, intervals) |
+| `SyncError::is_permanent_validation_failure` | `(&self) -> bool` | Detects non-retryable fatal violations |
 | `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps 9 standard `ErrorKind` variants (TimedOut, ConnectionReset, ConnectionAborted, NotConnected, BrokenPipe, NetworkUnreachable, HostUnreachable, NetworkDown, ConnectionRefused) and 11 Win32 error codes (53, 59, 64, 65, 67, 121, 1326) |
+
+#### Behavioral Scenarios
+
+[ERROR] Permanent validation failure classification and queue eviction
+GIVEN a `SyncError` produced during sync worker execution
+WHEN `is_permanent_validation_failure` is evaluated
+THEN permanent security and invariant violations (path traversal, directory junctions, reserved DOS names) return `true`
+AND the item is evicted from the debounce retry queue without looping retries
+AND transient errors return `false`, preserving exponential backoff retries
 
 ---
  
@@ -466,6 +524,19 @@ Worker sub-component managing target destination health probes, alternate UNC re
 
 ### SyncWorkerState
 Worker execution state container tracking scratch buffer, failure counts, and archive pruning intervals.
+
+### SyncWorkerRunner
+Testable sync worker state machine orchestrating reachability, debouncing, and execution.
+- `context`: SyncWorkerContext<E>
+- `queue`: DebounceQueue
+- `reachability`: ReachabilityMonitor
+- `state`: SyncWorkerState
+- `drain_threshold`: usize
+
+### WorkerTickOutcome
+Discrete tick outcome for `SyncWorkerRunner`.
+- `Continue`: Continue processing events and commands.
+- `ShutdownRequested`: Worker should terminate cleanly.
 
 ### StoreConfig
 Minimal configuration parameters required by `SqliteHashStore`.
@@ -603,12 +674,12 @@ User interface tray-icon utilizing `tray-icon` and `winit` with `TrayController`
 Integrates `StartupRegistry` under HKCU for automatic daemon launch on user login.
 
 ### 6. Automated Testing Frameworks
-279 automated test cases verifying engine behavior:
-- Unit test suite across all modules (228 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`).
+289 automated test cases verifying engine behavior:
+- Unit test suite across all modules (235 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`).
 - Integration test suite (`tests/integration_tests.rs`: 12 tests).
 - Generative property test suite (`tests/property_tests.rs`: 8 proptest suites verifying `is_metadata_up_to_date_raw` and `DirtyBlockRange` chunk coalescing).
 - Snapshot regression test suite (`tests/snapshot_tests.rs`: 20 insta golden snapshots).
-- Documentation tests (`cargo test --doc`: 8 doctests).
+- Documentation tests (`cargo test --doc`: 11 doctests).
 
 ### 7. Development & Release Automation Scripts (`scripts/`)
 - `scripts/check-quality.ps1`: Code quality pipeline executing formatting, linter, tests, and static analysis.
