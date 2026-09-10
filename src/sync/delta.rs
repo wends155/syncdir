@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU64;
 use std::time::SystemTime;
 
 use crate::config::VerificationMode;
@@ -15,7 +16,7 @@ use super::engine::{
 pub struct DirtyBlockRange {
     start_block: u64,
     block_count: u64,
-    block_size: u64,
+    block_size: NonZeroU64,
     data: Vec<u8>,
 }
 
@@ -24,13 +25,29 @@ impl DirtyBlockRange {
     pub const MAX_COALESCE_BYTES: usize = 16 * 1024 * 1024;
 
     /// Create an empty dirty block range with pinned block size.
+    ///
+    /// # Panics
+    /// Panics if `block_size` is 0. For fallible creation, use [`try_new`](Self::try_new).
     pub fn new(block_size: u64) -> Self {
+        Self::try_new(block_size).expect("block_size must be greater than zero")
+    }
+
+    /// Create an empty dirty block range from a validated non-zero block size.
+    pub fn new_nonzero(block_size: NonZeroU64) -> Self {
         Self {
             start_block: 0,
             block_count: 0,
             block_size,
             data: Vec::new(),
         }
+    }
+
+    /// Create an empty dirty block range, returning `SyncError::Validation` if `block_size` is 0.
+    pub fn try_new(block_size: u64) -> Result<Self, SyncError> {
+        let non_zero = NonZeroU64::new(block_size).ok_or_else(|| {
+            SyncError::validation("DirtyBlockRange block_size must be greater than zero")
+        })?;
+        Ok(Self::new_nonzero(non_zero))
     }
 
     /// Return the starting block index of this contiguous range.
@@ -54,6 +71,12 @@ impl DirtyBlockRange {
     /// Return the pinned block size in bytes for this range.
     #[must_use]
     pub fn block_size(&self) -> u64 {
+        self.block_size.get()
+    }
+
+    /// Return the pinned block size as a `NonZeroU64`.
+    #[must_use]
+    pub fn block_size_nonzero(&self) -> NonZeroU64 {
         self.block_size
     }
 
@@ -103,7 +126,7 @@ impl DirtyBlockRange {
     /// Flush all buffered dirty blocks to the underlying writer stream at the coalesced offset.
     pub fn flush<W: Write + Seek>(&mut self, writer: &mut W) -> Result<(), SyncError> {
         if self.block_count > 0 {
-            let offset = self.start_block * self.block_size;
+            let offset = self.start_block * self.block_size.get();
             if let Err(e) = writer.seek(SeekFrom::Start(offset)) {
                 self.reset();
                 return Err(SyncError::Io(e));
@@ -123,6 +146,20 @@ impl DirtyBlockRange {
         self.start_block = 0;
         self.block_count = 0;
         self.data.clear();
+    }
+}
+
+impl TryFrom<u64> for DirtyBlockRange {
+    type Error = SyncError;
+
+    fn try_from(val: u64) -> Result<Self, Self::Error> {
+        Self::try_new(val)
+    }
+}
+
+impl Default for DirtyBlockRange {
+    fn default() -> Self {
+        Self::new(64 * 1024)
     }
 }
 
@@ -432,6 +469,27 @@ mod tests {
         assert!(range.is_empty());
         assert_eq!(range.byte_len(), 0);
         assert_eq!(range.data(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_dirty_block_range_rejects_zero() {
+        assert!(matches!(
+            DirtyBlockRange::try_new(0),
+            Err(SyncError::Validation(msg)) if msg.contains("greater than zero")
+        ));
+        assert!(DirtyBlockRange::try_new(65536).is_ok());
+
+        assert!(matches!(
+            DirtyBlockRange::try_from(0),
+            Err(SyncError::Validation(_))
+        ));
+        assert!(DirtyBlockRange::try_from(65536).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "block_size must be greater than zero")]
+    fn test_dirty_block_range_new_panics_on_zero() {
+        let _ = DirtyBlockRange::new(0);
     }
 
     #[test]
