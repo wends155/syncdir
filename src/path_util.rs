@@ -142,6 +142,67 @@ pub fn collapse_components(path: &Path) -> Vec<Component<'_>> {
     out
 }
 
+/// Check if `target` is the same directory as `base` or a nested descendant of `base`.
+///
+/// Uses Windows case-insensitive component comparison with lexical component collapsing.
+#[must_use]
+pub fn is_same_or_descendant(base: &Path, target: &Path) -> bool {
+    let base_comps = collapse_components(base);
+    let target_comps = collapse_components(target);
+    if target_comps.len() < base_comps.len() {
+        return false;
+    }
+    base_comps.iter().zip(target_comps.iter()).all(|(b, t)| {
+        b.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&t.as_os_str().to_string_lossy())
+    })
+}
+
+/// Returns the Windows system root directory (e.g. `C:\Windows`).
+/// Reads `%SystemRoot%`, then `%windir%`, defaulting to `C:\Windows`.
+#[must_use]
+pub fn system_root() -> PathBuf {
+    std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("windir"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+}
+
+/// Launches the system file explorer targeting the specified path.
+///
+/// Returns `Err(std::io::Error)` with `ErrorKind::NotFound` if the path does not exist
+/// or if explorer is not found.
+pub fn open_path(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Path does not exist: {}", path.display()),
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let explorer = system_root().join("explorer.exe");
+        if !explorer.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Explorer executable not found at {}", explorer.display()),
+            ));
+        }
+        std::process::Command::new(explorer).arg(path).spawn()?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(opener).arg(path).spawn()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +267,27 @@ mod tests {
         let comps = collapse_components(Path::new(r"C:\..\a"));
         let p: PathBuf = comps.iter().collect();
         assert_eq!(p, PathBuf::from(r"C:\..\a"));
+    }
+
+    #[test]
+    fn test_path_util_hierarchies_and_system_root() {
+        assert!(is_same_or_descendant(
+            Path::new(r"C:\Users\Documents"),
+            Path::new(r"C:\Users\Documents\Sub")
+        ));
+        assert!(is_same_or_descendant(
+            Path::new(r"C:\Users\Documents"),
+            Path::new(r"c:\users\documents")
+        ));
+        assert!(!is_same_or_descendant(
+            Path::new(r"C:\Users\Documents"),
+            Path::new(r"C:\Users\Other")
+        ));
+
+        let sys_root = system_root();
+        assert!(!sys_root.as_os_str().is_empty());
+
+        let res = open_path(Path::new(r"C:\NonExistent_syncdir_dummy_path_12345"));
+        assert!(res.is_err());
     }
 }
