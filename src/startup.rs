@@ -133,6 +133,7 @@ pub trait RegistryBackend {
 #[derive(Debug, Default, Clone)]
 pub struct MockStartupRegistry {
     registered: std::sync::Arc<std::sync::Mutex<bool>>,
+    injected_error: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>>,
 }
 
 impl MockStartupRegistry {
@@ -140,12 +141,30 @@ impl MockStartupRegistry {
     pub fn new(initial: bool) -> Self {
         Self {
             registered: std::sync::Arc::new(std::sync::Mutex::new(initial)),
+            injected_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Injects an error to simulate registry failures (e.g. AccessDenied).
+    pub fn set_injected_error(&self, error: Option<std::io::Error>) {
+        if let Ok(mut err) = self.injected_error.lock() {
+            *err = error;
         }
     }
 }
 
 impl RegistryBackend for MockStartupRegistry {
     fn is_registered(&self) -> Result<bool, SyncError> {
+        let err_guard = self
+            .injected_error
+            .lock()
+            .map_err(|_| SyncError::lock_poison("Mock registry lock poisoned"))?;
+        if let Some(ref e) = *err_guard {
+            return Err(SyncError::registry_with_source(
+                "Injected registry error",
+                std::io::Error::new(e.kind(), e.to_string()),
+            ));
+        }
         let val = self
             .registered
             .lock()
@@ -154,6 +173,16 @@ impl RegistryBackend for MockStartupRegistry {
     }
 
     fn register(&self) -> Result<(), SyncError> {
+        let err_guard = self
+            .injected_error
+            .lock()
+            .map_err(|_| SyncError::lock_poison("Mock registry lock poisoned"))?;
+        if let Some(ref e) = *err_guard {
+            return Err(SyncError::registry_with_source(
+                "Injected registry error",
+                std::io::Error::new(e.kind(), e.to_string()),
+            ));
+        }
         let mut val = self
             .registered
             .lock()
@@ -163,6 +192,16 @@ impl RegistryBackend for MockStartupRegistry {
     }
 
     fn unregister(&self) -> Result<(), SyncError> {
+        let err_guard = self
+            .injected_error
+            .lock()
+            .map_err(|_| SyncError::lock_poison("Mock registry lock poisoned"))?;
+        if let Some(ref e) = *err_guard {
+            return Err(SyncError::registry_with_source(
+                "Injected registry error",
+                std::io::Error::new(e.kind(), e.to_string()),
+            ));
+        }
         let mut val = self
             .registered
             .lock()
@@ -228,5 +267,24 @@ mod tests {
 
         mock.unregister().unwrap();
         assert!(!mock.is_registered().unwrap());
+    }
+
+    #[test]
+    fn test_mock_startup_registry_error_injection() {
+        let mock = MockStartupRegistry::new(false);
+        assert!(!mock.is_registered().unwrap());
+
+        mock.set_injected_error(Some(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access is denied",
+        )));
+
+        assert!(mock.is_registered().is_err());
+        assert!(mock.register().is_err());
+        assert!(mock.unregister().is_err());
+
+        mock.set_injected_error(None);
+        assert!(mock.register().is_ok());
+        assert!(mock.is_registered().unwrap());
     }
 }

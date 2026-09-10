@@ -10,6 +10,8 @@ type SyncHandler = std::sync::Arc<dyn Fn(&Path) -> Result<(), SyncError> + Send 
 pub struct MockSyncEngine {
     synced_calls: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
     deleted_calls: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
+    failed_calls: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, String)>>>,
+    prune_calls: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
     full_scans: std::sync::Arc<std::sync::Mutex<usize>>,
     sync_error_fn: std::sync::Arc<std::sync::Mutex<Option<SyncErrorFactory>>>,
     sync_handler: std::sync::Arc<std::sync::Mutex<Option<SyncHandler>>>,
@@ -22,6 +24,8 @@ impl std::fmt::Debug for MockSyncEngine {
         f.debug_struct("MockSyncEngine")
             .field("synced_calls", &self.synced_calls)
             .field("deleted_calls", &self.deleted_calls)
+            .field("failed_calls", &self.failed_calls)
+            .field("prune_calls", &self.prune_calls)
             .field("full_scans", &self.full_scans)
             .field("scan_outcome", &self.scan_outcome)
             .finish()
@@ -92,6 +96,21 @@ impl MockSyncEngine {
         self.deleted_calls.lock().unwrap().clone()
     }
 
+    /// Return recorded failed calls with path and error description.
+    pub fn failed_calls(&self) -> Vec<(PathBuf, String)> {
+        self.failed_calls.lock().unwrap().clone()
+    }
+
+    /// Return recorded `prune_archive` destination directories.
+    pub fn prune_archive_calls(&self) -> Vec<PathBuf> {
+        self.prune_calls.lock().unwrap().clone()
+    }
+
+    /// Return recorded `prune_archive` destination directories (alias).
+    pub fn prune_calls(&self) -> Vec<PathBuf> {
+        self.prune_archive_calls()
+    }
+
     /// Return count of `run_full_scan` calls.
     pub fn full_scans_count(&self) -> usize {
         *self.full_scans.lock().unwrap()
@@ -113,20 +132,35 @@ impl SyncEngine for MockSyncEngine {
         dest_dir: &Path,
         _scratch: &mut [u8],
     ) -> Result<(), SyncError> {
-        let handler = self.sync_handler.lock().unwrap().clone();
-        if let Some(h) = handler {
-            h(path)?;
-        } else {
-            let err_fn = self.sync_error_fn.lock().unwrap().clone();
-            if let Some(f) = err_fn {
-                return Err(f());
+        let res: Result<(), SyncError> = (|| {
+            let handler = self.sync_handler.lock().unwrap().clone();
+            if let Some(h) = handler {
+                h(path)?;
+            } else {
+                let err_fn = self.sync_error_fn.lock().unwrap().clone();
+                if let Some(f) = err_fn {
+                    return Err(f());
+                }
+            }
+            Ok(())
+        })();
+
+        match res {
+            Ok(()) => {
+                self.synced_calls
+                    .lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), dest_dir.to_path_buf()));
+                Ok(())
+            }
+            Err(e) => {
+                self.failed_calls
+                    .lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), e.to_string()));
+                Err(e)
             }
         }
-        self.synced_calls
-            .lock()
-            .unwrap()
-            .push((path.to_path_buf(), dest_dir.to_path_buf()));
-        Ok(())
     }
 
     fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
@@ -134,23 +168,46 @@ impl SyncEngine for MockSyncEngine {
     }
 
     fn delete_file_from_dest(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
-        let handler = self.delete_handler.lock().unwrap().clone();
-        if let Some(h) = handler {
-            h(path)?;
-        } else {
-            let err_fn = self.sync_error_fn.lock().unwrap().clone();
-            if let Some(f) = err_fn {
-                return Err(f());
+        let res: Result<(), SyncError> = (|| {
+            let handler = self.delete_handler.lock().unwrap().clone();
+            if let Some(h) = handler {
+                h(path)?;
+            } else {
+                let err_fn = self.sync_error_fn.lock().unwrap().clone();
+                if let Some(f) = err_fn {
+                    return Err(f());
+                }
+            }
+            Ok(())
+        })();
+
+        match res {
+            Ok(()) => {
+                self.deleted_calls
+                    .lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), dest_dir.to_path_buf()));
+                Ok(())
+            }
+            Err(e) => {
+                self.failed_calls
+                    .lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), e.to_string()));
+                Err(e)
             }
         }
-        self.deleted_calls
-            .lock()
-            .unwrap()
-            .push((path.to_path_buf(), dest_dir.to_path_buf()));
-        Ok(())
     }
 
-    fn prune_archive(&self, _dest_dir: &Path) -> Result<(), SyncError> {
+    fn prune_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
+        let err_fn = self.sync_error_fn.lock().unwrap().clone();
+        if let Some(f) = err_fn {
+            return Err(f());
+        }
+        self.prune_calls
+            .lock()
+            .unwrap()
+            .push(dest_dir.to_path_buf());
         Ok(())
     }
 
@@ -209,6 +266,19 @@ mod tests {
                 .is_err()
         );
         assert!(mock.delete_file_from_dest(p2, d2).is_err());
+        assert_eq!(
+            mock.failed_calls(),
+            vec![
+                (
+                    p1.to_path_buf(),
+                    "Validation error: simulated failure".to_string()
+                ),
+                (
+                    p2.to_path_buf(),
+                    "Validation error: simulated failure".to_string()
+                ),
+            ]
+        );
 
         mock.clear_sync_error();
         assert!(
@@ -220,5 +290,9 @@ mod tests {
         let outcome = mock.run_full_scan(d1).unwrap();
         assert_eq!(outcome, ScanOutcome::Success { synced: 0 });
         assert_eq!(mock.full_scans_count(), 1);
+
+        assert!(mock.prune_archive(d1).is_ok());
+        assert_eq!(mock.prune_archive_calls(), vec![d1.to_path_buf()]);
+        assert_eq!(mock.prune_calls(), vec![d1.to_path_buf()]);
     }
 }

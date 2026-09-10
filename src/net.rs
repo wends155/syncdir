@@ -20,6 +20,13 @@ pub trait NetworkResolver: Send + Sync {
     /// # Errors
     /// Returns `SyncError` if the share is invalid or connection fails.
     fn establish_smb_connection(&self, unc_path: &Path) -> Result<(), SyncError>;
+
+    /// Probes whether the destination root path is currently accessible.
+    ///
+    /// Default implementation checks if `path` exists and is a directory.
+    fn is_destination_accessible(&self, path: &Path) -> bool {
+        std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    }
 }
 
 /// Default Win32 production network resolver using OS APIs.
@@ -40,11 +47,25 @@ impl NetworkResolver for Win32NetworkResolver {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MockNetworkInner {
     alternate_paths: std::collections::HashMap<PathBuf, PathBuf>,
     recorded_calls: Vec<PathBuf>,
     smb_failures: std::collections::HashMap<PathBuf, String>,
+    destination_accessible: bool,
+    offline_error: bool,
+}
+
+impl Default for MockNetworkInner {
+    fn default() -> Self {
+        Self {
+            alternate_paths: std::collections::HashMap::new(),
+            recorded_calls: Vec::new(),
+            smb_failures: std::collections::HashMap::new(),
+            destination_accessible: true,
+            offline_error: false,
+        }
+    }
 }
 
 /// In-memory mock network resolver for testing without network dependencies.
@@ -63,6 +84,18 @@ impl MockNetworkResolver {
     pub fn set_alternate_path(&self, from: impl Into<PathBuf>, to: impl Into<PathBuf>) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.alternate_paths.insert(from.into(), to.into());
+    }
+
+    /// Configure whether the destination is accessible.
+    pub fn set_destination_accessible(&self, accessible: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.destination_accessible = accessible;
+    }
+
+    /// Configure whether SMB operations fail with Win32 network offline error code 53.
+    pub fn set_offline_error(&self, is_offline: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.offline_error = is_offline;
     }
 
     /// Configure an SMB connection failure for `unc`.
@@ -97,9 +130,19 @@ impl NetworkResolver for MockNetworkResolver {
         self.try_resolve_alternate_path(path)
     }
 
+    fn is_destination_accessible(&self, _path: &Path) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|l| l.into_inner())
+            .destination_accessible
+    }
+
     fn establish_smb_connection(&self, unc_path: &Path) -> Result<(), SyncError> {
         let p = unc_path.to_path_buf();
         let inner = self.inner.lock().unwrap_or_else(|l| l.into_inner());
+        if inner.offline_error {
+            return Err(SyncError::Io(std::io::Error::from_raw_os_error(53)));
+        }
         if let Some(err_msg) = inner.smb_failures.get(&p) {
             Err(SyncError::validation(err_msg.clone()))
         } else {
@@ -520,5 +563,36 @@ mod tests {
                 .establish_smb_connection(Path::new(r"\\online\share"))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_mock_network_resolver_reachability_and_offline_codes() {
+        let resolver = MockNetworkResolver::new();
+        // Reachability is true by default
+        assert!(resolver.is_destination_accessible(Path::new(r"C:\test")));
+
+        // Reachability can be set to false
+        resolver.set_destination_accessible(false);
+        assert!(!resolver.is_destination_accessible(Path::new(r"C:\test")));
+
+        // Offline error can be toggled
+        assert!(
+            resolver
+                .establish_smb_connection(Path::new(r"\\server\share"))
+                .is_ok()
+        );
+        resolver.set_offline_error(true);
+        let err = resolver
+            .establish_smb_connection(Path::new(r"\\server\share"))
+            .unwrap_err();
+        assert!(err.is_network_offline());
+        match err {
+            SyncError::Io(io_err) => assert_eq!(io_err.raw_os_error(), Some(53)),
+            other => panic!("Expected SyncError::Io, got {:?}", other),
+        }
+
+        // Win32 resolver default implementation test
+        let win32 = Win32NetworkResolver;
+        assert!(!win32.is_destination_accessible(Path::new(r"C:\non_existent_folder_xyz_98765")));
     }
 }
