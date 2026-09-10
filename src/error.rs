@@ -9,6 +9,41 @@ fn format_block_detail(block_index: &Option<u64>) -> String {
     }
 }
 
+/// Categorization of validation errors for recovery and failure classification.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValidationKind {
+    /// Security violation (e.g. unsafe traversal, directory traversal).
+    Security,
+    /// Path traversal attempt.
+    PathTraversal,
+    /// Reparse point or directory junction violation.
+    ReparsePoint,
+    /// Filename contains reserved Windows DOS device name.
+    ReservedDeviceName,
+    /// Recursive sync loop (destination inside source or source inside destination).
+    RecursiveLoop,
+    /// Domain invariant violation (e.g. invalid parameter, zero debounce).
+    Invariant,
+    /// Transient validation error (e.g. temporary lock conflict).
+    Transient,
+}
+
+impl ValidationKind {
+    /// Returns `true` if the validation error is permanent and should not be retried.
+    #[must_use]
+    pub const fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::Security
+                | Self::PathTraversal
+                | Self::ReparsePoint
+                | Self::ReservedDeviceName
+                | Self::RecursiveLoop
+        )
+    }
+}
+
 /// All fallible operations in syncdir return this error type.
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -31,9 +66,14 @@ pub enum SyncError {
         #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
     ),
 
-    /// Runtime validation failure (e.g. missing directories).
-    #[error("Validation error: {0}")]
-    Validation(String),
+    /// Runtime validation failure (e.g. missing directories, invariant violations).
+    #[error("Validation error: {message}")]
+    Validation {
+        /// Classification of validation failure.
+        kind: ValidationKind,
+        /// Explanatory failure message.
+        message: String,
+    },
 
     /// Write verification failed for a path (data mismatch).
     #[error("Write verification failed for: {path}{}", format_block_detail(.block_index))]
@@ -154,9 +194,20 @@ impl SyncError {
         SyncError::Config(msg.into(), Some(Box::new(source)))
     }
 
-    /// Create a `SyncError::Validation` error.
+    /// Create a `SyncError::Validation` error with default Invariant classification.
     pub fn validation(msg: impl Into<String>) -> Self {
-        SyncError::Validation(msg.into())
+        SyncError::Validation {
+            kind: ValidationKind::Invariant,
+            message: msg.into(),
+        }
+    }
+
+    /// Create a `SyncError::Validation` error with explicit classification kind.
+    pub fn validation_kind(kind: ValidationKind, msg: impl Into<String>) -> Self {
+        SyncError::Validation {
+            kind,
+            message: msg.into(),
+        }
     }
 
     /// Create a `SyncError::Validation` error for security violations.
@@ -181,7 +232,18 @@ impl SyncError {
     /// assert!(err.is_permanent_validation_failure());
     /// ```
     pub fn validation_security(msg: impl Into<String>) -> Self {
-        SyncError::Validation(msg.into())
+        SyncError::Validation {
+            kind: ValidationKind::Security,
+            message: msg.into(),
+        }
+    }
+
+    /// Create a `SyncError::Validation` error for reparse point or junction violations.
+    pub fn validation_reparse(msg: impl Into<String>) -> Self {
+        SyncError::Validation {
+            kind: ValidationKind::ReparsePoint,
+            message: msg.into(),
+        }
     }
 
     /// Create a `SyncError::Validation` error for domain invariant violations.
@@ -206,7 +268,18 @@ impl SyncError {
     /// assert_eq!(err.to_string(), "Validation error: Debounce seconds must be greater than zero");
     /// ```
     pub fn validation_invariant(msg: impl Into<String>) -> Self {
-        SyncError::Validation(msg.into())
+        SyncError::Validation {
+            kind: ValidationKind::Invariant,
+            message: msg.into(),
+        }
+    }
+
+    /// Create a `SyncError::Validation` error for recursive sync loop violations.
+    pub fn validation_loop(msg: impl Into<String>) -> Self {
+        SyncError::Validation {
+            kind: ValidationKind::RecursiveLoop,
+            message: msg.into(),
+        }
     }
 
     /// Check if this error is a permanent validation failure that should not be retried.
@@ -227,22 +300,13 @@ impl SyncError {
     /// let perm = SyncError::validation_security("Destination component is a symlink or reparse point");
     /// assert!(perm.is_permanent_validation_failure());
     ///
-    /// let transient = SyncError::Validation("Temporary lock delay".into());
+    /// let transient = SyncError::validation("Temporary lock delay");
     /// assert!(!transient.is_permanent_validation_failure());
     /// ```
     #[must_use]
     pub fn is_permanent_validation_failure(&self) -> bool {
         match self {
-            Self::Validation(msg) => {
-                let lower = msg.to_ascii_lowercase();
-                lower.contains("traversal")
-                    || lower.contains("reserved")
-                    || lower.contains("reparse point")
-                    || lower.contains("junction")
-                    || lower.contains("invalid encoding")
-                    || lower.contains("refusing to write")
-                    || lower.contains("refusing to prune")
-            }
+            Self::Validation { kind, .. } => kind.is_permanent(),
             _ => false,
         }
     }
@@ -395,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_is_network_offline_false_for_non_io() {
-        let err = SyncError::Validation("some error".to_string());
+        let err = SyncError::validation("some error");
         assert!(!err.is_network_offline());
     }
 
@@ -613,7 +677,36 @@ mod tests {
         ));
         assert!(!transient.is_permanent_validation_failure());
 
-        let transient_val = SyncError::Validation("Temporary lock acquisition delay".into());
+        let transient_val = SyncError::validation_kind(
+            ValidationKind::Transient,
+            "Temporary lock acquisition delay",
+        );
         assert!(!transient_val.is_permanent_validation_failure());
+    }
+
+    #[test]
+    fn test_validation_kind_permanent_classification() {
+        use super::ValidationKind;
+
+        assert!(ValidationKind::Security.is_permanent());
+        assert!(ValidationKind::PathTraversal.is_permanent());
+        assert!(ValidationKind::ReparsePoint.is_permanent());
+        assert!(ValidationKind::ReservedDeviceName.is_permanent());
+        assert!(ValidationKind::RecursiveLoop.is_permanent());
+        assert!(!ValidationKind::Invariant.is_permanent());
+        assert!(!ValidationKind::Transient.is_permanent());
+    }
+
+    #[test]
+    fn test_validation_kind_sync_error_integration() {
+        use super::ValidationKind;
+
+        let err_sec = SyncError::validation_kind(ValidationKind::Security, "auth violation");
+        assert!(err_sec.is_permanent_validation_failure());
+        assert_eq!(err_sec.to_string(), "Validation error: auth violation");
+
+        let err_inv = SyncError::validation_invariant("invariant violation");
+        assert!(!err_inv.is_permanent_validation_failure());
+        assert_eq!(err_inv.to_string(), "Validation error: invariant violation");
     }
 }

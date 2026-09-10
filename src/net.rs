@@ -303,8 +303,8 @@ pub fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncEr
             unc_path.display()
         )));
     }
-    Err(SyncError::Validation(
-        "SMB connection is only supported on Windows".into(),
+    Err(SyncError::validation(
+        "SMB connection is only supported on Windows",
     ))
 }
 

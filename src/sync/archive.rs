@@ -741,7 +741,7 @@ mod tests {
         );
         let err = res.unwrap_err();
         assert!(
-            matches!(err, SyncError::Validation(_)),
+            matches!(err, SyncError::Validation { .. }),
             "Expected Validation error, got {:?}",
             err
         );

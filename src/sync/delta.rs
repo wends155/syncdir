@@ -499,13 +499,13 @@ mod tests {
     fn test_dirty_block_range_rejects_zero() {
         assert!(matches!(
             DirtyBlockRange::try_new(0),
-            Err(SyncError::Validation(msg)) if msg.contains("greater than zero")
+            Err(SyncError::Validation { ref message, .. }) if message.contains("greater than zero")
         ));
         assert!(DirtyBlockRange::try_new(65536).is_ok());
 
         assert!(matches!(
             DirtyBlockRange::try_from(0),
-            Err(SyncError::Validation(_))
+            Err(SyncError::Validation { .. })
         ));
         assert!(DirtyBlockRange::try_from(65536).is_ok());
     }

@@ -418,7 +418,7 @@ impl TargetDir {
                 TargetRole::Source => "C:\\, R:\\",
                 TargetRole::Destination => "C:\\, X:\\",
             };
-            return Err(SyncError::Validation(format!(
+            return Err(SyncError::validation_security(format!(
                 "Invalid {role} path '{s}': must start with a drive letter (e.g. {example_drive}) or UNC network prefix (e.g. \\\\server\\share)"
             )));
         }
@@ -1023,15 +1023,12 @@ impl Config {
                 "Source directory does not exist at validation, starting in degraded mode"
             );
         } else if !self.source_dir.is_dir() {
-            return Err(SyncError::Validation(
-                "Source path is not a directory".into(),
-            ));
+            return Err(SyncError::validation("Source path is not a directory"));
         }
 
         if self.destinations.is_empty() {
-            return Err(SyncError::Validation(
-                "At least one destination directory must be specified (via dest_dir or dest_dirs)"
-                    .into(),
+            return Err(SyncError::validation(
+                "At least one destination directory must be specified (via dest_dir or dest_dirs)",
             ));
         }
 
@@ -1040,7 +1037,7 @@ impl Config {
             if is_same_or_descendant(self.source_dir.as_path(), dest.as_path())
                 || is_same_or_descendant(dest.as_path(), self.source_dir.as_path())
             {
-                return Err(SyncError::Validation(format!(
+                return Err(SyncError::validation_loop(format!(
                     "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
                     dest.display(),
                     self.source_dir.display()
@@ -1055,7 +1052,7 @@ impl Config {
                 if is_same_or_descendant(dests[i], dests[j])
                     || is_same_or_descendant(dests[j], dests[i])
                 {
-                    return Err(SyncError::Validation(format!(
+                    return Err(SyncError::validation_loop(format!(
                         "Destination directories '{}' and '{}' are identical or nested within each other",
                         dests[i].display(),
                         dests[j].display()
@@ -1065,34 +1062,33 @@ impl Config {
         }
 
         if self.debounce_seconds == 0 {
-            return Err(SyncError::Validation(
-                "Debounce seconds must be greater than zero".into(),
+            return Err(SyncError::validation_invariant(
+                "Debounce seconds must be greater than zero",
             ));
         }
         if self.retry_interval_seconds == 0 {
-            return Err(SyncError::Validation(
-                "Retry interval seconds must be greater than zero".into(),
+            return Err(SyncError::validation_invariant(
+                "Retry interval seconds must be greater than zero",
             ));
         }
         if self.block_size_bytes == 0 {
-            return Err(SyncError::Validation(
-                "block_size_bytes must be greater than zero".into(),
+            return Err(SyncError::validation_invariant(
+                "block_size_bytes must be greater than zero",
             ));
         }
         if self.block_size_bytes > 64 * 1024 * 1024 {
-            return Err(SyncError::Validation(
-                "block_size_bytes must not exceed 64MB".into(),
+            return Err(SyncError::validation_invariant(
+                "block_size_bytes must not exceed 64MB",
             ));
         }
         if self.block_sync_threshold_bytes == 0 {
-            return Err(SyncError::Validation(
-                "block_sync_threshold_bytes must be greater than zero".into(),
+            return Err(SyncError::validation_invariant(
+                "block_sync_threshold_bytes must be greater than zero",
             ));
         }
         if self.block_sync_threshold_bytes < self.block_size_bytes {
-            return Err(SyncError::Validation(
-                "block_sync_threshold_bytes must be greater than or equal to block_size_bytes"
-                    .into(),
+            return Err(SyncError::validation_invariant(
+                "block_sync_threshold_bytes must be greater than or equal to block_size_bytes",
             ));
         }
         Ok(())
@@ -1708,7 +1704,7 @@ mod tests {
 
         let err = config.validate().unwrap_err();
         assert!(
-            matches!(err, SyncError::Validation(ref msg) if msg.contains("Invalid source path"))
+            matches!(err, SyncError::Validation { ref message, .. } if message.contains("Invalid source path"))
         );
     }
 

@@ -797,7 +797,7 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                             obs.on_write_verification_failed(&path);
                         }
                     }
-                    Err(SyncError::Validation(msg)) => {
+                    Err(SyncError::Validation { ref message, .. }) => {
                         let attempts = self.state.record_failure(&path);
                         if attempts <= 10 {
                             let backoff = calculate_exponential_backoff(attempts, retry_dur);
@@ -805,14 +805,14 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                                 path = %path.display(),
                                 attempt = attempts,
                                 ?backoff,
-                                error = %msg,
+                                error = %message,
                                 "Validation failure; rescheduling retry"
                             );
                             self.queue.requeue_sync_retry(path, backoff);
                         } else {
                             tracing::error!(
                                 path = %path.display(),
-                                error = %msg,
+                                error = %message,
                                 "Validation permanently failed after 10 retries"
                             );
                             self.state.reset_failure(&path);
@@ -905,7 +905,7 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                             );
                             self.state.reset_failure(&path);
                         }
-                        Err(SyncError::Validation(msg)) => {
+                        Err(SyncError::Validation { ref message, .. }) => {
                             let attempts = self.state.record_failure(&path);
                             if attempts <= 10 {
                                 let backoff = calculate_exponential_backoff(attempts, retry_dur);
@@ -913,14 +913,14 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                                     path = %path.display(),
                                     attempt = attempts,
                                     ?backoff,
-                                    error = %msg,
+                                    error = %message,
                                     "Validation error on deletion; rescheduling retry"
                                 );
                                 self.queue.requeue_delete_retry(path, backoff);
                             } else {
                                 tracing::error!(
                                     path = %path.display(),
-                                    error = %msg,
+                                    error = %message,
                                     "Deletion permanently failed after 10 retries"
                                 );
                                 self.state.reset_failure(&path);
@@ -1744,7 +1744,7 @@ mod tests {
         let mut runner = SyncWorkerRunner::new(ctx);
 
         // Configure mock engine to return a transient validation error
-        engine.set_sync_error(|| SyncError::Validation("temporary lock conflict".to_string()));
+        engine.set_sync_error(|| SyncError::validation("temporary lock conflict"));
 
         runner.handle_command(SyncCommand::FileModified(PathBuf::from("transient.txt")));
         let t0 = Instant::now() + Duration::from_millis(50);

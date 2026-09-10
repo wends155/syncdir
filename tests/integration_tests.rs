@@ -244,14 +244,14 @@ fn test_path_traversal_prevention() {
     let res1 = engine.sync_file(std::path::Path::new("/etc/passwd"));
     assert!(matches!(
         res1,
-        Err(syncdir::error::SyncError::Validation(_))
+        Err(syncdir::error::SyncError::Validation { .. })
     ));
 
     // Traversal path
     let res2 = engine.sync_file(std::path::Path::new("../test.txt"));
     assert!(matches!(
         res2,
-        Err(syncdir::error::SyncError::Validation(_))
+        Err(syncdir::error::SyncError::Validation { .. })
     ));
 }
 

@@ -137,7 +137,7 @@ fn test_sync_error_display_config() {
 
 #[test]
 fn test_sync_error_display_validation() {
-    let err = SyncError::Validation("source directory does not exist".to_string());
+    let err = SyncError::validation("source directory does not exist");
     assert_snapshot!(err.to_string());
 }
 
