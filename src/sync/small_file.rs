@@ -365,13 +365,8 @@ mod tests {
         std::fs::create_dir_all(&dst).unwrap();
         let config = Config::test_default(src.clone(), dst.clone());
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let engine = LocalSyncEngine::new(
-            MockHashStore::new(),
-            TargetSyncConfig {
-                verify_writes: true,
-                ..target_cfg
-            },
-        );
+        let engine =
+            LocalSyncEngine::new(MockHashStore::new(), target_cfg.with_verify_writes(true));
         std::fs::write(src.join("small.txt"), b"payload").unwrap();
         let mut scratch = vec![0u8; 4096];
         assert!(

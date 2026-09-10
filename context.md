@@ -568,3 +568,29 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Prohibited `daemon -> tray` architectural dependency eliminated.
 >   - Public exposure of `winit` event types and proxies eliminated.
 >   - Dead `startup` imports in `daemon.rs` eliminated.
+
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Bucket 3: Config Subsystem Decomposition (`review_report.md` Findings 5, 8, 10, 14)
+> * **Changes:**
+>   - **Submodule Extraction & Hierarchy (O1, O2, O3, O4, O5, O6)**: Decomposed the 2,257-line monolithic `src/config.rs` into an acyclic module tree under `src/config/`:
+>     - `src/config/mod.rs` (560 lines): Central facade, public re-exports, `from_raw_parts` factory methods, Serde DTO conversion bridges (`From<RawConfig>`, `Into<RawConfig>`), and `StoreConfig` `TryFrom` conversions.
+>     - `src/config/target.rs`: `VerificationMode`, `TargetRole` (`pub(crate)`), `TargetDir` (self-normalizing path invariant with private `inner: PathBuf`), and `DestinationCollection` (case-insensitive deduplication).
+>     - `src/config/validation.rs`: TOML preprocessing (`preprocess_config_toml`, `escape_backslashes_in_quotes`) and numeric bound constants (`MAX_BLOCK_SIZE_BYTES`, `DEFAULT_DEBOUNCE_SECONDS`, `DEFAULT_RETRY_INTERVAL_SECONDS`).
+>     - `src/config/raw.rs`: `RawConfig` DTO with `pub(crate)` fields for TOML deserialization/serialization.
+>     - `src/config/builder.rs`: `ConfigBuilder` and `TargetSyncConfigBuilder` using `from_raw_parts`, with infallible builder semantics and validation deferred to `validate()` or `build()`.
+>     - `src/config/tests.rs`: Ported all 48 comprehensive unit tests using explicit item-level imports, plus 2 new tests validating `StoreConfig` conversions.
+>   - **Strict Field Encapsulation**: Tightened all 9 fields of `TargetSyncConfig` (`source_dir`, `dest_dir`, `debounce_seconds`, `block_size_bytes`, `block_sync_threshold_bytes`, `verify_writes`, `verification_mode`, `propagate_deletions`, `archive_retention_days`) from `pub(crate)` to strictly private. Provided getter methods and `with_verify_writes` mutation helper.
+>   - **Persistence Bridge Formalization**: Implemented `TryFrom<&Config> for StoreConfig` and `TryFrom<&TargetSyncConfig> for StoreConfig` in `src/config/mod.rs`, cleanly validating non-zero block sizes via `StoreConfig::new`.
+>   - **Consumer Adaptation**: Updated `src/sync/small_file.rs:370` test from struct update syntax on private fields to `target_cfg.with_verify_writes(true)`.
+>   - **Full Quality Verification Gate**: Verified zero formatting diffs (`cargo fmt`), zero lint warnings (`cargo clippy -D warnings`), and 100% test pass rate with 301 passing tests (`cargo test --all-features`).
+> * **New Constraints:**
+>   - Submodules within `src/config/` must maintain acyclic dependencies (`mod.rs` $\to$ submodules). Sibling submodules must not import each other directly unless necessary.
+>   - `TargetSyncConfig` fields must remain strictly private; consumers must use accessors or `TargetSyncConfigBuilder`.
+>   - Database layer `StoreConfig` construction from configuration must use `TryFrom` conversions in `src/config/mod.rs`.
+> * **Pruned:**
+>   - 2,257-line monolithic `src/config.rs` eliminated.
+>   - Public / crate-private field leakage on `TargetSyncConfig` eliminated.
+>   - Unchecked direct struct construction of `TargetSyncConfig` by consumers eliminated.
+
