@@ -422,5 +422,43 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Stale references to monolithic `src/sync.rs`, 197 test count metric, and outdated integration/snapshot counts eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Critical Findings Remediation (Archive Pruning, DebounceQueue Action Replacement & Compaction, Fallible ConfigBuilder Validation, DirtyBlockRange Zero-Panic Constructor)
+> * **Changes:**
+>   - **`src/sync/archive.rs`**: Anchored `prune_archive` retention on `{timestamp}_` filename prefix with nested directory timestamp inheritance, preventing premature deletion of older files preserved across Windows NTFS renames.
+>   - **`src/sync/worker.rs`**: Updated `DebounceQueue::enqueue_sync` and `enqueue_delete` to permit action replacement on already-tracked paths regardless of queue capacity (`pending_count >= max_capacity`), preventing stale deletions of modified files. Implemented `compact_heaps()` to prune dead entries from min-heaps during bursts.
+>   - **`src/config.rs`**: Converted `ConfigBuilder::build(self)` to fallible `Result<Config, SyncError>` enforcing all validation invariants (`debounce_seconds > 0`, `retry_interval_seconds > 0`, `0 < block_size_bytes <= 64MB`, `block_sync_threshold_bytes >= block_size_bytes`, destination presence, and source/dest containment). Preserved `build_unvalidated()` for isolated test fixtures; migrated 57 call sites across workspace.
+>   - **`src/sync/delta.rs` & `src/sync/engine.rs`**: Converted `DirtyBlockRange::new` to require `std::num::NonZeroU64`, eliminating `.expect()` panics. Added fallible `try_new(u64) -> Result<Self, SyncError>`.
+>   - **Test Suite**: Added 10 new unit and property tests. Full test suite expanded from 268 to 278 automated tests (228 lib + 3 bin + 12 integration + 8 property + 20 snapshot + 7 doc-tests). All exit 0.
+> * **New Constraints:**
+>   - `ConfigBuilder::build()` is fallible and must be handled with `?` or `.unwrap()` in production/tests. Invalid configs must use `build_unvalidated()` only when explicitly testing invalid states.
+>   - `DirtyBlockRange::new()` requires `NonZeroU64`. Use `DirtyBlockRange::try_new(u64)` for dynamic values.
+>   - `DebounceQueue` must allow action replacement for existing paths even at max capacity.
+>   - Archive retention anchors must parse the filename timestamp prefix rather than querying filesystem creation timestamps (`btime`).
+> * **Pruned:**
+>   - Runtime panic in `DirtyBlockRange::new(0)` eliminated.
+>   - Stale deletion bug on full `DebounceQueue` eliminated.
+>   - Unchecked builder construction bypasses eliminated.
+>   - Premature archive pruning on NTFS renames eliminated.
+
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Documentation sync for Critical Findings Remediation (`/update-doc`)
+> * **Changes:**
+>   - Enriched rustdoc comments in `src/config.rs` with `# Returns`, `# Errors`, and runnable doctests for `ConfigBuilder::build`, `build_unvalidated`, and `try_build`.
+>   - Fixed rustdoc intra-doc link resolution for `TargetSyncConfig` in `src/db.rs`.
+>   - Synchronized `spec.md` verification baseline hash against source commit `78822d4`.
+>   - Synchronized `spec.md` behavioral contracts and scenarios for `ConfigBuilder`, `DirtyBlockRange`, `DebounceQueue`, archive pruning retention, and test metrics (279 tests).
+>   - Verified 0 warnings on `cargo doc --no-deps` and all 8 doc-tests passing (`cargo test --doc`).
+> * **New Constraints:**
+>   - `ConfigBuilder::build()` doctests must use fallible `?` error propagation.
+> * **Pruned:**
+>   - Stale panicking `DirtyBlockRange::new` contract and outdated `ConfigBuilder::build` signature in `spec.md` removed.
+
+
+
 
 

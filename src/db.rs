@@ -120,7 +120,7 @@ impl TryFrom<&Config> for StoreConfig {
 impl TryFrom<&crate::config::TargetSyncConfig> for StoreConfig {
     type Error = SyncError;
 
-    /// Fallible conversion from [`TargetSyncConfig`].
+    /// Fallible conversion from [`crate::config::TargetSyncConfig`].
     ///
     /// Returns [`SyncError::Validation`] if `block_size_bytes` is zero.
     fn try_from(cfg: &crate::config::TargetSyncConfig) -> Result<Self, Self::Error> {
@@ -768,7 +768,7 @@ mod tests {
             .dest_dir(PathBuf::from("."))
             .block_sync_threshold_bytes(block_size * 2)
             .block_size_bytes(block_size)
-            .build()
+            .build_unvalidated()
     }
 
     #[test]
@@ -996,7 +996,7 @@ mod tests {
         let cfg = Config::builder(PathBuf::from("."))
             .dest_dir(PathBuf::from("."))
             .block_size_bytes(0)
-            .build();
+            .build_unvalidated();
         let res = StoreConfig::try_from(&cfg);
         assert!(
             res.is_err(),

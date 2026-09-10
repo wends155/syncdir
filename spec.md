@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 57e1de8
+> Last verified against: 78822d4
  
 | Field | Value |
 |-------|-------|
@@ -31,8 +31,9 @@
 | `ConfigBuilder::dest_dir` | `(mut self, dest: impl Into<PathBuf>) -> Self` | `ConfigBuilder` | — |
 | `ConfigBuilder::dest_dirs` | `(mut self, dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self` | `ConfigBuilder` | — |
 | `ConfigBuilder::add_dest_dir` | `(mut self, dir: impl Into<PathBuf>) -> Self` | `ConfigBuilder` | — |
-| `ConfigBuilder::build` | `(self) -> Config` | `Config` | — |
-| `ConfigBuilder::try_build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` |
+| `ConfigBuilder::build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` (validates all configuration invariants) |
+| `ConfigBuilder::build_unvalidated` | `(self) -> Config` | `Config` | — (bypasses invariant validation; test fixtures only) |
+| `ConfigBuilder::try_build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` (alias for `build`) |
 | `TargetDir::new` | `(path: impl Into<PathBuf>) -> Self` | `TargetDir` | — |
 | `TargetDir::validate` | `(&self, role: &str) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid drive or UNC syntax) |
 | `TargetDir::as_path` | `(&self) -> &Path` | `&Path` | — |
@@ -100,6 +101,12 @@ GIVEN a `TargetSyncConfigBuilder` configured with a recursive sync loop (`source
 WHEN `build` is called
 THEN `SyncError::Validation` is returned
 AND construction fails
+
+[ERROR] ConfigBuilder immediate invariant validation failure
+GIVEN a `ConfigBuilder` configured with invalid parameters (zero debounce, zero retry interval, block size > 64MB, `block_sync_threshold_bytes < block_size_bytes`, missing destination, or recursive directory containment)
+WHEN `build` is called
+THEN `SyncError::Validation` is returned
+AND construction fails immediately
 
 ---
 
@@ -190,13 +197,14 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `start_sync_worker` | `<E: SyncEngine + 'static>(context: SyncWorkerContext<E>) -> Result<JoinHandle<()>, SyncError>` | `Result<JoinHandle<()>, SyncError>` | `SyncError::Io` (thread spawn failure) |
 | `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — |
 | `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (reusable scratch buffer lease for zero-lock streaming) |
-| `DirtyBlockRange::new` | `(block_size: u64) -> Self` | `DirtyBlockRange` | Panics if `block_size == 0` |
-| `DirtyBlockRange::new_nonzero` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — |
-| `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` |
+| `DirtyBlockRange::new` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (infallible zero-panic constructor) |
+| `DirtyBlockRange::new_nonzero` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (alias for `new`) |
+| `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` (if `block_size == 0`) |
 | `DirtyBlockRange::block_size_nonzero` | `(&self) -> NonZeroU64` | `NonZeroU64` | — |
 | `MockSyncEngine::new` | `() -> Self` | `MockSyncEngine` | — |
 | `SourceConnectivityTracker::new` | `(initial: bool) -> Self` | `SourceConnectivityTracker` | — |
 | `DebounceQueue::new` | `(max_capacity: usize) -> Self` | `DebounceQueue` | — |
+| `DebounceQueue::len` | `(&self) -> usize` | `usize` | — (total count of pending syncs and deletes) |
 | `ReachabilityMonitor::new` | `(target_index: usize, configured_dest: PathBuf, retry_interval_seconds: u64, resolver: Arc<dyn NetworkResolver>) -> Self` | `ReachabilityMonitor` | — |
 | `SyncWorkerState::new` | `(block_size_bytes: u64) -> Self` | `SyncWorkerState` | — |
 | `calculate_exponential_backoff` | `(attempts: u32, base_interval: Duration) -> Duration` | `Duration` | Capped at 300s |
@@ -237,7 +245,7 @@ AND any directory junction is rejected with `SyncError::Validation`
 GIVEN an invocation of `DirtyBlockRange::try_new(0)`
 WHEN the constructor validates the block size
 THEN `SyncError::Validation("DirtyBlockRange block_size must be greater than zero")` is returned
-AND `new(0)` panics with the same invariant message
+AND `new` requires `NonZeroU64`, preventing zero block size values at compile time
 
 [CONCURRENCY] SyncWorker non-spinning poll timeout during network offline
 GIVEN a worker queue with expired debounce items
@@ -262,6 +270,20 @@ WHEN `delete_file_from_dest` executes
 THEN the target file is renamed to `.syncdir_archive` without triggering an immediate full archive crawl
 AND archive pruning is executed periodically (hourly) and post-full-scan
 AND `prune_archive` ignores symlinks/junctions and enforces recursion depth $\le 32$
+
+[HAPPY] Archive pruning filename timestamp anchor & nested directory inheritance
+GIVEN an archive directory containing files moved via NTFS rename whose original filesystem creation timestamps are older than `max_age_days`
+AND the filename prefix `{timestamp}_` reflects recent archival within retention limits
+WHEN `prune_archive` executes
+THEN the file is retained based on its filename timestamp anchor
+AND files in nested subdirectories inherit the timestamp anchor from the top-level archived folder
+
+[CONCURRENCY] DebounceQueue action replacement at capacity
+GIVEN a `DebounceQueue` at maximum capacity (`pending_count >= max_capacity`)
+AND a path currently pending in `pending_deletes` receives a sync notification (or vice-versa)
+WHEN `enqueue_sync` is called
+THEN the action replacement succeeds without rejecting the modification
+AND dead queue entries in the min-heap are pruned via `compact_heaps`
 
 [HAPPY] Resilient full directory scan
 GIVEN a directory scan encountering locked or `PermissionDenied` folders
@@ -581,12 +603,12 @@ User interface tray-icon utilizing `tray-icon` and `winit` with `TrayController`
 Integrates `StartupRegistry` under HKCU for automatic daemon launch on user login.
 
 ### 6. Automated Testing Frameworks
-273 automated test cases verifying engine behavior:
-- Unit test suite across all modules (223 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`).
+279 automated test cases verifying engine behavior:
+- Unit test suite across all modules (228 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`).
 - Integration test suite (`tests/integration_tests.rs`: 12 tests).
 - Generative property test suite (`tests/property_tests.rs`: 8 proptest suites verifying `is_metadata_up_to_date_raw` and `DirtyBlockRange` chunk coalescing).
 - Snapshot regression test suite (`tests/snapshot_tests.rs`: 20 insta golden snapshots).
-- Documentation tests (`cargo test --doc`: 7 doctests).
+- Documentation tests (`cargo test --doc`: 8 doctests).
 
 ### 7. Development & Release Automation Scripts (`scripts/`)
 - `scripts/check-quality.ps1`: Code quality pipeline executing formatting, linter, tests, and static analysis.

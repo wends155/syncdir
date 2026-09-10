@@ -3,9 +3,10 @@ use crate::error::SyncError;
 use crate::sync::engine::{
     ConnectivityState, ScanOutcome, SyncCommand, SyncEngine, SyncStatusObserver,
 };
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Thread-safe tracker for source directory connectivity.
 #[derive(Clone, Debug)]
@@ -72,33 +73,55 @@ impl DebounceQueue {
     /// Enqueue a path for sync with a debounce duration.
     /// If the path is already pending, its deadline is extended.
     /// Returns false if at capacity and the path was not already pending.
-    pub fn enqueue_sync(&mut self, path: PathBuf, debounce: std::time::Duration) -> bool {
-        if !self.pending_syncs.contains_key(&path)
-            && self.pending_syncs.len() + self.pending_deletes.len() >= self.max_capacity
+    pub fn enqueue_sync(&mut self, path: PathBuf, debounce: Duration) -> bool {
+        let is_tracked =
+            self.pending_syncs.contains_key(&path) || self.pending_deletes.contains_key(&path);
+        if !is_tracked && self.pending_syncs.len() + self.pending_deletes.len() >= self.max_capacity
         {
             return false;
         }
         self.pending_deletes.remove(&path);
         let dl = Instant::now() + debounce;
         self.pending_syncs.insert(path.clone(), dl);
-        self.sync_heap.push(std::cmp::Reverse((dl, path)));
+        self.sync_heap.push(Reverse((dl, path)));
+        self.compact_heaps();
         true
     }
 
     /// Enqueue a path for deletion with a debounce duration.
     /// If the path is already pending, its deadline is extended.
     /// Returns false if at capacity and the path was not already pending.
-    pub fn enqueue_delete(&mut self, path: PathBuf, debounce: std::time::Duration) -> bool {
-        if !self.pending_deletes.contains_key(&path)
-            && self.pending_syncs.len() + self.pending_deletes.len() >= self.max_capacity
+    pub fn enqueue_delete(&mut self, path: PathBuf, debounce: Duration) -> bool {
+        let is_tracked =
+            self.pending_syncs.contains_key(&path) || self.pending_deletes.contains_key(&path);
+        if !is_tracked && self.pending_syncs.len() + self.pending_deletes.len() >= self.max_capacity
         {
             return false;
         }
         self.pending_syncs.remove(&path);
         let dl = Instant::now() + debounce;
         self.pending_deletes.insert(path.clone(), dl);
-        self.delete_heap.push(std::cmp::Reverse((dl, path)));
+        self.delete_heap.push(Reverse((dl, path)));
+        self.compact_heaps();
         true
+    }
+
+    fn compact_single_heap(
+        heap: &mut BinaryHeap<Reverse<(Instant, PathBuf)>>,
+        active_items: &HashMap<PathBuf, Instant>,
+    ) {
+        if heap.len() > 64 && heap.len() > active_items.len() * 2 {
+            let valid_entries: Vec<Reverse<(Instant, PathBuf)>> = heap
+                .drain()
+                .filter(|Reverse((deadline, path))| active_items.get(path) == Some(deadline))
+                .collect();
+            *heap = BinaryHeap::from(valid_entries);
+        }
+    }
+
+    fn compact_heaps(&mut self) {
+        Self::compact_single_heap(&mut self.sync_heap, &self.pending_syncs);
+        Self::compact_single_heap(&mut self.delete_heap, &self.pending_deletes);
     }
 
     /// Drain and return all sync paths whose debounce deadlines are <= `now`.
@@ -202,6 +225,12 @@ impl DebounceQueue {
     /// Return total count of pending syncs and deletes.
     pub fn pending_count(&self) -> usize {
         self.pending_syncs.len() + self.pending_deletes.len()
+    }
+
+    /// Returns the total number of pending operations (syncs + deletes).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.pending_count()
     }
 }
 
@@ -891,6 +920,51 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_debounce_queue_action_replacement_at_capacity() {
+        let mut q = DebounceQueue::new(2);
+        let path1 = PathBuf::from("file1.txt");
+        let path2 = PathBuf::from("file2.txt");
+        let path3 = PathBuf::from("file3.txt");
+
+        // Fill queue to max_capacity (2) with pending deletes
+        assert!(q.enqueue_delete(path1.clone(), Duration::from_secs(10)));
+        assert!(q.enqueue_delete(path2.clone(), Duration::from_secs(10)));
+        assert_eq!(q.len(), 2);
+
+        // New untracked path must be rejected due to capacity limit
+        assert!(!q.enqueue_sync(path3.clone(), Duration::from_secs(10)));
+        assert_eq!(q.len(), 2);
+
+        // Tracked path in pending_deletes must be accepted for action replacement (sync replacing delete)
+        assert!(q.enqueue_sync(path1.clone(), Duration::from_secs(5)));
+        assert_eq!(q.len(), 2);
+
+        // Vice-versa: tracked path in pending_syncs must be accepted for delete replacement
+        assert!(q.enqueue_delete(path1.clone(), Duration::from_secs(5)));
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn test_debounce_queue_heap_compaction() {
+        let mut q = DebounceQueue::new(100);
+        let path = PathBuf::from("frequently_edited.txt");
+
+        // Enqueue the same path 1000 times with updated deadlines
+        for i in 1..=1000 {
+            q.enqueue_sync(path.clone(), Duration::from_millis(i * 10));
+        }
+
+        // Only 1 item is logically pending
+        assert_eq!(q.len(), 1);
+        // Compaction must have run and kept heap size bounded well below 1000
+        assert!(
+            q.sync_heap.len() <= 64,
+            "Heap size not bounded: {}",
+            q.sync_heap.len()
+        );
+    }
+
+    #[test]
     fn test_calculate_worker_poll_timeout() {
         let now = Instant::now();
 
@@ -1028,7 +1102,7 @@ mod tests {
             .debounce_seconds(0)
             .retry_interval_seconds(1)
             .propagate_deletions(true)
-            .build();
+            .build_unvalidated();
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1056,7 +1130,7 @@ mod tests {
             .dest_dir(dest.clone())
             .debounce_seconds(0)
             .retry_interval_seconds(1)
-            .build();
+            .build_unvalidated();
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1087,7 +1161,7 @@ mod tests {
             .dest_dir(dst)
             .debounce_seconds(0)
             .retry_interval_seconds(1)
-            .build();
+            .build_unvalidated();
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
@@ -1285,7 +1359,7 @@ mod tests {
             .dest_dir(dest.clone())
             .debounce_seconds(0)
             .retry_interval_seconds(0)
-            .build();
+            .build_unvalidated();
 
         let engine = MockSyncEngine::new();
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1340,7 +1414,7 @@ mod tests {
             .dest_dir(dest)
             .debounce_seconds(0)
             .retry_interval_seconds(0)
-            .build();
+            .build_unvalidated();
 
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = MockSyncEngine::new();
@@ -1400,7 +1474,7 @@ mod tests {
             .dest_dir(fake_dest.clone())
             .debounce_seconds(0)
             .retry_interval_seconds(1)
-            .build();
+            .build_unvalidated();
 
         let resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
         resolver.set_alternate_path(fake_dest, real_unc_dest.clone());

@@ -366,7 +366,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let range = pool
             .take()
-            .unwrap_or_else(|| DirtyBlockRange::new_nonzero(self.config.block_size_nonzero()));
+            .unwrap_or_else(|| DirtyBlockRange::new(self.config.block_size_nonzero()));
         DirtyRangeLease {
             pool: &self.dirty_range_pool,
             range: Some(range),
@@ -751,7 +751,8 @@ mod tests {
             .dest_dir(dest.clone())
             .block_sync_threshold_bytes(4)
             .block_size_bytes(4)
-            .build();
+            .build()
+            .unwrap();
         let store =
             SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
                 .unwrap();
@@ -801,7 +802,8 @@ mod tests {
             .dest_dir(dst.clone())
             .block_size_bytes(512)
             .block_sync_threshold_bytes(1024)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 

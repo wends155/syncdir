@@ -40,7 +40,7 @@
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let config = Config::builder("C:\\Source")
 //!         .dest_dir("\\\\server\\share\\Dest")
-//!         .build();
+//!         .build()?;
 //!
 //!     let app_dir = Path::new("C:\\ProgramData\\syncdir");
 //!     let daemon = SyncDaemon::start(config, app_dir, None)?;

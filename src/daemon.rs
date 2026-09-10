@@ -543,7 +543,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
 
-        let config = Config::builder(src).dest_dir(dst).build();
+        let config = Config::builder(src).dest_dir(dst).build().unwrap();
         let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
         assert_eq!(daemon.worker_handles.len(), 1);
         daemon.shutdown();
@@ -629,7 +629,8 @@ verify_writes = true
         let config = Config::builder(src.clone())
             .dest_dir(dst)
             .retry_interval_seconds(1)
-            .build();
+            .build()
+            .unwrap();
         let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
 
         // Now bring source online
@@ -667,7 +668,7 @@ verify_writes = true
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
 
-        let config = Config::builder(src).dest_dir(dst).build();
+        let config = Config::builder(src).dest_dir(dst).build().unwrap();
         let daemon =
             SyncDaemon::start_with_factory(MockEngineFactory, config, dir.path(), None).unwrap();
         assert_eq!(daemon.worker_handles.len(), 1);
@@ -681,7 +682,8 @@ verify_writes = true
 
         let config = Config::builder("Z:\\shared")
             .dest_dir("\\\\server\\share\\data\\subfolder")
-            .build();
+            .build()
+            .unwrap();
 
         let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
         assert!(result.is_err());
@@ -696,7 +698,8 @@ verify_writes = true
 
         let config = Config::builder("Z:\\source")
             .dest_dir("\\\\server\\share2")
-            .build();
+            .build()
+            .unwrap();
 
         let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
         assert!(result.is_ok());
@@ -709,7 +712,8 @@ verify_writes = true
 
         let config = Config::builder("C:\\source")
             .dest_dirs(vec!["Y:\\backup", "\\\\server\\share\\backup\\sub"])
-            .build();
+            .build()
+            .unwrap();
 
         let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
         assert!(result.is_err());
@@ -730,7 +734,8 @@ verify_writes = true
 
         let config = Config::builder("C:\\source")
             .dest_dirs(vec!["Y:\\backup1", "Z:\\backup2"])
-            .build();
+            .build()
+            .unwrap();
 
         let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
         assert!(result.is_ok());
@@ -740,7 +745,7 @@ verify_writes = true
     fn test_sync_daemon_rejects_unvalidated_config() {
         let dir = tempdir().unwrap();
         // Config with zero destinations fails config.validate()
-        let invalid_config = Config::builder(dir.path()).build();
+        let invalid_config = Config::builder(dir.path()).build_unvalidated();
         let result =
             SyncDaemon::start_with_factory(MockEngineFactory, invalid_config, dir.path(), None);
         match result {
@@ -757,7 +762,7 @@ verify_writes = true
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
 
-        let config = Config::builder(src).dest_dir(dst).build();
+        let config = Config::builder(src).dest_dir(dst).build().unwrap();
         let mock_resolver = Arc::new(crate::net::MockNetworkResolver::new());
         let daemon = SyncDaemon::start_with_factory_and_resolver(
             MockEngineFactory,
@@ -806,7 +811,7 @@ verify_writes = true
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
 
-        let config = Config::builder(src).dest_dir(dest).build();
+        let config = Config::builder(src).dest_dir(dest).build().unwrap();
         let resolver = TrackingResolver {
             unc_calls: std::sync::atomic::AtomicUsize::new(0),
             alt_calls: std::sync::atomic::AtomicUsize::new(0),

@@ -13,6 +13,16 @@ use super::path_safety::{
 /// Global atomic counter for unique archive path generation across threads and timestamps.
 static ARCHIVE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+fn parse_archive_timestamp(name: &str) -> Option<SystemTime> {
+    let prefix = name.split('_').next()?;
+    let millis: u64 = prefix.parse().ok()?;
+    if millis >= 1_000_000_000_000 {
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(millis))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn prune_archive(
     archive_dir: &Path,
     max_age_days: u64,
@@ -31,6 +41,7 @@ pub(crate) fn prune_archive(
         dir: &Path,
         files: &mut Vec<(PathBuf, u64, SystemTime)>,
         total_bytes: &mut u64,
+        inherited_time: Option<SystemTime>,
         depth: usize,
     ) -> std::io::Result<()> {
         const MAX_ARCHIVE_DEPTH: usize = 32;
@@ -53,18 +64,20 @@ pub(crate) fn prune_archive(
             }
             let ft = entry.file_type()?;
             let path = entry.path();
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            let parsed_time = parse_archive_timestamp(&name_str);
+
             if ft.is_dir() {
-                collect_files(&path, files, total_bytes, depth + 1)?;
+                let next_inherited = parsed_time.or(inherited_time);
+                collect_files(&path, files, total_bytes, next_inherited, depth + 1)?;
             } else if ft.is_file()
                 && let Ok(meta) = entry.metadata()
             {
                 let len = meta.len();
-                // Use archive creation time, not payload mtime.
-                // std::fs::rename preserves mtime; created() reflects when the entry
-                // arrived in the archive directory, which is the correct retention anchor.
-                let archive_time = meta
-                    .created()
-                    .or_else(|_| meta.modified())
+                let archive_time = parsed_time
+                    .or(inherited_time)
+                    .or_else(|| meta.modified().ok())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 *total_bytes += len;
                 files.push((path, len, archive_time));
@@ -73,7 +86,7 @@ pub(crate) fn prune_archive(
         Ok(())
     }
 
-    let _ = collect_files(archive_dir, &mut files, &mut total_bytes, 0);
+    let _ = collect_files(archive_dir, &mut files, &mut total_bytes, None, 0);
 
     // Evict files older than max_age_days based on archive entry time
     files.retain(|(path, len, archive_time)| {
@@ -222,6 +235,7 @@ mod tests {
             .block_sync_threshold_bytes(10)
             .block_size_bytes(4)
             .build()
+            .unwrap()
     }
 
     #[cfg(windows)]
@@ -399,7 +413,8 @@ mod tests {
         let config = Config::builder(src.clone())
             .dest_dir(dst.clone())
             .propagate_deletions(true)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let engine = std::sync::Arc::new(LocalSyncEngine::new(MockHashStore::new(), target_cfg));
 
@@ -468,7 +483,8 @@ mod tests {
         let config = Config::builder(src.clone())
             .dest_dir(dst.clone())
             .propagate_deletions(true)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
@@ -530,7 +546,8 @@ mod tests {
         let config_no_prop = Config::builder(src)
             .dest_dir(dst.clone())
             .propagate_deletions(false)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg_no_prop = TargetSyncConfig::from_config(&config_no_prop, dst.clone());
         let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
         let rec3 = FileRecord {
@@ -552,13 +569,58 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_archive_preserves_newly_archived_old_files() {
+        use std::time::UNIX_EPOCH;
+        let temp = tempfile::tempdir().unwrap();
+        let archive_dir = temp.path().join(".syncdir_archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let file_name = format!("{}_{}_test_old_file.txt", now_millis, "0001");
+        let file_path = archive_dir.join(&file_name);
+        std::fs::write(&file_path, b"content").unwrap();
+
+        // Set creation and modification time to 60 days ago
+        let sixty_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 86400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let mut times = std::fs::FileTimes::new().set_modified(sixty_days_ago);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTimesExt;
+            times = times.set_created(sixty_days_ago);
+        }
+        f.set_times(times).unwrap();
+        drop(f);
+
+        // Prune with 30-day max age
+        prune_archive(&archive_dir, 30, 10_000_000).unwrap();
+
+        // File MUST still exist because filename timestamp is recent
+        assert!(
+            file_path.exists(),
+            "Newly archived file with old btime was incorrectly pruned"
+        );
+    }
+
+    #[test]
     fn test_prune_archive_retains_newly_archived_old_file() {
-        use std::time::{Duration, SystemTime};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let dir = tempdir().unwrap();
         let archive_dir = dir.path().join(".syncdir_archive");
         std::fs::create_dir_all(&archive_dir).unwrap();
 
-        let file_path = archive_dir.join("old_content_file.txt");
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let file_path = archive_dir.join(format!("{}_0001_old_content_file.txt", now_millis));
         std::fs::write(&file_path, b"important backup").unwrap();
 
         // Set mtime to 60 days ago
@@ -573,6 +635,44 @@ mod tests {
         assert!(
             file_path.exists(),
             "newly archived file must be retained regardless of payload mtime"
+        );
+    }
+
+    #[test]
+    fn test_prune_archive_nested_directory_timestamp_inheritance() {
+        use std::time::UNIX_EPOCH;
+        let temp = tempfile::tempdir().unwrap();
+        let archive_dir = temp.path().join(".syncdir_archive");
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let top_dir = archive_dir.join(format!("{}_{}_nested_folder", now_millis, "0002"));
+        let sub_dir = top_dir.join("subdir");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let nested_file = sub_dir.join("deep_file.txt");
+        std::fs::write(&nested_file, b"deep content").unwrap();
+
+        let sixty_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 86400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&nested_file)
+            .unwrap();
+        let mut times = std::fs::FileTimes::new().set_modified(sixty_days_ago);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTimesExt;
+            times = times.set_created(sixty_days_ago);
+        }
+        f.set_times(times).unwrap();
+        drop(f);
+
+        prune_archive(&archive_dir, 30, 10_000_000).unwrap();
+        assert!(
+            nested_file.exists(),
+            "Nested file inheriting recent parent timestamp was incorrectly pruned"
         );
     }
 
@@ -595,7 +695,8 @@ mod tests {
         let config = Config::builder(src)
             .dest_dir(dst.clone())
             .propagate_deletions(true)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 

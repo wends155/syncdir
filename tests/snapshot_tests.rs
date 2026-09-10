@@ -27,7 +27,8 @@ fn test_config_snapshot_multi_dest() {
         .block_size_bytes(4)
         .verify_writes(true)
         .retry_interval_seconds(10)
-        .build();
+        .build()
+        .unwrap();
     assert_snapshot!(format!("{:#?}", config));
 }
 
@@ -52,7 +53,7 @@ fn test_config_validation_error_no_dests() {
         .block_size_bytes(4)
         .verify_writes(true)
         .retry_interval_seconds(10)
-        .build();
+        .build_unvalidated();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
@@ -67,7 +68,7 @@ fn test_config_validation_error_zero_debounce() {
         .block_size_bytes(4)
         .verify_writes(true)
         .retry_interval_seconds(10)
-        .build();
+        .build_unvalidated();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
@@ -82,7 +83,7 @@ fn test_config_validation_error_invalid_relative_source() {
         .block_size_bytes(4)
         .verify_writes(true)
         .retry_interval_seconds(10)
-        .build();
+        .build_unvalidated();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
@@ -97,7 +98,7 @@ fn test_config_validation_error_zero_block_size() {
         .block_size_bytes(0)
         .verify_writes(true)
         .retry_interval_seconds(10)
-        .build();
+        .build_unvalidated();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }
@@ -112,7 +113,7 @@ fn test_config_validation_error_zero_threshold() {
         .block_size_bytes(4)
         .verify_writes(true)
         .retry_interval_seconds(10)
-        .build();
+        .build_unvalidated();
     let err = config.validate().unwrap_err();
     assert_snapshot!(err.to_string());
 }

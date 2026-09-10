@@ -500,7 +500,8 @@ mod tests {
             .propagate_deletions(true)
             .block_sync_threshold_bytes(10)
             .block_size_bytes(4)
-            .build();
+            .build()
+            .unwrap();
         let store = crate::db::SqliteHashStore::new(
             &db_path,
             crate::db::StoreConfig::try_from(&config).unwrap(),
@@ -532,7 +533,7 @@ mod tests {
         }
 
         let store = MockHashStore::new();
-        let config = Config::builder(src).dest_dir(dst).build();
+        let config = Config::builder(src).dest_dir(dst).build().unwrap();
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
@@ -603,7 +604,8 @@ mod tests {
         let config = Config::builder(src.clone())
             .dest_dir(dst.clone())
             .propagate_deletions(true)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let engine = LocalSyncEngine::new(db, target_cfg);
 

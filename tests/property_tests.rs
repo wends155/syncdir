@@ -43,7 +43,8 @@ proptest! {
             .retry_interval_seconds(retry_interval)
             .verify_writes(verify_writes)
             .propagate_deletions(propagate_deletions)
-            .build();
+            .build()
+            .unwrap();
 
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -106,7 +107,7 @@ proptest! {
     ) {
         let config = Config::builder(PathBuf::from(rel_path))
             .dest_dir(PathBuf::from(r"D:\Dest"))
-            .build();
+            .build_unvalidated();
         prop_assert!(config.validate().is_err());
     }
 
@@ -120,7 +121,7 @@ proptest! {
         use std::io::Cursor;
         use syncdir::sync::DirtyBlockRange;
 
-        let mut range = DirtyBlockRange::new(block_size);
+        let mut range = DirtyBlockRange::new(std::num::NonZeroU64::new(block_size).unwrap());
         let mut cursor = Cursor::new(Vec::new());
         let payload = vec![0xAAu8; block_size as usize];
 
@@ -194,7 +195,8 @@ proptest! {
             .dest_dir(dest.clone())
             .block_size_bytes(1024)
             .block_sync_threshold_bytes(1024)
-            .build();
+            .build()
+            .unwrap();
         let store =
             SqliteHashStore::new(db_file.path(), StoreConfig::try_from(&config).unwrap()).unwrap();
         let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());

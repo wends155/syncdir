@@ -21,7 +21,8 @@ fn test_integration_config_db_sync_commands() {
         .propagate_deletions(false)
         .block_sync_threshold_bytes(4096)
         .block_size_bytes(1024)
-        .build();
+        .build()
+        .unwrap();
 
     assert!(config.validate().is_ok());
 
@@ -150,7 +151,8 @@ fn test_propagate_deletions_false() {
     let config = Config::builder(source.clone())
         .dest_dir(dest.clone())
         .propagate_deletions(false)
-        .build();
+        .build()
+        .unwrap();
     let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
 
     let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
@@ -372,7 +374,7 @@ fn test_sync_daemon_shutdown_order() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&dst).unwrap();
 
-    let config = Config::builder(src).dest_dir(dst).build();
+    let config = Config::builder(src).dest_dir(dst).build().unwrap();
     let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
     daemon.shutdown();
 }
@@ -397,7 +399,7 @@ fn test_worker_reachability_and_offline_drain_guard() {
         .dest_dir(dst.clone())
         .debounce_seconds(0)
         .retry_interval_seconds(1)
-        .build();
+        .build_unvalidated();
     let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
 
     let mock_engine = MockSyncEngine::new();
@@ -486,7 +488,8 @@ fn test_delta_sync_interrupted_write_invalidates_cache() {
             .dest_dir(dst.clone())
             .block_sync_threshold_bytes(1024)
             .block_size_bytes(512)
-            .build();
+            .build()
+            .unwrap();
 
         let store =
             SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();

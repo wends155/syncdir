@@ -790,8 +790,54 @@ impl ConfigBuilder {
         self
     }
 
-    /// Builds and normalizes paths without failing validation, allowing `config.validate()` to be called.
-    pub fn build(self) -> Config {
+    /// Builds and validates the configuration into a [`Config`].
+    ///
+    /// Validates all configuration invariants including non-zero debounce and retry
+    /// intervals, valid block size bounds (1 byte to 64MB), block threshold ordering,
+    /// destination presence, and recursive path containment.
+    ///
+    /// # Returns
+    ///
+    /// A fully validated [`Config`] ready for synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Validation`] if any configuration invariant is violated:
+    /// - `debounce_seconds == 0`
+    /// - `retry_interval_seconds == 0`
+    /// - `block_size_bytes == 0` or `> 64MB`
+    /// - `block_sync_threshold_bytes < block_size_bytes`
+    /// - No destination directories specified
+    /// - Source and destination directories have recursive containment (`source == dest` or nested)
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use syncdir::config::Config;
+    ///
+    /// # fn main() -> Result<(), syncdir::error::SyncError> {
+    /// let config = Config::builder("C:\\Source")
+    ///     .dest_dir("D:\\Dest")
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build(self) -> Result<Config, SyncError> {
+        let config = self.build_unvalidated();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Builds configuration without running invariant validation.
+    ///
+    /// Normalizes configured paths without asserting invariants, allowing
+    /// [`Config::validate`] to be invoked explicitly or permitting negative test fixtures.
+    ///
+    /// # Returns
+    ///
+    /// An unvalidated [`Config`].
+    #[doc(hidden)]
+    pub fn build_unvalidated(self) -> Config {
         Config {
             source_dir: TargetDir::new(self.source_dir),
             destinations: DestinationCollection::from_raw(self.dest_dir, self.dest_dirs),
@@ -805,11 +851,18 @@ impl ConfigBuilder {
         }
     }
 
-    /// Builds and validates the configuration, returning an error if validation fails.
+    /// Fallible builder method equivalent to [`ConfigBuilder::build`].
+    ///
+    /// # Returns
+    ///
+    /// A fully validated [`Config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Validation`] if validation invariants fail.
+    #[inline]
     pub fn try_build(self) -> Result<Config, SyncError> {
-        let config = self.build();
-        config.validate()?;
-        Ok(config)
+        self.build()
     }
 }
 
@@ -940,7 +993,7 @@ impl Config {
             .block_size_bytes(4)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build()
+            .build_unvalidated()
     }
 
     /// Load configuration from a TOML file at the given path.
@@ -1213,7 +1266,8 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build()
+            .unwrap();
         assert!(config.validate().is_ok());
     }
 
@@ -1231,21 +1285,27 @@ mod tests {
         std::fs::create_dir_all(&nested_src).unwrap();
 
         // 1. Identical paths
-        let cfg_identical = Config::builder(src.clone()).dest_dir(src.clone()).build();
+        let cfg_identical = Config::builder(src.clone())
+            .dest_dir(src.clone())
+            .build_unvalidated();
         assert!(
             cfg_identical.validate().is_err(),
             "Identical source and destination directory must fail validation"
         );
 
         // 2. Destination nested inside source
-        let cfg_dest_in_src = Config::builder(src.clone()).dest_dir(nested_dest).build();
+        let cfg_dest_in_src = Config::builder(src.clone())
+            .dest_dir(nested_dest)
+            .build_unvalidated();
         assert!(
             cfg_dest_in_src.validate().is_err(),
             "Destination directory nested within source directory must fail validation"
         );
 
         // 3. Source nested inside destination
-        let cfg_src_in_dest = Config::builder(nested_src).dest_dir(outside_dest).build();
+        let cfg_src_in_dest = Config::builder(nested_src)
+            .dest_dir(outside_dest)
+            .build_unvalidated();
         assert!(
             cfg_src_in_dest.validate().is_err(),
             "Source directory nested within destination directory must fail validation"
@@ -1265,7 +1325,7 @@ mod tests {
             .dest_dir(dst.clone())
             .block_size_bytes(65 * 1024 * 1024)
             .block_sync_threshold_bytes(65 * 1024 * 1024)
-            .build();
+            .build_unvalidated();
         assert!(
             cfg_oversized_block.validate().is_err(),
             "block_size_bytes exceeding 64MB must fail validation"
@@ -1276,7 +1336,8 @@ mod tests {
             .dest_dir(dst.clone())
             .block_size_bytes(64 * 1024 * 1024)
             .block_sync_threshold_bytes(64 * 1024 * 1024)
-            .build();
+            .build()
+            .unwrap();
         assert!(
             cfg_boundary_block.validate().is_ok(),
             "block_size_bytes at boundary 64MB must pass validation"
@@ -1287,7 +1348,7 @@ mod tests {
             .dest_dir(dst)
             .block_size_bytes(1024 * 1024)
             .block_sync_threshold_bytes(512 * 1024)
-            .build();
+            .build_unvalidated();
         assert!(
             cfg_invalid_threshold.validate().is_err(),
             "block_sync_threshold_bytes smaller than block_size_bytes must fail validation"
@@ -1337,7 +1398,8 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build()
+            .unwrap();
         // Soft validation: missing source directory logs a warning but validation passes
         assert!(config.validate().is_ok());
     }
@@ -1356,7 +1418,7 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build_unvalidated();
         assert!(config.validate().is_err());
     }
 
@@ -1374,7 +1436,7 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(0)
-            .build();
+            .build_unvalidated();
         assert!(config.validate().is_err());
     }
 
@@ -1455,7 +1517,8 @@ mod tests {
             .block_size_bytes(4)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build()
+            .unwrap();
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0], PathBuf::from("D:\\dst1"));
@@ -1517,7 +1580,7 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build_unvalidated();
         assert!(config.validate().is_err());
     }
 
@@ -1555,7 +1618,8 @@ mod tests {
             .block_size_bytes(4)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build()
+            .unwrap();
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].to_string_lossy(), r"\\172.16.0.60\scada_data");
@@ -1577,7 +1641,7 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build_unvalidated();
         assert!(config.validate().is_err());
     }
 
@@ -1620,7 +1684,8 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build()
+            .unwrap();
 
         assert!(config.validate().is_ok());
         let resolved = config.resolved_dest_dirs();
@@ -1639,7 +1704,7 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build_unvalidated();
 
         let err = config.validate().unwrap_err();
         assert!(
@@ -1658,7 +1723,8 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.source_dir().to_string_lossy(), r"C:\Source\Folder");
         let dests = config.resolved_dest_dirs();
@@ -1681,7 +1747,8 @@ mod tests {
             .block_size_bytes(512)
             .verify_writes(true)
             .retry_interval_seconds(10)
-            .build();
+            .build()
+            .unwrap();
 
         let resolved = config.resolved_dest_dirs();
         assert_eq!(resolved.len(), 2);
@@ -1837,7 +1904,8 @@ mod tests {
             .debounce_seconds(5)
             .retry_interval_seconds(15)
             .propagate_deletions(false)
-            .build();
+            .build()
+            .unwrap();
         let target = TargetSyncConfig::from_config(&config, PathBuf::from(r"C:\dst2"));
         assert_eq!(target.source_dir(), Path::new(r"C:\src"));
         assert_eq!(target.dest_dir(), Path::new(r"C:\dst2"));
@@ -1900,7 +1968,8 @@ mod tests {
         let config = Config::builder(r"C:\Source")
             .dest_dir(d1.clone())
             .add_dest_dir(d2.clone())
-            .build();
+            .build()
+            .unwrap();
         let slice: &[_] = config.destinations();
         assert_eq!(slice.len(), 2);
         let legacy = config.dest_dirs().unwrap();
@@ -2028,14 +2097,16 @@ mod tests {
         let cfg1 = Config::builder(r"C:\source")
             .dest_dir(r"D:\dest")
             .verify_writes(true)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(cfg1.verification_mode(), VerificationMode::Full);
 
         // Legacy verify_writes = false resolves to Disabled
         let cfg2 = Config::builder(r"C:\source")
             .dest_dir(r"D:\dest")
             .verify_writes(false)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(cfg2.verification_mode(), VerificationMode::Disabled);
 
         // Explicit verification_mode overrides verify_writes
@@ -2043,7 +2114,8 @@ mod tests {
             .dest_dir(r"D:\dest")
             .verify_writes(true)
             .verification_mode(VerificationMode::MetadataAndFlush)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(cfg3.verification_mode(), VerificationMode::MetadataAndFlush);
 
         // TOML parsing with verification_mode
@@ -2066,7 +2138,8 @@ mod tests {
         let config = Config::builder(r"C:\source")
             .dest_dir(r"D:\dest")
             .verification_mode(VerificationMode::MetadataAndFlush)
-            .build();
+            .build()
+            .unwrap();
         let target = TargetSyncConfig::from_config(&config, r"D:\dest");
         assert_eq!(
             target.verification_mode(),
@@ -2092,18 +2165,23 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dest2).unwrap();
 
-        let config = Config::builder(&src).dest_dirs(vec![dest1, dest2]).build();
+        let config = Config::builder(&src)
+            .dest_dirs(vec![dest1, dest2])
+            .build_unvalidated();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("nested within each other"));
     }
 
     #[test]
     fn test_target_sync_config_try_from() {
-        let config_no_dest = Config::builder(r"C:\source").build();
+        let config_no_dest = Config::builder(r"C:\source").build_unvalidated();
         let res = TargetSyncConfig::try_from_config(&config_no_dest);
         assert!(res.is_err());
 
-        let config_with_dest = Config::builder(r"C:\source").dest_dir(r"D:\dest").build();
+        let config_with_dest = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .build()
+            .unwrap();
         let res = TargetSyncConfig::try_from_config(&config_with_dest);
         assert!(res.is_ok());
     }
@@ -2117,5 +2195,40 @@ mod tests {
         let targets = cfg.target_configs();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].dest_dir().to_string_lossy(), r"D:\dest");
+    }
+
+    #[test]
+    fn test_config_builder_build_validates_invariants() {
+        // 0 debounce seconds must fail validation immediately under build()
+        let res = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .debounce_seconds(0)
+            .build();
+        assert!(res.is_err(), "Expected error for debounce_seconds == 0");
+
+        // try_build also fails
+        let res_try = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .debounce_seconds(0)
+            .try_build();
+        assert!(res_try.is_err(), "Expected error from try_build");
+
+        // build_unvalidated allows constructing for tests without panic
+        let unvalidated = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .debounce_seconds(0)
+            .build_unvalidated();
+        assert_eq!(unvalidated.debounce_seconds, 0);
+
+        // block_sync_threshold_bytes < block_size_bytes must fail
+        let res_order = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .block_size_bytes(1024 * 1024)
+            .block_sync_threshold_bytes(512 * 1024)
+            .build();
+        assert!(
+            res_order.is_err(),
+            "Expected error for threshold < block_size"
+        );
     }
 }

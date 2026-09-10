@@ -27,20 +27,6 @@ impl DirtyBlockRange {
     /// Create an empty dirty block range with pinned block size.
     ///
     /// # Arguments
-    ///
-    /// * `block_size` - Size in bytes of each discrete block.
-    ///
-    /// # Returns
-    ///
-    /// An empty [`DirtyBlockRange`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `block_size` is 0. For fallible creation, use [`try_new`](Self::try_new).
-    pub fn new(block_size: u64) -> Self {
-        Self::try_new(block_size).expect("block_size must be greater than zero")
-    }
-
     /// Create an empty dirty block range from a validated non-zero block size.
     ///
     /// # Arguments
@@ -50,13 +36,21 @@ impl DirtyBlockRange {
     /// # Returns
     ///
     /// An empty [`DirtyBlockRange`].
-    pub fn new_nonzero(block_size: NonZeroU64) -> Self {
+    pub fn new(block_size: NonZeroU64) -> Self {
         Self {
             start_block: 0,
             block_count: 0,
             block_size,
             data: Vec::new(),
         }
+    }
+
+    /// Create an empty dirty block range from a validated non-zero block size.
+    ///
+    /// Alias for [`new`](Self::new).
+    #[inline]
+    pub fn new_nonzero(block_size: NonZeroU64) -> Self {
+        Self::new(block_size)
     }
 
     /// Create an empty dirty block range, returning `SyncError::Validation` if `block_size` is 0.
@@ -76,7 +70,7 @@ impl DirtyBlockRange {
         let non_zero = NonZeroU64::new(block_size).ok_or_else(|| {
             SyncError::validation("DirtyBlockRange block_size must be greater than zero")
         })?;
-        Ok(Self::new_nonzero(non_zero))
+        Ok(Self::new(non_zero))
     }
 
     /// Return the starting block index of this contiguous range.
@@ -188,7 +182,11 @@ impl TryFrom<u64> for DirtyBlockRange {
 
 impl Default for DirtyBlockRange {
     fn default() -> Self {
-        Self::new(64 * 1024)
+        const DEFAULT_BLOCK_SIZE: NonZeroU64 = match NonZeroU64::new(64 * 1024) {
+            Some(v) => v,
+            None => unreachable!(),
+        };
+        Self::new(DEFAULT_BLOCK_SIZE)
     }
 }
 
@@ -444,6 +442,7 @@ mod tests {
             .block_sync_threshold_bytes(10)
             .block_size_bytes(4)
             .build()
+            .unwrap()
     }
 
     #[test]
@@ -459,7 +458,7 @@ mod tests {
     #[test]
     fn test_dirty_block_range_coalescing() {
         let mut cursor = std::io::Cursor::new(Vec::new());
-        let mut range = DirtyBlockRange::new(4);
+        let mut range = DirtyBlockRange::new(NonZeroU64::new(4).unwrap());
 
         // Add contiguous blocks: block 0 (4 bytes), block 1 (4 bytes)
         range.add_block(0, b"AAAA", &mut cursor).unwrap();
@@ -486,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_dirty_block_range_new_getters() {
-        let range = DirtyBlockRange::new(1024);
+        let range = DirtyBlockRange::new(NonZeroU64::new(1024).unwrap());
         assert_eq!(range.block_size(), 1024);
         assert_eq!(range.start_block(), 0);
         assert_eq!(range.end_block(), 0);
@@ -512,14 +511,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "block_size must be greater than zero")]
-    fn test_dirty_block_range_new_panics_on_zero() {
-        let _ = DirtyBlockRange::new(0);
+    fn test_dirty_block_range_try_new_rejects_zero() {
+        assert!(DirtyBlockRange::try_new(0).is_err());
     }
 
     #[test]
     fn test_dirty_block_range_buffer_reuse_preserves_capacity() {
-        let mut range = DirtyBlockRange::new(4);
+        let mut range = DirtyBlockRange::new(NonZeroU64::new(4).unwrap());
         let mut cursor = std::io::Cursor::new(Vec::new());
 
         range.add_block(0, b"AAAA", &mut cursor).unwrap();
@@ -552,7 +550,8 @@ mod tests {
             .dest_dir(dest.clone())
             .block_sync_threshold_bytes(4)
             .block_size_bytes(4)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, target_cfg);
@@ -618,7 +617,8 @@ mod tests {
         let config = Config::builder(src.clone())
             .dest_dir(dst.clone())
             .block_size_bytes(512)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
@@ -653,7 +653,8 @@ mod tests {
         let config = Config::builder(src.clone())
             .dest_dir(dst.clone())
             .block_size_bytes(512)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let src_file = src.join("large.bin");
         let dst_file = dst.join("large.bin");
@@ -716,7 +717,8 @@ mod tests {
             .dest_dir(dst.clone())
             .block_size_bytes(512)
             .verify_writes(true)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
@@ -750,7 +752,8 @@ mod tests {
         let config = Config::builder(src.clone())
             .dest_dir(dst.clone())
             .block_size_bytes(512)
-            .build();
+            .build()
+            .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
@@ -818,7 +821,7 @@ mod tests {
             }
         }
 
-        let mut range = DirtyBlockRange::new(512);
+        let mut range = DirtyBlockRange::new(NonZeroU64::new(512).unwrap());
         let mut cursor = std::io::Cursor::new(Vec::new());
         range.add_block(0, &[0xAA; 512], &mut cursor).unwrap();
         assert_eq!(range.block_count(), 1);
