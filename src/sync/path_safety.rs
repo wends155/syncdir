@@ -77,14 +77,20 @@ pub fn verify_destination_not_reparse_cached(
     rel_path: &Path,
     verified_dirs: &mut HashSet<PathBuf>,
 ) -> Result<Option<Metadata>, SyncError> {
-    if fs::symlink_metadata(dest_dir)
-        .map(|m| is_reparse_or_symlink_meta(&m))
-        .unwrap_or(false)
-    {
-        return Err(SyncError::validation(format!(
-            "Destination root '{}' is a symlink or reparse point; refusing to write",
-            dest_dir.display()
-        )));
+    if !verified_dirs.contains(dest_dir) {
+        if fs::symlink_metadata(dest_dir)
+            .map(|m| is_reparse_or_symlink_meta(&m))
+            .unwrap_or(false)
+        {
+            return Err(SyncError::validation(format!(
+                "Destination root '{}' is a symlink or reparse point; refusing to write",
+                dest_dir.display()
+            )));
+        }
+        if verified_dirs.len() >= 1000 {
+            verified_dirs.clear();
+        }
+        verified_dirs.insert(dest_dir.to_path_buf());
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
@@ -129,13 +135,19 @@ pub fn verify_destination_not_reparse_cached(
     rel_path: &Path,
     verified_dirs: &mut HashSet<PathBuf>,
 ) -> Result<Option<Metadata>, SyncError> {
-    if let Ok(m) = fs::symlink_metadata(dest_dir) {
-        if is_reparse_or_symlink_meta(&m) {
-            return Err(SyncError::validation(format!(
-                "Destination root '{}' is a symlink; refusing to write",
-                dest_dir.display()
-            )));
+    if !verified_dirs.contains(dest_dir) {
+        if let Ok(m) = fs::symlink_metadata(dest_dir) {
+            if is_reparse_or_symlink_meta(&m) {
+                return Err(SyncError::validation(format!(
+                    "Destination root '{}' is a symlink; refusing to write",
+                    dest_dir.display()
+                )));
+            }
         }
+        if verified_dirs.len() >= 1000 {
+            verified_dirs.clear();
+        }
+        verified_dirs.insert(dest_dir.to_path_buf());
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
@@ -348,6 +360,24 @@ mod tests {
         // Non-existent relative subpath with valid dest_dir
         let res = verify_destination_not_reparse(&dest_dir, Path::new("sub/file.txt"));
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_verify_destination_caches_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_dir = tmp.path().join("dest");
+        std::fs::create_dir(&dest_dir).unwrap();
+
+        let mut verified = HashSet::new();
+        let file_rel = Path::new("sub/file.txt");
+        assert!(!verified.contains(&dest_dir));
+
+        let res = verify_destination_not_reparse_cached(&dest_dir, file_rel, &mut verified);
+        assert!(res.is_ok());
+        assert!(
+            verified.contains(&dest_dir),
+            "Expected dest_dir to be cached in verified_dirs"
+        );
     }
 
     #[test]
