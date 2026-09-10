@@ -311,6 +311,32 @@ This file documents the chronological history, design decisions, and rules conte
 >   - SipHash-based `OnceLock<HashMap<EngineStatus, Icon>>` replaced by $O(1)$ array indexing.
 >   - Duplicated path and UNC label formatting across `TrayController` menu items eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Comprehensive Remediation of 29 Review Findings across Sync Engine, Worker Loop, Test Doubles, Scanner, and Path Safety
+> * **Changes:**
+>   - Remediated all 29 qualitative architectural findings from `review_report.md` across 26 steps and 6 sequential checkpoints (`480d3d1`, `d8c717e`, `183c70b`, `54b0364`, `a4b9954`, `677795a`).
+>   - **Delta Sync Integrity & Recovery**: `LocalSyncEngine::sync_delta_large_file_core` tracks `dirty_blocks_written` and invokes `self.db.delete_file` on in-place write or verification failure, invalidating stale SQLite block signatures. `DirtyBlockRange` resets internal buffers on seek/flush error. `VerificationMode::Full` coalesces contiguous readbacks up to 4MB.
+>   - **Non-Fatal Timestamp Updates**: Softened `dest_file.set_times()` failures in `sync_small_file_core` and `sync_delta_large_file_core` to `tracing::warn!` logs to prevent aborting verified byte copies on restrictive SMB shares.
+>   - **Reparse & Path Safety Hardening**: `verify_destination_not_reparse` and `verify_destination_not_reparse_cached` validate `dest_dir` root using `is_reparse_or_symlink_meta`. `verified_dirs` cache is bounded to 1,000 entries with FIFO eviction. `archive_dest_file_only` verifies `.syncdir_archive` root against reparse points. `is_safe_relative_path` normalizes Unicode superscripts (`¹`, `²`, `³`) and rejects Win32 wildcard characters (`*`, `?`, `<`, `>`, `|`, `"`).
+>   - **Hexagonal Test Doubles & DIP Decoupling**: Added default `is_destination_accessible` method to `NetworkResolver`; enhanced `MockNetworkResolver` with accessible toggles and Win32 error 53 (`ERROR_BAD_NETPATH`). Upgraded `MockHashStore` with `set_error_hook`, batch save counters, and lowercase keys for `COLLATE NOCASE` SQLite parity. Upgraded `MockStartupRegistry` with `set_injected_error`. Upgraded `MockSyncEngine` with `failed_calls` and `prune_archive_calls` tracking. Completely eliminated all 4 ad-hoc test doubles (`StubValidationFailEngine`, `BatchTrackingStore`, `FailingHashStore`, `TruncatingMockStore`).
+>   - **Worker Loop Decomposition & Offline Drainage**: Decomposed `start_sync_worker` loop into `SyncWorkerState` helper methods (`mark_needs_catchup_scan`, `clear_needs_catchup_scan`, `should_trigger_catchup_scan`). Offline guard halts queue draining during outages to prevent 1.8M allocations/hr churn. Permanent deletion failure after 10 retries triggers catchup scan on reconnect. Removed extraneous `path.clone()` calls.
+>   - **Daemon & Scanner Hygiene**: `DaemonTrayHandler` holds injected `NetworkResolver` and revalidates target loops on config reload. Scanner deletion phase terminates early on `is_network_offline()`. Scanner uses zero-allocation borrowed `&str` lookups (`cached_lookup`). Archive pruning errors are logged. Removed dead `sync_file_buffered` trait method. Enriched `SyncEngine` and `SyncStatusObserver` with `# Examples` and `# Errors` doc comments.
+>   - Verified across full test suite: 263 passed (213 unit, 3 main, 12 integration, 8 property, 20 snapshot, 7 doctests), 0 failed, 1 ignored. Clean formatting and clippy (`-D warnings`).
+> * **New Constraints:**
+>   - Delta synchronization write or verification failures MUST delete the file signature from `HashStore` to force full transfer on next pass.
+>   - `DirtyBlockRange` MUST invoke `self.reset()` upon seek or write error before returning.
+>   - All reachability checks in worker and daemon MUST query `NetworkResolver::is_destination_accessible` rather than calling `std::fs::metadata` directly on host OS paths.
+>   - Ad-hoc test doubles in test modules are prohibited; use canonical mocks (`MockHashStore`, `MockSyncEngine`, `MockNetworkResolver`, `MockStartupRegistry`).
+>   - `is_safe_relative_path` MUST reject Win32 wildcards and normalize Unicode superscripts before DOS reserved name evaluation.
+> * **Pruned:**
+>   - All 4 ad-hoc test doubles (`StubValidationFailEngine`, `BatchTrackingStore`, `FailingHashStore`, `TruncatingMockStore`) deleted.
+>   - Dead `sync_file_buffered` method deleted from `SyncEngine`.
+>   - Stale SQLite signature retention on in-place delta sync failure eliminated.
+>   - Worker offline queue churning (1.8M heap allocations/hr) eliminated.
+
+
 
 
 
