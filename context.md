@@ -458,6 +458,28 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Stale panicking `DirtyBlockRange::new` contract and outdated `ConfigBuilder::build` signature in `spec.md` removed.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Qualitative Code Review Remediations (Archive Junction Guard, Truncated Destination File Repair, Two-Phase Locking, SyncWorkerRunner State Machine Extraction, Watcher Buffer Overflow Recovery, Error Classification, Reparse Cache Invalidation)
+> * **Changes:**
+>   - **`src/sync/archive.rs`**: `prune_archive` verifies that `archive_dir` is not an NTFS junction/reparse point or symlink before traversal via `fs::symlink_metadata`, returning `Err(SyncError::Validation)` to guard against arbitrary file deletions outside backup root. Evicts parent from `verified_dirs` on file deletion in `delete_file_from_dest`.
+>   - **`src/sync/engine.rs`**: `sync_file_to_dest_core` verifies destination file size (`dest_size == src_size`) and modification timestamp (`abs_diff <= 2000`ms) against source metadata, actively repairing truncated/corrupted target files instead of skipping. Implemented two-phase locking in `verify_destination_cached` to drop mutex lock across remote SMB `symlink_metadata` calls. Added `invalidate_verified_dirs` to `trait SyncEngine` and prefix eviction `evict_verified_dir` on `LocalSyncEngine`.
+>   - **`src/sync/worker.rs`**: Extracted discrete, testable `SyncWorkerRunner<E>` state machine with `handle_command` and `tick(now: Instant)` methods, enabling deterministic zero-sleep unit testing of queues, reachability, and retries. Preserved `start_sync_worker` public signature.
+>   - **`src/monitor.rs`**: `DirectoryWatcher::handle_watcher_result` detects notify errors (including `ReadDirectoryChangesW` buffer overflow) and automatically dispatches `SyncCommand::TriggerFullScan` to prevent permanently dropped filesystem events.
+>   - **`src/error.rs`**: Added `SyncError::is_permanent_validation_failure` and constructors `validation_security` / `validation_invariant` to prevent retry exhaustion on fatal security violations while preserving backoff retries for transient failures. Retained exact `SyncError::Validation(String)` representation for snapshot compatibility.
+>   - **Test Suite**: Added 7 new unit tests across co-located modules; test suite expanded to 286 passing tests (235 unit + 3 bin + 12 integration + 8 property + 20 snapshot + 8 doc-tests) with zero warnings and clean formatting.
+> * **New Constraints:**
+>   - `prune_archive` must never traverse reparse or junction root directories.
+>   - Fast-path destination skip checks must compare destination size and timestamp against source.
+>   - Cache mutex locks must not be held across network/SMB filesystem calls.
+>   - Permanent validation errors must be classified via `is_permanent_validation_failure` to prevent worker retry lockups.
+> * **Pruned:**
+>   - Monolithic untested thread loop in `start_sync_worker` replaced by `SyncWorkerRunner`.
+>   - Unchecked destination file size skip bug eliminated.
+>   - Reparse point cache stale substitution window eliminated.
+
+
 
 
 
