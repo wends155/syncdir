@@ -1195,7 +1195,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
         .name(format!("sync-worker-{}", target_index))
         .spawn(move || {
             let mut runner = SyncWorkerRunner::new(context);
-            loop {
+            'worker: loop {
                 if runner
                     .context
                     .cancellation
@@ -1205,13 +1205,13 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                         target_index = target_index + 1,
                         "Sync worker shutting down via cancellation signal."
                     );
-                    break;
+                    break 'worker;
                 }
 
                 let now = Instant::now();
                 match runner.tick(now) {
                     Ok(WorkerTickOutcome::Continue) => {}
-                    Ok(WorkerTickOutcome::ShutdownRequested) => break,
+                    Ok(WorkerTickOutcome::ShutdownRequested) => break 'worker,
                     Err(e) => {
                         tracing::error!(error = %e, "Sync worker tick error");
                     }
@@ -1229,17 +1229,21 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                                 target_index = target_index + 1,
                                 "Sync worker shutting down via command."
                             );
-                            break;
+                            break 'worker;
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'worker,
                 }
 
                 // Drain any additional queued commands non-blocking
                 while let Ok(cmd) = runner.context.rx.try_recv() {
                     if !runner.handle_command(cmd) {
-                        break;
+                        tracing::info!(
+                            target_index = target_index + 1,
+                            "Sync worker shutting down via drained command."
+                        );
+                        break 'worker;
                     }
                 }
             }
@@ -2042,5 +2046,51 @@ mod tests {
             ctx3.cancellation()
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn test_worker_shutdown_drained_from_try_recv() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target_cfg = TargetSyncConfig::builder(src, dst).build().unwrap();
+        let engine = MockSyncEngine::new();
+        let scan_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = scan_count.clone();
+        engine.set_sync_error(move || {
+            let count = sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count >= 1 {
+                SyncError::Cancelled
+            } else {
+                SyncError::Io(std::io::Error::other("transient"))
+            }
+        });
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let ctx = SyncWorkerContext::new(0, target_cfg, engine, rx, None, source_online);
+        tx.send(SyncCommand::FileModified(PathBuf::from("first.txt")))
+            .unwrap();
+        tx.send(SyncCommand::TriggerFullScan).unwrap();
+
+        let handle = start_sync_worker(ctx).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join_thread = std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+
+        // The worker should terminate immediately upon processing TriggerFullScan in try_recv.
+        // If the drain loop break only exits `while let` instead of the outer worker loop,
+        // it hangs waiting for the next recv_timeout / debounce interval.
+        let res = done_rx.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(
+            res.is_ok(),
+            "Worker thread failed to terminate after draining Shutdown/Cancelled command"
+        );
+        let _ = join_thread.join();
     }
 }
