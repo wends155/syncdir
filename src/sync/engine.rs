@@ -108,7 +108,25 @@ impl From<WatcherState> for bool {
 }
 
 /// Observer for sync worker status changes. Decouples sync from UI.
+///
+/// Implementors can register to receive asynchronous notifications about target connectivity,
+/// source watcher status, and permanent write verification failures.
+///
+/// # Examples
+///
+/// ```
+/// use syncdir::sync::engine::{SyncStatusObserver, ConnectivityState, WatcherState};
+/// use std::path::Path;
+///
+/// struct MyObserver;
+/// impl SyncStatusObserver for MyObserver {
+///     fn on_target_status_change(&self, target_index: usize, state: ConnectivityState) {
+///         println!("Target {} is {:?}", target_index, state);
+///     }
+/// }
+/// ```
 pub trait SyncStatusObserver: Send + Sync + 'static {
+    /// Notification when target connectivity changes.
     fn on_target_status_change(&self, target_index: usize, state: ConnectivityState);
     /// Forward source directory connectivity and watcher active status to observers.
     fn on_watcher_status_change(&self, _source: ConnectivityState, _watcher: WatcherState) {}
@@ -117,36 +135,64 @@ pub trait SyncStatusObserver: Send + Sync + 'static {
 }
 
 /// Core sync execution contract. Implemented by the delta sync engine.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use syncdir::sync::engine::SyncEngine;
+/// use syncdir::sync::mock::MockSyncEngine;
+/// use std::path::Path;
+///
+/// let engine = MockSyncEngine::new();
+/// let _ = engine.sync_file(Path::new("document.txt"));
+/// ```
 pub trait SyncEngine: Send + Sync {
-    /// Synchronize a single file with a reusable scratch buffer.
-    fn sync_file_buffered(&self, path: &Path, scratch: &mut [u8]) -> Result<(), SyncError>;
-
     /// Synchronize a single file from source to destination.
-    fn sync_file(&self, path: &Path) -> Result<(), SyncError> {
-        let mut scratch = vec![0u8; 64 * 1024];
-        self.sync_file_buffered(path, &mut scratch)
-    }
+    ///
+    /// # Errors
+    /// Returns `SyncError::Io` on filesystem errors, `SyncError::Db` on database persistence failures,
+    /// or `SyncError::WriteVerificationFailed` if written content does not match source Blake3 hashes.
+    fn sync_file(&self, path: &Path) -> Result<(), SyncError>;
 
     /// Synchronize a file to a specific destination directory with a reusable scratch buffer.
     ///
     /// Required method: implementors must handle the `dest_dir` parameter.
+    ///
+    /// # Errors
+    /// Returns `SyncError` if reading source, streaming delta, verifying writes, or saving metadata fails.
     fn sync_file_to_dest_buffered(
         &self,
         path: &Path,
         dest_dir: &Path,
         scratch: &mut [u8],
     ) -> Result<(), SyncError>;
+
     /// Handle deletion of a file (archive on destination).
+    ///
+    /// # Errors
+    /// Returns `SyncError` if moving the deleted file to archive fails.
     fn delete_file(&self, path: &Path) -> Result<(), SyncError>;
+
     /// Handle deletion of a file on a specific destination directory.
     ///
     /// Required method: implementors must handle the `dest_dir` parameter.
+    ///
+    /// # Errors
+    /// Returns `SyncError` if moving the deleted file to archive fails.
     fn delete_file_from_dest(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError>;
+
     /// Prune archive directory on the destination.
+    ///
+    /// # Errors
+    /// Returns `SyncError` if walking or deleting old archive files fails.
     fn prune_archive(&self, _dest_dir: &Path) -> Result<(), SyncError> {
         Ok(())
     }
+
     /// Run a full scan and sync cycle that can be interrupted by the `cancel` signal.
+    ///
+    /// # Errors
+    /// Returns `SyncError::Cancelled` if cancelled, or `SyncError` on scanning/sync failures.
     fn run_cancellable_full_scan(
         &self,
         dest_dir: &Path,
@@ -157,6 +203,9 @@ pub trait SyncEngine: Send + Sync {
     }
 
     /// Perform a full directory scan on `dest_dir` and sync all changed files.
+    ///
+    /// # Errors
+    /// Returns `SyncError` on directory traversal or synchronization failure.
     fn run_full_scan(&self, dest_dir: &Path) -> Result<ScanOutcome, SyncError> {
         static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
@@ -187,27 +236,37 @@ impl FileMetadataSnapshot {
             modified_epoch_millis: safe_modified_millis(meta)?,
         })
     }
+
+    /// Check if destination metadata matches source snapshot and optional DB record.
+    #[must_use]
+    pub fn is_up_to_date(
+        &self,
+        dest: &FileMetadataSnapshot,
+        record: Option<&crate::db::FileRecord>,
+    ) -> bool {
+        if let Some(record) = record
+            && record.file_size == self.size
+            && record.last_modified == self.modified_epoch_millis
+            && dest.size == self.size
+            && dest
+                .modified_epoch_millis
+                .abs_diff(self.modified_epoch_millis)
+                <= 2000
+        {
+            return true;
+        }
+        false
+    }
 }
 
-/// Raw metadata evaluation for testing and invariant assertion.
+/// Raw metadata evaluation for testing and backward compatibility.
 #[doc(hidden)]
 pub fn is_metadata_up_to_date_raw(
     dest: &FileMetadataSnapshot,
     src: &FileMetadataSnapshot,
     record: Option<&crate::db::FileRecord>,
 ) -> bool {
-    if let Some(record) = record
-        && record.file_size == src.size
-        && record.last_modified == src.modified_epoch_millis
-        && dest.size == src.size
-        && dest
-            .modified_epoch_millis
-            .abs_diff(src.modified_epoch_millis)
-            <= 2000
-    {
-        return true;
-    }
-    false
+    src.is_up_to_date(dest, record)
 }
 
 /// Delta sync engine backed by a `HashStore` for signature caching.
@@ -415,11 +474,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
 impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     fn sync_file(&self, path: &Path) -> Result<(), SyncError> {
-        self.sync_file_to_dest(path, self.config.dest_dir())
-    }
-
-    fn sync_file_buffered(&self, path: &Path, scratch: &mut [u8]) -> Result<(), SyncError> {
-        self.sync_file_to_dest_buffered(path, self.config.dest_dir(), scratch)
+        let dest = self
+            .resolved_dest
+            .as_deref()
+            .unwrap_or_else(|| self.config.dest_dir());
+        self.sync_file_to_dest(path, dest)
     }
 
     fn sync_file_to_dest_buffered(
@@ -432,7 +491,11 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     }
 
     fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
-        self.delete_file_from_dest(path, self.config.dest_dir())
+        let dest = self
+            .resolved_dest
+            .as_deref()
+            .unwrap_or_else(|| self.config.dest_dir());
+        self.delete_file_from_dest(path, dest)
     }
 
     fn delete_file_from_dest(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError> {

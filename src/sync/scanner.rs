@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,6 +166,10 @@ impl<S: HashStore> LocalSyncEngine<S> {
         )?;
 
         let cached_records = self.db.list_all_records()?;
+        let cached_lookup: HashMap<PathBuf, &FileRecord> = cached_records
+            .values()
+            .map(|rec| (crate::path_util::normalize_path(&rec.relative_path), rec))
+            .collect();
 
         // Sync all source files
         let mut synced_count = 0usize;
@@ -178,12 +182,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 self.flush_record_batch(&mut batch)?;
                 return Err(SyncError::Cancelled);
             }
-            let normalized_key = PathBuf::from(rel_path.to_string_lossy().replace('\\', "/"));
             match self.sync_file_to_dest_core(
                 rel_path,
                 &active_dest,
                 &mut scratch,
-                cached_records.get(&normalized_key),
+                cached_lookup.get(rel_path).copied(),
             ) {
                 Ok(Some((record, hashes))) => {
                     synced_count += 1;
@@ -280,6 +283,17 @@ impl<S: HashStore> LocalSyncEngine<S> {
                                 SyncError::Io(io_err) => io_err.raw_os_error(),
                                 _ => None,
                             };
+                            if e.is_network_offline() {
+                                tracing::warn!(
+                                    path = %tracked_path.display(),
+                                    target = %active_dest.display(),
+                                    error = %e,
+                                    os_error = ?os_code,
+                                    "Target unreachable during deletion phase of full scan, aborting deletion pass"
+                                );
+                                delete_skip_count += 1;
+                                break;
+                            }
                             tracing::warn!(
                                 path = %tracked_path.display(),
                                 target = %active_dest.display(),
@@ -306,7 +320,13 @@ impl<S: HashStore> LocalSyncEngine<S> {
             }
         }
 
-        let _ = self.prune_destination_archive(&active_dest);
+        if let Err(e) = self.prune_destination_archive(&active_dest) {
+            tracing::warn!(
+                target = %active_dest.display(),
+                error = %e,
+                "Failed to prune destination archive after full scan"
+            );
+        }
 
         if failed_count > 0 || delete_skip_count > 0 {
             Ok(ScanOutcome::PartialFailure {

@@ -836,11 +836,6 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(SyncError::validation("Permanent validation failure"))
         }
-        fn sync_file_buffered(&self, _path: &Path, _scratch: &mut [u8]) -> Result<(), SyncError> {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(SyncError::validation("Permanent validation failure"))
-        }
         fn delete_file(&self, _path: &Path) -> Result<(), SyncError> {
             self.call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

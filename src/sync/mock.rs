@@ -122,10 +122,6 @@ impl SyncEngine for MockSyncEngine {
         self.sync_file_to_dest_buffered(path, Path::new(""), &mut [])
     }
 
-    fn sync_file_buffered(&self, path: &Path, scratch: &mut [u8]) -> Result<(), SyncError> {
-        self.sync_file_to_dest_buffered(path, Path::new(""), scratch)
-    }
-
     fn sync_file_to_dest_buffered(
         &self,
         path: &Path,
