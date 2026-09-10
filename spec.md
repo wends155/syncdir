@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 7316ffc
+> Last verified against: 96f1765
  
 | Field | Value |
 |-------|-------|
@@ -14,7 +14,7 @@
 
 ### 1. Config Module
  
-> Handles configuration file loading, path sanitization, and invariant validation.
+> Handles configuration file loading, path sanitization, domain type modeling, and invariant validation. Decomposed into `src/config/{mod, target, validation, raw, builder, tests}.rs`.
  
 #### Public API
  
@@ -24,7 +24,7 @@
 | `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid parameters, relative paths, or missing destination directories) |
 | `Config::source_dir` | `(&self) -> &Path` | `&Path` | — (primary non-blocking getter) |
 | `Config::resolved_source_dir` | `(&self) -> &Path` | `&Path` | — (deprecated in favor of `source_dir`) |
-| `Config::destinations` | `(&self) -> &DestinationCollection` | `&DestinationCollection` | — |
+| `Config::destinations` | `(&self) -> &[TargetDir]` | `&[TargetDir]` | — (zero-copy canonical destination slice) |
 | `Config::resolved_dest_dirs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `Config::target_configs` | `(&self) -> Vec<TargetSyncConfig>` | `Vec<TargetSyncConfig>` | — |
 | `Config::builder` | `(source_dir: impl Into<PathBuf>) -> ConfigBuilder` | `ConfigBuilder` | — |
@@ -39,20 +39,20 @@
 | `TargetDir::validate` | `(&self, role: &str) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid drive or UNC syntax) |
 | `TargetDir::as_path` | `(&self) -> &Path` | `&Path` | — |
 | `TargetDir::to_path_buf` | `(&self) -> PathBuf` | `PathBuf` | — |
-| `DestinationCollection::new` | `(destinations: impl IntoIterator<Item = TargetDir>) -> Self` | `DestinationCollection` | — (case-insensitive dedup) |
+| `DestinationCollection::new` | `(destinations: impl IntoIterator<Item = TargetDir>) -> Self` | `DestinationCollection` | — (case-insensitive dedup preserving order) |
 | `DestinationCollection::iter` | `(&self) -> impl Iterator<Item = &TargetDir>` | `Iterator` | — |
 | `DestinationCollection::len` | `(&self) -> usize` | `usize` | — |
 | `DestinationCollection::is_empty` | `(&self) -> bool` | `bool` | — |
-| `DestinationCollection::get` | `(&self, idx: usize) -> Option<&TargetDir>` | `Option<&TargetDir>` | — |
+| `DestinationCollection::as_slice` | `(&self) -> &[TargetDir]` | `&[TargetDir]` | — |
 | `DestinationCollection::to_path_bufs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `TargetSyncConfig::from_config` | `(config: &Config, dest_dir: impl Into<TargetDir>) -> Result<Self, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` (validates invariants via builder) |
 | `TargetSyncConfig::builder` | `(source_dir: impl Into<PathBuf>, dest_dir: impl Into<PathBuf>) -> TargetSyncConfigBuilder` | `TargetSyncConfigBuilder` | — |
 | `TargetSyncConfig::block_size_nonzero` | `(&self) -> std::num::NonZeroU64` | `NonZeroU64` | — (safely defaults to 64KB on zero) |
+| `TargetSyncConfig::with_verify_writes` | `(mut self, verify_writes: bool) -> Self` | `Self` | — (mutation helper for test fixtures) |
 | `TargetSyncConfigBuilder::build` | `(self) -> Result<TargetSyncConfig, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` |
 | `StoreConfig::try_from` | `(config: &Config) -> Result<StoreConfig, SyncError>` | `StoreConfig` | `SyncError::Validation` |
+| `StoreConfig::try_from` | `(target_config: &TargetSyncConfig) -> Result<StoreConfig, SyncError>` | `StoreConfig` | `SyncError::Validation` |
 | `preprocess_config_toml` | `(raw_toml: &str) -> String` | `String` | — (preserves multi-line arrays and quotes) |
-| `system_root` | `() -> PathBuf` | `PathBuf` | — (re-exported from `path_util`) |
-| `is_same_or_descendant` | `(base: &Path, target: &Path) -> bool` | `bool` | — (re-exported from `path_util`) |
 
 #### Behavioral Scenarios
 
@@ -212,9 +212,14 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `SyncWorkerRunner::new` | `(context: SyncWorkerContext<E>) -> Self` | `SyncWorkerRunner<E>` | — (discrete, testable worker state machine with `pub(crate)` fields) |
 | `SyncWorkerRunner::handle_command` | `(&mut self, cmd: SyncCommand) -> bool` | `bool` | — (false indicates shutdown requested) |
 | `SyncWorkerRunner::tick` | `(&mut self, now: Instant) -> Result<WorkerTickOutcome, SyncError>` | `WorkerTickOutcome` | `SyncError` |
-| `SyncWorkerContext::new` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>, resolver: Arc<dyn NetworkResolver>) -> Self` | `SyncWorkerContext<E>` | — |
-| `SyncWorkerContext::for_test` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>) -> Self` | `SyncWorkerContext<E>` | — |
-| `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — (composes 4 collaborating transfer/scan engines) |
+| `SyncWorkerContext::builder` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, source_conn: impl Into<SourceConnectivityTracker>) -> SyncWorkerContextBuilder<E>` | `SyncWorkerContextBuilder<E>` | — (entrypoint for builder construction) |
+| `SyncWorkerContext::new` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>) -> Self` | `SyncWorkerContext<E>` | — (direct constructor with default Win32 resolver) |
+| `SyncWorkerContext::with_resolver` | `(mut self, resolver: Arc<dyn NetworkResolver>) -> Self` | `Self` | — (fluent setter) |
+| `SyncWorkerContext::with_cancellation` | `(mut self, cancellation: Arc<AtomicBool>) -> Self` | `Self` | — (fluent setter) |
+| `SyncWorkerContext::with_max_pending_queue` | `(mut self, max: usize) -> Self` | `Self` | — (fluent setter) |
+| `SyncWorkerContextBuilder::new` | `(...) -> Self` | `SyncWorkerContextBuilder<E>` | — |
+| `SyncWorkerContextBuilder::build` | `(self) -> Result<SyncWorkerContext<E>, SyncError>` | `SyncWorkerContext<E>` | `SyncError::Validation` (requires `max_pending_queue > 0`) |
+| `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — (composes 4 collaborating transfer/scan engines; fields private) |
 | `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (pub(crate) reusable scratch buffer lease for zero-lock streaming) |
 | `LocalSyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (clears reparse cache) |
 | `LocalSyncEngine::evict_verified_dir` | `(&self, dir: &Path)` | `()` | — (evicts dir and descendants from cache) |
@@ -227,16 +232,10 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` (if `block_size == 0`) |
 | `DirtyBlockRange::block_size_nonzero` | `(&self) -> NonZeroU64` | `NonZeroU64` | — |
 | `FileMetadataSnapshot::from` | `(record: &FileRecord) -> Self` | `FileMetadataSnapshot` | — (converts database record to metadata snapshot) |
-| `MockSyncEngine::new` | `() -> Self` | `MockSyncEngine` | — |
+| `MockSyncEngine::new` | `() -> Self` | `MockSyncEngine` | — (zero-panic mutex locking with `unwrap_or_else`) |
 | `SourceConnectivityTracker::new` | `(initial: bool) -> Self` | `SourceConnectivityTracker` | — |
-| `DebounceQueue::new` | `(max_capacity: usize) -> Self` | `DebounceQueue` | — (pub(crate) internal debounce queue) |
-| `DebounceQueue::len` | `(&self) -> usize` | `usize` | — (pub(crate) total count of pending syncs and deletes) |
-| `ReachabilityMonitor::new` | `(target_index: usize, configured_dest: PathBuf, retry_interval_seconds: u64, resolver: Arc<dyn NetworkResolver>) -> Self` | `ReachabilityMonitor` | — (pub(crate) internal reachability monitor) |
-| `SyncWorkerState::new` | `(block_size_bytes: u64) -> Self` | `SyncWorkerState` | — |
-| `calculate_exponential_backoff` | `(attempts: u32, base_interval: Duration) -> Duration` | `Duration` | pub(crate) capped at 300s |
 | `is_metadata_up_to_date_raw` | `(record_mod: i64, record_size: i64, src_mod: i64, src_size: i64, dest_mod: i64, dest_size: i64) -> bool` | `bool` | Evaluates SMB ±2000ms timestamp tolerance |
 | `verify_destination_not_reparse` | `(dest_dir: &Path, rel_path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (rejects directory junctions in path) |
-| `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, verified_dirs: &mut HashSet<PathBuf>) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | `SyncError::Validation` (pub(crate) caches verified ancestor and root directories) |
 | `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | — (rejects `..`, ADS, drive letters, reserved names) |
  
 #### Behavioral Scenarios
@@ -384,7 +383,6 @@ THEN operations are executed against the active resolved UNC share path
 | Function | Signature | Returns | Errors |
 |----------|-----------|---------|--------|
 | `DirectoryWatcher::start` | `(source_path: impl AsRef<Path>, tx: Sender<SyncCommand>) -> Result<DirectoryWatcher, SyncError>` | `DirectoryWatcher` | `SyncError::Watcher` (failed to set up watcher) |
-| `DirectoryWatcher::handle_watcher_result` | `(res: Result<Event, notify::Error>, source_root: &Path, tx: &Sender<SyncCommand>)` | `()` | — (dispatches events or recovery scan) |
 
 #### Behavioral Scenarios
 
@@ -398,16 +396,15 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 
 ### 7. Tray Module
 
-> Manages the system tray icon, tooltips, checkable context menus, and event notifications.
+> Manages the system tray icon, tooltips, checkable context menus, and event notifications. All windowing types (`winit`, `UserEvent`) are encapsulated behind `TrayEventLoop`.
 
 #### Public API
 
 | Function / Component | Signature | Returns | Errors |
 |----------------------|-----------|---------|--------|
-| `run_tray` | `<H: TrayActionHandler + ?Sized>(event_loop: EventLoop<UserEvent>, action_handler: Arc<H>, dests: Vec<DestinationState>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
+| `TrayEventLoop::new` | `() -> Result<Self, SyncError>` | `TrayEventLoop` | `SyncError::Tray` (event loop initialization failure) |
+| `TrayEventLoop::run` | `<H: TrayActionHandler + ?Sized>(self, destinations: Vec<DestinationState>, handler: Arc<H>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
 | `TrayEventLoop::status_observer` | `(&self) -> Arc<dyn SyncStatusObserver>` | `Arc<dyn SyncStatusObserver>` | Encapsulates `winit` event loop proxy |
-| `open_path` | `(path: &Path) -> Result<(), SyncError>` | `()` | Delegates to `path_util::open_path` |
-| `TrayController::new` | `(...) -> Result<Self, SyncError>` | `TrayController<H>` | `SyncError::Tray` (pub(crate)) |
 | `DestinationState::new` | `(path: impl Into<PathBuf>, is_online: impl Into<ConnectivityState>) -> Self` | `DestinationState` | — |
 | `DestinationState::with_resolved_unc` | `(mut self, resolved_unc: impl Into<Option<PathBuf>>) -> Self` | `DestinationState` | — |
 | `TrayState::new` | `(initial_dest_online: Vec<ConnectivityState>) -> Self` | `TrayState` | — |
@@ -422,7 +419,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 
 ### 8. Daemon Module (SyncDaemon)
 
-> Coordinates daemon lifecycle, worker thread spawning, watcher event loops, loop detection, and clean shutdown.
+> Coordinates daemon lifecycle, worker thread spawning, watcher event loops, loop detection, and clean shutdown. Decoupled from `tray` and `startup`.
 
 #### Public API
 
@@ -433,14 +430,16 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `SyncDaemon::validate_target_loops` | `(config: &Config, resolver: &dyn NetworkResolver) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (non-blocking loop detection using `try_resolve_unc_path`) |
 | `SyncDaemon::command_tx` | `(&self) -> Sender<SyncCommand>` | `Sender<SyncCommand>` | — |
 | `SyncDaemon::config` | `(&self) -> &Config` | `&Config` | — |
+| `SyncDaemon::handle` | `(&self) -> DaemonHandle` | `DaemonHandle` | — |
 | `SyncDaemon::shutdown` | `(mut self)` | `()` | — |
-| `DaemonTrayHandler::new` | `(config_path: PathBuf, command_tx: Sender<SyncCommand>, registry: R) -> Self` | `DaemonTrayHandler` | — |
+| `DaemonHandle::new` | `(command_tx: Sender<SyncCommand>) -> Self` | `DaemonHandle` | — |
+| `DaemonHandle::trigger_full_scan` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Tray` |
 
 ---
 
 ### 9. Net Module (Networking FFI)
 
-> Manages Win32 UNC and SMB connection resolution, mapped drive lookup, and alternate path fallbacks.
+> Manages Win32 UNC and SMB connection resolution, mapped drive lookup, and alternate path fallbacks. All low-level Win32 FFI helpers are encapsulated as private functions behind the `NetworkResolver` trait.
 
 #### Public API
 
@@ -449,11 +448,6 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `trait NetworkResolver` | `Send + Sync` | — | Abstraction for network resolution and SMB sessions |
 | `Win32NetworkResolver` | `struct` | `Win32NetworkResolver` | Production Win32 implementation |
 | `MockNetworkResolver::new` | `() -> Self` | `MockNetworkResolver` | In-memory mock for testing |
-| `resolve_mapped_drive_unc` | `(drive_prefix: &str) -> Option<String>` | `Option<String>` | Uses stack-allocated FFI buffers (pub(crate)) |
-| `try_resolve_unc_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | — (pub(crate)) |
-| `establish_smb_connection` | `(unc_path: impl AsRef<Path>) -> Result<(), SyncError>` | `()` | `SyncError::Validation`, `SyncError::Io` (pub(crate)) |
-| `find_mapped_drive_for_unc` | `(unc_path: impl AsRef<Path>) -> Option<PathBuf>` | `Option<PathBuf>` | — (pub(crate)) |
-| `try_resolve_alternate_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | — (pub(crate)) |
 
 ---
 

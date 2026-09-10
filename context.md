@@ -616,4 +616,20 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Unchecked `.pop().unwrap()` in debounce queue drainage eliminated.
 >   - Lock contention and cache poisoning risks in destination verification eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Documentation & Architecture Synchronization (`/update-doc` & `/architecture`)
+> * **Changes:**
+>   - **Architecture Documentation Sync (`architecture.md`)**: Updated Project Layout (§4) to document the `src/config/` submodule structure (`mod.rs`, `builder.rs`, `raw.rs`, `target.rs`, `validation.rs`, `tests.rs`) and decomposed sync transfer components. Synchronized Module Boundaries (§5) for `config`, `daemon`, `tray`, `sync`, `net`, `db`, and `monitor`. Updated Known Constraints & Technical Debt (§14) confirming full resolution of all 17 review findings from `review_report.md`.
+>   - **Behavioral Specification Sync (`spec.md`)**: Bumped verification commit baseline to `96f1765`. Updated public API contracts across all 10 modules: documented `Config::destinations` slice accessor, `TargetSyncConfigBuilder`, `StoreConfig` bridges, `SyncWorkerContextBuilder`, private `LocalSyncEngine` fields, `TrayEventLoop` windowing encapsulation, `DaemonHandle`, and private internal helpers in `net.rs` and `monitor.rs`. Verified 100% semantic alignment between `Cargo.toml`, `lib.rs`, and `README.md`.
+>   - **Verification Gate**: Passed all quality checks (`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --all-features`) with 302 passing tests and zero regressions.
+> * **New Constraints:**
+>   - Documentation updates must preserve the verified commit hash link in `spec.md`.
+>   - Module contracts in `spec.md` and boundary definitions in `architecture.md` must accurately reflect internal encapsulation and public API surfaces.
+> * **Pruned:**
+>   - Stale references to monolithic `src/config.rs` eliminated.
+>   - Obsolete `daemon -> tray` references and dead `open_path` signatures eliminated.
+
+
 
