@@ -4,7 +4,9 @@ expression: "format!(\"{:#?}\", target_config)"
 ---
 Ok(
     TargetSyncConfig {
-        source_dir: "C:\\source",
+        source_dir: TargetDir(
+            "C:\\source",
+        ),
         dest_dir: TargetDir(
             "D:\\backup",
         ),

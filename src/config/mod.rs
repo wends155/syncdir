@@ -32,7 +32,7 @@ pub const DEFAULT_BLOCK_SIZE: std::num::NonZeroU64 = match std::num::NonZeroU64:
 /// Isolated target sync configuration for a specific destination directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSyncConfig {
-    source_dir: PathBuf,
+    source_dir: TargetDir,
     dest_dir: TargetDir,
     block_size_bytes: u64,
     block_sync_threshold_bytes: u64,
@@ -55,7 +55,7 @@ impl TargetSyncConfig {
     ///
     /// A configured [`TargetSyncConfigBuilder`] instance with default sync options.
     pub fn builder(
-        source_dir: impl Into<PathBuf>,
+        source_dir: impl Into<TargetDir>,
         dest_dir: impl Into<TargetDir>,
     ) -> TargetSyncConfigBuilder {
         TargetSyncConfigBuilder::new(source_dir, dest_dir)
@@ -80,7 +80,7 @@ impl TargetSyncConfig {
     /// Returns [`SyncError::Validation`] if parameters, timeouts, block sizes, or paths fail validation,
     /// or if the destination directory is identical to or nested within the source directory.
     pub fn new(
-        source_dir: impl Into<PathBuf>,
+        source_dir: impl Into<TargetDir>,
         dest_dir: impl Into<TargetDir>,
     ) -> Result<Self, SyncError> {
         Self::builder(source_dir, dest_dir).build()
@@ -106,6 +106,11 @@ impl TargetSyncConfig {
 
     /// Source directory getter.
     pub fn source_dir(&self) -> &Path {
+        self.source_dir.as_path()
+    }
+
+    /// Source target dir getter.
+    pub fn source_target_dir(&self) -> &TargetDir {
         &self.source_dir
     }
 
@@ -193,8 +198,8 @@ impl TargetSyncConfig {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_raw_parts(
-        source_dir: PathBuf,
-        dest_dir: TargetDir,
+        source_dir: impl Into<TargetDir>,
+        dest_dir: impl Into<TargetDir>,
         block_size_bytes: u64,
         block_sync_threshold_bytes: u64,
         verify_writes: bool,
@@ -204,8 +209,8 @@ impl TargetSyncConfig {
         propagate_deletions: bool,
     ) -> Self {
         Self {
-            source_dir,
-            dest_dir,
+            source_dir: source_dir.into(),
+            dest_dir: dest_dir.into(),
             block_size_bytes,
             block_sync_threshold_bytes,
             verify_writes,

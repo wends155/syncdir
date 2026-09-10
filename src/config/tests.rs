@@ -1166,3 +1166,18 @@ fn test_target_sync_config_block_size_nonzero_panic_free_fallback() {
     );
     assert_eq!(target_zero.block_size_nonzero(), DEFAULT_BLOCK_SIZE);
 }
+
+#[test]
+fn test_target_sync_config_source_dir_target_dir() {
+    use crate::config::TargetSyncConfig;
+    use crate::config::target::TargetDir;
+    let td = TargetDir::new("C:\\Users\\Data");
+    let config = TargetSyncConfig::builder(td.clone(), "D:\\Backup")
+        .build()
+        .expect("build");
+    assert_eq!(config.source_dir(), std::path::Path::new("C:\\Users\\Data"));
+    assert_eq!(
+        config.source_target_dir().as_path(),
+        std::path::Path::new("C:\\Users\\Data")
+    );
+}

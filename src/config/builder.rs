@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// Builder for constructing and validating a [`TargetSyncConfig`].
 #[derive(Debug, Clone)]
 pub struct TargetSyncConfigBuilder {
-    source_dir: PathBuf,
+    source_dir: TargetDir,
     dest_dir: TargetDir,
     block_size_bytes: u64,
     block_sync_threshold_bytes: u64,
@@ -32,7 +32,7 @@ impl TargetSyncConfigBuilder {
     /// # Returns
     ///
     /// A [`TargetSyncConfigBuilder`] initialized with 1MB blocks, 10MB threshold, 3s debounce, and 10s retry.
-    pub fn new(source_dir: impl Into<PathBuf>, dest_dir: impl Into<TargetDir>) -> Self {
+    pub fn new(source_dir: impl Into<TargetDir>, dest_dir: impl Into<TargetDir>) -> Self {
         Self {
             source_dir: source_dir.into(),
             dest_dir: dest_dir.into(),
@@ -131,17 +131,16 @@ impl TargetSyncConfigBuilder {
                 "retry_interval_seconds must be greater than zero",
             ));
         }
-        let src_target = TargetDir::new(&self.source_dir);
-        src_target.validate(TargetRole::Source)?;
+        self.source_dir.validate(TargetRole::Source)?;
         self.dest_dir.validate(TargetRole::Destination)?;
 
-        if is_same_or_descendant(src_target.as_path(), self.dest_dir.as_path())
-            || is_same_or_descendant(self.dest_dir.as_path(), src_target.as_path())
+        if is_same_or_descendant(self.source_dir.as_path(), self.dest_dir.as_path())
+            || is_same_or_descendant(self.dest_dir.as_path(), self.source_dir.as_path())
         {
             return Err(SyncError::validation_loop(format!(
                 "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
                 self.dest_dir.display(),
-                src_target.display()
+                self.source_dir.display()
             )));
         }
 
@@ -149,7 +148,7 @@ impl TargetSyncConfigBuilder {
             .verification_mode
             .unwrap_or_else(|| VerificationMode::from_legacy_flag(self.verify_writes));
         Ok(TargetSyncConfig::from_raw_parts(
-            src_target.to_path_buf(),
+            self.source_dir,
             self.dest_dir,
             self.block_size_bytes,
             self.block_sync_threshold_bytes,
