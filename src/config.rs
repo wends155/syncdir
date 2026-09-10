@@ -55,6 +55,15 @@ pub struct TargetSyncConfig {
 
 impl TargetSyncConfig {
     /// Return a builder for `TargetSyncConfig`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_dir` - Path to the source directory to mirror.
+    /// * `dest_dir` - Destination target directory.
+    ///
+    /// # Returns
+    ///
+    /// A configured [`TargetSyncConfigBuilder`] instance with default sync options.
     pub fn builder(
         source_dir: impl Into<PathBuf>,
         dest_dir: impl Into<TargetDir>,
@@ -63,6 +72,23 @@ impl TargetSyncConfig {
     }
 
     /// Construct a validated `TargetSyncConfig`.
+    ///
+    /// Validates directory paths, timeout positivity, block threshold ordering,
+    /// and ensures destination is not identical to or nested within the source directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_dir` - Path to the source directory to mirror.
+    /// * `dest_dir` - Destination target directory.
+    ///
+    /// # Returns
+    ///
+    /// A validated [`TargetSyncConfig`] ready for use with [`LocalSyncEngine`](crate::sync::LocalSyncEngine).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Validation`] if parameters, timeouts, block sizes, or paths fail validation,
+    /// or if the destination directory is identical to or nested within the source directory.
     pub fn new(
         source_dir: impl Into<PathBuf>,
         dest_dir: impl Into<TargetDir>,
@@ -190,6 +216,15 @@ pub struct TargetSyncConfigBuilder {
 
 impl TargetSyncConfigBuilder {
     /// Create a new builder with default operational settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_dir` - Path to the source directory to mirror.
+    /// * `dest_dir` - Destination target directory.
+    ///
+    /// # Returns
+    ///
+    /// A [`TargetSyncConfigBuilder`] initialized with 1MB blocks, 10MB threshold, 3s debounce, and 10s retry.
     pub fn new(source_dir: impl Into<PathBuf>, dest_dir: impl Into<TargetDir>) -> Self {
         Self {
             source_dir: source_dir.into(),
@@ -249,8 +284,16 @@ impl TargetSyncConfigBuilder {
 
     /// Builds and validates the `TargetSyncConfig`.
     ///
+    /// Validates directory paths, timeout positivity, block threshold ordering,
+    /// and ensures destination is not identical to or nested within the source directory.
+    ///
+    /// # Returns
+    ///
+    /// A validated [`TargetSyncConfig`] ready for sync worker execution.
+    ///
     /// # Errors
-    /// Returns `SyncError::Validation` if parameters, timeouts, block sizes, or paths fail validation,
+    ///
+    /// Returns [`SyncError::Validation`] if parameters, timeouts, block sizes, or paths fail validation,
     /// or if the destination directory is identical to or nested within the source directory.
     pub fn build(self) -> Result<TargetSyncConfig, SyncError> {
         let max_block_size = 64 * 1024 * 1024;
