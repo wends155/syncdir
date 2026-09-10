@@ -179,28 +179,20 @@ impl SyncDaemon {
         resolver: &dyn crate::net::NetworkResolver,
     ) -> Result<(), SyncError> {
         let src_orig = config.source_dir();
-        let src_resolved = resolver.try_resolve_alternate_path(src_orig);
         let src_unc = resolver.try_resolve_unc_path(src_orig);
 
         let dests: Vec<_> = config
             .resolved_dest_dirs()
             .into_iter()
             .map(|dest| {
-                let dest_resolved = resolver.try_resolve_alternate_path(&dest);
                 let dest_unc = resolver.try_resolve_unc_path(&dest);
-                (dest, dest_resolved, dest_unc)
+                (dest, dest_unc)
             })
             .collect();
 
         // 1. Check source vs destination loops
-        for (dest, dest_resolved, dest_unc) in &dests {
-            let is_loop = crate::config::is_same_or_descendant(&src_resolved, dest_resolved)
-                || crate::config::is_same_or_descendant(dest_resolved, &src_resolved)
-                || crate::config::is_same_or_descendant(src_orig, dest_resolved)
-                || crate::config::is_same_or_descendant(dest_resolved, src_orig)
-                || crate::config::is_same_or_descendant(&src_resolved, dest)
-                || crate::config::is_same_or_descendant(dest, &src_resolved)
-                || crate::config::is_same_or_descendant(&src_unc, dest_unc)
+        for (dest, dest_unc) in &dests {
+            let is_loop = crate::config::is_same_or_descendant(&src_unc, dest_unc)
                 || crate::config::is_same_or_descendant(dest_unc, &src_unc)
                 || crate::config::is_same_or_descendant(src_orig, dest_unc)
                 || crate::config::is_same_or_descendant(dest_unc, src_orig)
@@ -211,9 +203,9 @@ impl SyncDaemon {
                 return Err(SyncError::validation(format!(
                     "Destination directory '{}' (resolved: '{}') is identical to or nested within source directory '{}' (resolved: '{}') (recursive sync loop)",
                     dest.display(),
-                    dest_resolved.display(),
+                    dest_unc.display(),
                     src_orig.display(),
-                    src_resolved.display()
+                    src_unc.display()
                 )));
             }
         }
@@ -221,16 +213,10 @@ impl SyncDaemon {
         // 2. Check destination vs destination overlaps (pairwise O(N^2))
         for i in 0..dests.len() {
             for j in (i + 1)..dests.len() {
-                let (d1, d1_res, d1_unc) = &dests[i];
-                let (d2, d2_res, d2_unc) = &dests[j];
+                let (d1, d1_unc) = &dests[i];
+                let (d2, d2_unc) = &dests[j];
 
-                let is_dest_dest_overlap = crate::config::is_same_or_descendant(d1_res, d2_res)
-                    || crate::config::is_same_or_descendant(d2_res, d1_res)
-                    || crate::config::is_same_or_descendant(d1, d2_res)
-                    || crate::config::is_same_or_descendant(d2_res, d1)
-                    || crate::config::is_same_or_descendant(d1_res, d2)
-                    || crate::config::is_same_or_descendant(d2, d1_res)
-                    || crate::config::is_same_or_descendant(d1_unc, d2_unc)
+                let is_dest_dest_overlap = crate::config::is_same_or_descendant(d1_unc, d2_unc)
                     || crate::config::is_same_or_descendant(d2_unc, d1_unc)
                     || crate::config::is_same_or_descendant(d1, d2_unc)
                     || crate::config::is_same_or_descendant(d2_unc, d1)
@@ -783,5 +769,55 @@ verify_writes = true
         .unwrap();
         assert_eq!(daemon.worker_handles.len(), 1);
         daemon.shutdown();
+    }
+
+    struct TrackingResolver {
+        unc_calls: std::sync::atomic::AtomicUsize,
+        alt_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::net::NetworkResolver for TrackingResolver {
+        fn try_resolve_alternate_path(&self, path: &Path) -> PathBuf {
+            self.alt_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            path.to_path_buf()
+        }
+
+        fn try_resolve_unc_path(&self, path: &Path) -> PathBuf {
+            self.unc_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            path.to_path_buf()
+        }
+
+        fn is_destination_accessible(&self, _path: &Path) -> bool {
+            true
+        }
+
+        fn establish_smb_connection(&self, _unc_path: &Path) -> Result<(), SyncError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_validate_target_loops_unc() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(src).dest_dir(dest).build();
+        let resolver = TrackingResolver {
+            unc_calls: std::sync::atomic::AtomicUsize::new(0),
+            alt_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let result = SyncDaemon::validate_target_loops(&config, &resolver);
+        assert!(result.is_ok());
+        assert!(resolver.unc_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert_eq!(
+            resolver.alt_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }
