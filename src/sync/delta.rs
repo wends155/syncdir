@@ -247,190 +247,222 @@ impl<S: HashStore> DeltaTransferEngine<S> {
         scratch: &mut [u8],
     ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
         let mut dirty_blocks_written: usize = 0;
-        let run =
-            || -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
-                if let Some(parent) = task.dest_path.parent() {
-                    fs::create_dir_all(parent)?;
+        let run = || -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
+            if let Some(parent) = task.dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut src_file = File::open(task.src_path)?;
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(true).create(true).truncate(false);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            if let Ok(sym_meta) = fs::symlink_metadata(task.dest_path)
+                && crate::sync::path_safety::is_reparse_or_symlink_meta(&sym_meta)
+            {
+                return Err(SyncError::validation_reparse(format!(
+                    "Destination file '{}' is a symlink or reparse point; refusing to write",
+                    task.dest_path.display()
+                )));
+            }
+            let mut dest_file = match opts.open(task.dest_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    if let Ok(sym_meta) = fs::symlink_metadata(task.dest_path)
+                        && crate::sync::path_safety::is_reparse_or_symlink_meta(&sym_meta)
+                    {
+                        return Err(SyncError::validation_reparse(format!(
+                            "Destination file '{}' is a symlink or reparse point; refusing to write",
+                            task.dest_path.display()
+                        )));
+                    }
+                    return Err(SyncError::Io(e));
                 }
-                let mut src_file = File::open(task.src_path)?;
-                let mut dest_file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(task.dest_path)?;
+            };
+            let dest_meta = dest_file.metadata()?;
+            if crate::sync::path_safety::is_reparse_or_symlink_meta(&dest_meta) {
+                return Err(SyncError::validation_reparse(format!(
+                    "Destination file '{}' is a symlink or reparse point; refusing to write",
+                    task.dest_path.display()
+                )));
+            }
 
-                let block_size = self.config.block_size_bytes();
-                let initial_dest_len = dest_file.metadata().map(|m| m.len()).unwrap_or(0);
-                let cached_hashes = self.db.get_block_hashes(task.rel_path)?;
+            let block_size = self.config.block_size_bytes();
+            let initial_dest_len = dest_meta.len();
+            let cached_hashes = self.db.get_block_hashes(task.rel_path)?;
 
-                let buffer = scratch;
-                let mut new_hashes = Vec::new();
-                let mut block_idx: u64 = 0;
-                let mut lease = self.acquire_dirty_range_lease();
-                let range = &mut *lease;
-                let mut total_bytes_read: u64 = 0;
-                let mut modified_block_indices: Vec<(u64, usize, [u8; 32])> = Vec::new();
+            let buffer = scratch;
+            let mut new_hashes = Vec::new();
+            let mut block_idx: u64 = 0;
+            let mut lease = self.acquire_dirty_range_lease();
+            let range = &mut *lease;
+            let mut total_bytes_read: u64 = 0;
+            let mut modified_block_indices: Vec<(u64, usize, [u8; 32])> = Vec::new();
 
-                loop {
-                    let bytes_read = read_block(&mut src_file, buffer)?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-                    total_bytes_read += bytes_read as u64;
-                    let hash = *blake3::hash(&buffer[..bytes_read]).as_bytes();
-                    new_hashes.push(hash);
-
-                    let cached = cached_hashes.get(block_idx as usize);
-                    let block_changed = match cached {
-                        Some(cached_hash) => cached_hash != &hash,
-                        None => true,
-                    };
-                    let is_truncated_on_dest =
-                        initial_dest_len < (block_idx * block_size + bytes_read as u64);
-
-                    if block_changed || is_truncated_on_dest {
-                        range.add_block(block_idx, &buffer[..bytes_read], &mut dest_file)?;
-                        dirty_blocks_written += 1;
-                        if self.config.verification_mode() != VerificationMode::Disabled {
-                            modified_block_indices.push((block_idx, bytes_read, hash));
-                        }
-                    }
-                    block_idx += 1;
+            loop {
+                let bytes_read = read_block(&mut src_file, buffer)?;
+                if bytes_read == 0 {
+                    break;
                 }
-                range.flush(&mut dest_file)?;
-                drop(lease);
+                total_bytes_read += bytes_read as u64;
+                let hash = *blake3::hash(&buffer[..bytes_read]).as_bytes();
+                new_hashes.push(hash);
 
-                // Post-stream metadata re-verification (TOCTOU protection)
-                let post_meta = src_file.metadata()?;
-                let post_len = post_meta.len();
-                let post_mod = safe_modified_millis(&post_meta)?;
-                if post_len != total_bytes_read || post_mod != task.src_mod {
-                    tracing::warn!(
-                        path = %task.rel_path.display(),
-                        expected_len = total_bytes_read,
-                        post_len,
-                        expected_mod = task.src_mod,
-                        post_mod,
-                        "Source file modified concurrently during delta streaming; aborting sync"
-                    );
-                    return Err(SyncError::write_verification_failed(
-                        task.dest_path.to_path_buf(),
-                    ));
-                }
-
-                // Validate destination length before verification (TOCTOU / remote corruption protection)
-                let dest_len_pre = dest_file.metadata()?.len();
-                if dest_len_pre < total_bytes_read {
-                    tracing::warn!(
-                        path = %task.rel_path.display(),
-                        dest_len_pre,
-                        total_bytes_read,
-                        "Destination file is shorter than expected bytes read before truncation"
-                    );
-                    return Err(SyncError::write_verification_failed(
-                        task.dest_path.to_path_buf(),
-                    ));
-                }
-
-                let verification_mode = self.config.verification_mode();
-                let indices_to_verify: Vec<&(u64, usize, [u8; 32])> = match verification_mode {
-                    VerificationMode::Disabled => Vec::new(),
-                    VerificationMode::MetadataAndFlush => {
-                        dest_file.sync_all()?;
-                        Vec::new()
-                    }
-                    VerificationMode::Full => {
-                        dest_file.sync_all()?;
-                        modified_block_indices.iter().collect()
-                    }
-                    VerificationMode::Sampled => {
-                        dest_file.sync_all()?;
-                        let n = modified_block_indices.len();
-                        if n <= 4 {
-                            modified_block_indices.iter().collect()
-                        } else {
-                            let mut sample = Vec::with_capacity(4);
-                            sample.push(&modified_block_indices[0]);
-                            let mid1 = n / 3;
-                            let mid2 = (2 * n) / 3;
-                            sample.push(&modified_block_indices[mid1]);
-                            sample.push(&modified_block_indices[mid2]);
-                            sample.push(&modified_block_indices[n - 1]);
-                            sample
-                        }
-                    }
+                let cached = cached_hashes.get(block_idx as usize);
+                let block_changed = match cached {
+                    Some(cached_hash) => cached_hash != &hash,
+                    None => true,
                 };
+                let is_truncated_on_dest =
+                    initial_dest_len < (block_idx * block_size + bytes_read as u64);
 
-                let mut current_offset: Option<u64> = None;
-                for &(b_idx, bytes_len, expected_hash) in indices_to_verify {
-                    let target_offset = b_idx * block_size;
-                    if current_offset != Some(target_offset) {
-                        dest_file.seek(SeekFrom::Start(target_offset))?;
+                if block_changed || is_truncated_on_dest {
+                    range.add_block(block_idx, &buffer[..bytes_read], &mut dest_file)?;
+                    dirty_blocks_written += 1;
+                    if self.config.verification_mode() != VerificationMode::Disabled {
+                        modified_block_indices.push((block_idx, bytes_read, hash));
                     }
-                    if let Err(e) = dest_file.read_exact(&mut buffer[..bytes_len]) {
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            return Err(SyncError::write_verification_failed_block(
-                                task.dest_path.to_path_buf(),
-                                b_idx,
-                                expected_hash,
-                                [0u8; 32],
-                            ));
-                        }
-                        return Err(SyncError::Io(e));
+                }
+                block_idx += 1;
+            }
+            range.flush(&mut dest_file)?;
+            drop(lease);
+
+            // Post-stream metadata re-verification (TOCTOU protection)
+            let post_meta = src_file.metadata()?;
+            let post_len = post_meta.len();
+            let post_mod = safe_modified_millis(&post_meta)?;
+            if post_len != total_bytes_read || post_mod != task.src_mod {
+                tracing::warn!(
+                    path = %task.rel_path.display(),
+                    expected_len = total_bytes_read,
+                    post_len,
+                    expected_mod = task.src_mod,
+                    post_mod,
+                    "Source file modified concurrently during delta streaming; aborting sync"
+                );
+                return Err(SyncError::write_verification_failed(
+                    task.dest_path.to_path_buf(),
+                ));
+            }
+
+            // Validate destination length before verification (TOCTOU / remote corruption protection)
+            let dest_len_pre = dest_file.metadata()?.len();
+            if dest_len_pre < total_bytes_read {
+                tracing::warn!(
+                    path = %task.rel_path.display(),
+                    dest_len_pre,
+                    total_bytes_read,
+                    "Destination file is shorter than expected bytes read before truncation"
+                );
+                return Err(SyncError::write_verification_failed(
+                    task.dest_path.to_path_buf(),
+                ));
+            }
+
+            let verification_mode = self.config.verification_mode();
+            let indices_to_verify: Vec<&(u64, usize, [u8; 32])> = match verification_mode {
+                VerificationMode::Disabled => Vec::new(),
+                VerificationMode::MetadataAndFlush => {
+                    dest_file.sync_all()?;
+                    Vec::new()
+                }
+                VerificationMode::Full => {
+                    dest_file.sync_all()?;
+                    modified_block_indices.iter().collect()
+                }
+                VerificationMode::Sampled => {
+                    dest_file.sync_all()?;
+                    let n = modified_block_indices.len();
+                    if n <= 4 {
+                        modified_block_indices.iter().collect()
+                    } else {
+                        let mut sample = Vec::with_capacity(4);
+                        sample.push(&modified_block_indices[0]);
+                        let mid1 = n / 3;
+                        let mid2 = (2 * n) / 3;
+                        sample.push(&modified_block_indices[mid1]);
+                        sample.push(&modified_block_indices[mid2]);
+                        sample.push(&modified_block_indices[n - 1]);
+                        sample
                     }
-                    current_offset = Some(target_offset + bytes_len as u64);
-                    let actual_hash = *blake3::hash(&buffer[..bytes_len]).as_bytes();
-                    if actual_hash != expected_hash {
+                }
+            };
+
+            let mut current_offset: Option<u64> = None;
+            for &(b_idx, bytes_len, expected_hash) in indices_to_verify {
+                let target_offset = b_idx * block_size;
+                if current_offset != Some(target_offset) {
+                    dest_file.seek(SeekFrom::Start(target_offset))?;
+                }
+                if let Err(e) = dest_file.read_exact(&mut buffer[..bytes_len]) {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         return Err(SyncError::write_verification_failed_block(
                             task.dest_path.to_path_buf(),
                             b_idx,
                             expected_hash,
-                            actual_hash,
+                            [0u8; 32],
                         ));
                     }
+                    return Err(SyncError::Io(e));
                 }
-
-                // Truncate to exact bytes read (TOCTOU protection)
-                dest_file.set_len(total_bytes_read)?;
-
-                let dest_len_final = dest_file.metadata()?.len();
-                if dest_len_final != total_bytes_read {
-                    tracing::warn!(
-                        path = %task.rel_path.display(),
-                        dest_len_final,
-                        total_bytes_read,
-                        "Destination file length does not match total bytes read after set_len"
-                    );
-                    return Err(SyncError::write_verification_failed(
+                current_offset = Some(target_offset + bytes_len as u64);
+                let actual_hash = *blake3::hash(&buffer[..bytes_len]).as_bytes();
+                if actual_hash != expected_hash {
+                    return Err(SyncError::write_verification_failed_block(
                         task.dest_path.to_path_buf(),
+                        b_idx,
+                        expected_hash,
+                        actual_hash,
                     ));
                 }
+            }
 
-                if let Err(e) = dest_file.set_times(fs::FileTimes::new().set_modified(
-                    SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod),
-                )) {
-                    tracing::warn!(
-                        path = %task.rel_path.display(),
-                        error = %e,
-                        "Failed to preserve modified timestamp on destination file (delta)"
-                    );
-                }
+            // Truncate to exact bytes read (TOCTOU protection)
+            dest_file.set_len(total_bytes_read)?;
 
-                let record = FileRecord {
-                    id: task.cached_id,
-                    relative_path: task.rel_path.to_path_buf(),
-                    file_size: total_bytes_read as i64,
-                    last_modified: task.src_mod,
-                };
-                tracing::info!(
+            let dest_len_final = dest_file.metadata()?.len();
+            if dest_len_final != total_bytes_read {
+                tracing::warn!(
                     path = %task.rel_path.display(),
-                    target = %task.dest_dir.display(),
-                    size = total_bytes_read,
-                    "Synced file to destination (delta)"
+                    dest_len_final,
+                    total_bytes_read,
+                    "Destination file length does not match total bytes read after set_len"
                 );
-                Ok((record, new_hashes))
+                return Err(SyncError::write_verification_failed(
+                    task.dest_path.to_path_buf(),
+                ));
+            }
+
+            if let Err(e) =
+                dest_file.set_times(fs::FileTimes::new().set_modified(
+                    SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod),
+                ))
+            {
+                tracing::warn!(
+                    path = %task.rel_path.display(),
+                    error = %e,
+                    "Failed to preserve modified timestamp on destination file (delta)"
+                );
+            }
+
+            let record = FileRecord {
+                id: task.cached_id,
+                relative_path: task.rel_path.to_path_buf(),
+                file_size: total_bytes_read as i64,
+                last_modified: task.src_mod,
             };
+            tracing::info!(
+                path = %task.rel_path.display(),
+                target = %task.dest_dir.display(),
+                size = total_bytes_read,
+                "Synced file to destination (delta)"
+            );
+            Ok((record, new_hashes))
+        };
 
         match run() {
             Ok(result) => Ok(result),
@@ -872,5 +904,80 @@ mod tests {
             engine.dirty_range_capacity() >= 512,
             "dirty_range_capacity should retain allocated buffer"
         );
+    }
+
+    #[cfg(windows)]
+    fn create_test_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        link.display(),
+                        target.display()
+                    ),
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(std::io::Error::other("Failed to create test junction"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_delta_large_file_rejects_dest_reparse_point() {
+        #[cfg(windows)]
+        {
+            let temp = tempdir().unwrap();
+            let source = temp.path().join("source");
+            let dest = temp.path().join("dest");
+            fs::create_dir_all(&source).unwrap();
+            fs::create_dir_all(&dest).unwrap();
+
+            let db_path = temp.path().join("hashes.db");
+            let target_cfg = TargetSyncConfig::builder(source.clone(), dest.clone())
+                .block_size_bytes(512)
+                .block_sync_threshold_bytes(512)
+                .build()
+                .unwrap();
+            let store_cfg = crate::db::StoreConfig::new(
+                target_cfg.block_size_bytes(),
+                target_cfg.block_sync_threshold_bytes(),
+            )
+            .unwrap();
+            let db = SqliteHashStore::new(&db_path, store_cfg).unwrap();
+            let engine = DeltaTransferEngine::new(db, target_cfg);
+
+            let src_file = source.join("target.bin");
+            let dst_file = dest.join("target.bin");
+            let payload = vec![0xCDu8; 1024];
+            fs::write(&src_file, &payload).unwrap();
+
+            let link_target = temp.path().join("link_target");
+            fs::create_dir_all(&link_target).unwrap();
+            create_test_junction(&link_target, &dst_file).unwrap();
+
+            let meta = fs::metadata(&src_file).unwrap();
+            let task = FileSyncTask {
+                rel_path: Path::new("target.bin"),
+                src_path: &src_file,
+                dest_path: &dst_file,
+                dest_dir: &dest,
+                src_size: meta.len() as i64,
+                src_mod: safe_modified_millis(&meta).unwrap(),
+                cached_id: None,
+            };
+
+            let mut scratch = vec![0u8; 512];
+            let res = engine.sync_delta_large_file_core(&task, &mut scratch);
+            assert!(
+                res.is_err(),
+                "sync_delta_large_file_core must reject destination reparse point"
+            );
+            let err = res.err().unwrap();
+            assert!(matches!(err, SyncError::Validation { .. }));
+        }
     }
 }
