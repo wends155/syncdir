@@ -164,10 +164,16 @@ impl<S: HashStore> LocalSyncEngine<S> {
             }
         }
 
-        temp_file.set_times(
+        if let Err(e) = temp_file.set_times(
             fs::FileTimes::new()
                 .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod)),
-        )?;
+        ) {
+            tracing::warn!(
+                path = %task.rel_path.display(),
+                error = %e,
+                "Failed to preserve modified timestamp on staging file; proceeding with rename"
+            );
+        }
 
         drop(temp_file);
         fs::rename(&temp_path, task.dest_path)?;

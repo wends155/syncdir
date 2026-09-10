@@ -21,7 +21,7 @@ pub(crate) fn prune_archive(
     if !archive_dir.exists() {
         return Ok(());
     }
-    let max_age = std::time::Duration::from_secs(max_age_days * 24 * 3600);
+    let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86_400));
     let now = SystemTime::now();
 
     let mut files = Vec::new();
@@ -149,6 +149,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
         match fs::metadata(&dest_path) {
             Ok(_) => {
                 if self.config.propagate_deletions() {
+                    let archive_dir = dest_dir.join(".syncdir_archive");
+                    verify_destination_not_reparse(&archive_dir, Path::new(""))?;
+
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_err(|e| {
@@ -188,7 +191,10 @@ impl<S: HashStore> LocalSyncEngine<S> {
     /// Handle deletion of a file on a specific destination directory.
     pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
         self.archive_dest_file_only(rel_path, dest_dir)?;
-        self.db.delete_file(rel_path)?;
+        let dest_path = dest_dir.join(rel_path);
+        if self.config.propagate_deletions() || !dest_path.exists() {
+            self.db.delete_file(rel_path)?;
+        }
         Ok(())
     }
 
@@ -538,7 +544,10 @@ mod tests {
 
         let res = engine_no_prop.delete_file_from_dest(Path::new("unprop.txt"), &dst);
         assert!(res.is_ok());
-        assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_none());
+        assert!(
+            store.get_file(Path::new("unprop.txt")).unwrap().is_some(),
+            "DB record must be retained when propagate_deletions = false and destination file still exists"
+        );
         assert!(unprop_file.exists());
     }
 
@@ -564,6 +573,39 @@ mod tests {
         assert!(
             file_path.exists(),
             "newly archived file must be retained regardless of payload mtime"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_archive_dest_file_reparse_rejection() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let archive_junction = dst.join(".syncdir_archive");
+        if create_test_junction(&outside, &archive_junction).is_err() {
+            return;
+        }
+
+        let config = Config::builder(src)
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        let file = dst.join("victim.txt");
+        std::fs::write(&file, "payload").unwrap();
+
+        let res = engine.archive_dest_file_only(Path::new("victim.txt"), &dst);
+        assert!(
+            res.is_err(),
+            "Must reject archiving when .syncdir_archive is a reparse point"
         );
     }
 }
