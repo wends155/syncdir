@@ -23,6 +23,12 @@ pub use target::{DestinationCollection, TargetDir, VerificationMode};
 pub mod builder;
 pub use builder::{ConfigBuilder, TargetSyncConfigBuilder};
 
+/// Default block size (64KB) as a non-zero integer.
+pub const DEFAULT_BLOCK_SIZE: std::num::NonZeroU64 = match std::num::NonZeroU64::new(64 * 1024) {
+    Some(v) => v,
+    None => unreachable!(),
+};
+
 /// Isolated target sync configuration for a specific destination directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSyncConfig {
@@ -125,8 +131,7 @@ impl TargetSyncConfig {
     /// A [`std::num::NonZeroU64`] representing the block size in bytes.
     #[must_use]
     pub fn block_size_nonzero(&self) -> std::num::NonZeroU64 {
-        std::num::NonZeroU64::new(self.block_size_bytes)
-            .unwrap_or_else(|| std::num::NonZeroU64::new(64 * 1024).expect("64KB is non-zero"))
+        std::num::NonZeroU64::new(self.block_size_bytes).unwrap_or(DEFAULT_BLOCK_SIZE)
     }
 
     /// Block sync threshold in bytes getter.

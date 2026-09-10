@@ -182,11 +182,7 @@ impl TryFrom<u64> for DirtyBlockRange {
 
 impl Default for DirtyBlockRange {
     fn default() -> Self {
-        const DEFAULT_BLOCK_SIZE: NonZeroU64 = match NonZeroU64::new(64 * 1024) {
-            Some(v) => v,
-            None => unreachable!(),
-        };
-        Self::new(DEFAULT_BLOCK_SIZE)
+        Self::new(crate::config::DEFAULT_BLOCK_SIZE)
     }
 }
 

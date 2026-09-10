@@ -61,6 +61,7 @@ impl TargetSyncConfigBuilder {
     /// Set write verification flag.
     pub fn verify_writes(mut self, val: bool) -> Self {
         self.verify_writes = val;
+        self.verification_mode = Some(VerificationMode::from_legacy_flag(val));
         self
     }
 
@@ -232,6 +233,7 @@ impl ConfigBuilder {
     /// Set write verification flag.
     pub fn verify_writes(mut self, val: bool) -> Self {
         self.verify_writes = val;
+        self.verification_mode = Some(VerificationMode::from_legacy_flag(val));
         self
     }
 

@@ -321,7 +321,7 @@ pub fn is_metadata_up_to_date_raw(
 /// greater allocation capacity if the pool is already populated.
 pub struct DirtyRangeLease<'a> {
     pool: &'a std::sync::Mutex<Option<DirtyBlockRange>>,
-    range: Option<DirtyBlockRange>,
+    range: DirtyBlockRange,
 }
 
 impl<'a> DirtyRangeLease<'a> {
@@ -329,10 +329,7 @@ impl<'a> DirtyRangeLease<'a> {
         pool: &'a std::sync::Mutex<Option<DirtyBlockRange>>,
         range: DirtyBlockRange,
     ) -> Self {
-        Self {
-            pool,
-            range: Some(range),
-        }
+        Self { pool, range }
     }
 }
 
@@ -340,37 +337,32 @@ impl<'a> std::ops::Deref for DirtyRangeLease<'a> {
     type Target = DirtyBlockRange;
 
     fn deref(&self) -> &Self::Target {
-        self.range
-            .as_ref()
-            .expect("DirtyRangeLease invariant violated: range is None")
+        &self.range
     }
 }
 
 impl<'a> std::ops::DerefMut for DirtyRangeLease<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.range
-            .as_mut()
-            .expect("DirtyRangeLease invariant violated: range is None")
+        &mut self.range
     }
 }
 
 impl<'a> Drop for DirtyRangeLease<'a> {
     fn drop(&mut self) {
-        if let Some(mut range) = self.range.take() {
-            range.reset();
-            let mut pool = self
-                .pool
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match pool.as_mut() {
-                Some(existing) => {
-                    if range.capacity() > existing.capacity() {
-                        *existing = range;
-                    }
+        let mut range = std::mem::take(&mut self.range);
+        range.reset();
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match pool.as_mut() {
+            Some(existing) => {
+                if range.capacity() > existing.capacity() {
+                    *existing = range;
                 }
-                None => {
-                    *pool = Some(range);
-                }
+            }
+            None => {
+                *pool = Some(range);
             }
         }
     }
@@ -2378,5 +2370,22 @@ mod tests {
         assert_eq!(calculate_remaining_files(1, 1, 1), 0);
         assert_eq!(calculate_remaining_files(5, 2, 1), 2);
         assert_eq!(calculate_remaining_files(usize::MAX, usize::MAX, 1), 0);
+    }
+
+    #[test]
+    fn test_dirty_range_lease_panic_free_deref_and_deref_mut() {
+        let pool = std::sync::Mutex::new(None);
+        let range = DirtyBlockRange::new(std::num::NonZeroU64::new(1024).unwrap());
+        let mut lease = DirtyRangeLease::new(&pool, range);
+        assert_eq!(lease.capacity(), 0);
+        assert!(lease.is_empty());
+        assert_eq!(lease.block_size(), 1024);
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        lease.add_block(0, &[1u8; 10], &mut cursor).unwrap();
+        assert_eq!(lease.byte_len(), 10);
+        assert!(!lease.is_empty());
+        drop(lease);
+        let pooled = pool.lock().unwrap();
+        assert!(pooled.is_some());
     }
 }

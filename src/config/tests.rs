@@ -1119,3 +1119,57 @@ fn test_store_config_try_from_target_sync_config() {
     let err = crate::db::StoreConfig::try_from(&zero_target);
     assert!(err.is_err());
 }
+
+#[test]
+fn test_target_sync_config_builder_verify_writes_syncs_with_verification_mode() {
+    let temp = tempdir().unwrap();
+    let src = temp.path().join("source");
+    let dest = temp.path().join("dest");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let cfg = TargetSyncConfig::builder(src.clone(), dest.clone())
+        .verification_mode(VerificationMode::Full)
+        .verify_writes(false)
+        .build()
+        .unwrap();
+    assert_eq!(cfg.verification_mode(), VerificationMode::Disabled);
+    assert!(!cfg.verify_writes());
+
+    let cfg2 = TargetSyncConfig::builder(src.clone(), dest.clone())
+        .verification_mode(VerificationMode::Disabled)
+        .verify_writes(true)
+        .build()
+        .unwrap();
+    assert_ne!(cfg2.verification_mode(), VerificationMode::Disabled);
+    assert!(cfg2.verify_writes());
+
+    let config = Config::builder(src)
+        .dest_dir(dest)
+        .verification_mode(VerificationMode::Full)
+        .verify_writes(false)
+        .build()
+        .unwrap();
+    assert_eq!(config.verification_mode(), VerificationMode::Disabled);
+    assert!(!config.verify_writes());
+}
+
+#[test]
+fn test_target_sync_config_block_size_nonzero_panic_free_fallback() {
+    let temp = tempdir().unwrap();
+    let src = temp.path().join("source");
+    let dest = temp.path().join("dest");
+
+    let target_zero = TargetSyncConfig::from_raw_parts(
+        src,
+        TargetDir::from(dest),
+        0,
+        1024,
+        true,
+        VerificationMode::Full,
+        3,
+        10,
+        true,
+    );
+    assert_eq!(target_zero.block_size_nonzero(), DEFAULT_BLOCK_SIZE);
+}
