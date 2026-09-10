@@ -270,6 +270,15 @@ impl FileMetadataSnapshot {
     }
 }
 
+impl From<&crate::db::FileRecord> for FileMetadataSnapshot {
+    fn from(record: &crate::db::FileRecord) -> Self {
+        Self {
+            size: record.file_size.max(0),
+            modified_epoch_millis: record.last_modified.max(0),
+        }
+    }
+}
+
 /// Raw metadata evaluation for testing and backward compatibility.
 #[doc(hidden)]
 pub fn is_metadata_up_to_date_raw(
@@ -341,13 +350,16 @@ impl<'a> Drop for DirtyRangeLease<'a> {
     }
 }
 
-/// Delta sync engine backed by a `HashStore` for signature caching.
+/// Delta sync engine backed by a `HashStore` for signature caching, composed of collaborating transfer, archive, and scan engines.
 pub struct LocalSyncEngine<S: HashStore> {
-    pub(crate) db: S,
+    pub(crate) db: std::sync::Arc<S>,
     pub(crate) config: TargetSyncConfig,
     pub(crate) resolved_dest: Option<PathBuf>,
-    pub(crate) dirty_range_pool: std::sync::Mutex<Option<DirtyBlockRange>>,
     pub(crate) verified_dirs: std::sync::Mutex<HashSet<PathBuf>>,
+    pub(crate) small_file_engine: crate::sync::small_file::SmallFileTransferEngine,
+    pub(crate) delta_engine: crate::sync::delta::DeltaTransferEngine<std::sync::Arc<S>>,
+    pub(crate) archive_manager: crate::sync::archive::ArchiveManager,
+    pub(crate) scanner: crate::sync::scanner::DirectoryScanner,
 }
 
 #[derive(Debug)]
@@ -365,12 +377,24 @@ impl<S: HashStore> LocalSyncEngine<S> {
     /// Create a new sync engine with the given database and config.
     pub fn new(db: S, config: impl Into<TargetSyncConfig>) -> Self {
         let config = config.into();
+        let db = std::sync::Arc::new(db);
+        let small_file_engine =
+            crate::sync::small_file::SmallFileTransferEngine::new(config.clone());
+        let delta_engine = crate::sync::delta::DeltaTransferEngine::new(
+            std::sync::Arc::clone(&db),
+            config.clone(),
+        );
+        let archive_manager = crate::sync::archive::ArchiveManager::new(config.clone());
+        let scanner = crate::sync::scanner::DirectoryScanner::new(config.clone());
         Self {
             db,
             config,
             resolved_dest: None,
-            dirty_range_pool: std::sync::Mutex::new(None),
             verified_dirs: std::sync::Mutex::new(HashSet::new()),
+            small_file_engine,
+            delta_engine,
+            archive_manager,
+            scanner,
         }
     }
 
@@ -411,28 +435,13 @@ impl<S: HashStore> LocalSyncEngine<S> {
     ///
     /// A [`DirtyRangeLease`] handle providing mutable access to a pooled or newly allocated buffer.
     pub fn acquire_dirty_range_lease(&self) -> DirtyRangeLease<'_> {
-        let mut pool = self
-            .dirty_range_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let range = pool
-            .take()
-            .unwrap_or_else(|| DirtyBlockRange::new(self.config.block_size_nonzero()));
-        DirtyRangeLease {
-            pool: &self.dirty_range_pool,
-            range: Some(range),
-        }
+        self.delta_engine.acquire_dirty_range_lease()
     }
 
     /// Return the capacity of the pooled buffer if present, or 0 if checked out or empty.
     #[cfg(test)]
     pub(crate) fn dirty_range_capacity(&self) -> usize {
-        self.dirty_range_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|r| r.capacity())
-            .unwrap_or(0)
+        self.delta_engine.dirty_range_capacity()
     }
 
     /// Set a pre-resolved destination path (e.g. from ReachabilityMonitor or worker context).
@@ -489,9 +498,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
         scratch: &mut [u8],
     ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
         if (task.src_size as u64) < self.config.block_sync_threshold_bytes() {
-            self.sync_small_file_core(task, scratch)
+            self.small_file_engine.sync_small_file_core(task, scratch)
         } else {
-            self.sync_delta_large_file_core(task, scratch)
+            self.delta_engine.sync_delta_large_file_core(task, scratch)
         }
     }
 
@@ -1139,5 +1148,69 @@ mod tests {
             let cache = engine.verified_dirs.lock().unwrap();
             assert!(cache.is_empty(), "Full invalidation must clear all entries");
         }
+    }
+
+    #[test]
+    fn test_composed_local_sync_engine_end_to_end_regression() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let db_path = temp.path().join("sig.db");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        // 1. Verify From<&FileRecord> for FileMetadataSnapshot
+        let rec = crate::db::FileRecord {
+            id: Some(42),
+            relative_path: PathBuf::from("rec.txt"),
+            file_size: 1024,
+            last_modified: 1_700_000_000_000,
+        };
+        let snap = FileMetadataSnapshot::from(&rec);
+        assert_eq!(snap.size, 1024);
+        assert_eq!(snap.modified_epoch_millis, 1_700_000_000_000);
+
+        // 2. End-to-end test composed LocalSyncEngine via SyncEngine trait
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .debounce_seconds(1)
+            .retry_interval_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(64)
+            .block_size_bytes(16)
+            .build()
+            .unwrap();
+
+        let store_cfg = crate::db::StoreConfig::new(
+            config.block_size_bytes(),
+            config.block_sync_threshold_bytes(),
+        )
+        .unwrap();
+        let store = SqliteHashStore::new(&db_path, store_cfg).unwrap();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        // Small file sync (< 64 bytes threshold)
+        fs::write(src.join("small.txt"), b"small content").unwrap();
+        engine.sync_file(Path::new("small.txt")).unwrap();
+        assert_eq!(fs::read(dst.join("small.txt")).unwrap(), b"small content");
+
+        // Large file sync (>= 64 bytes threshold)
+        let large_payload = vec![0xEEu8; 128];
+        fs::write(src.join("large.bin"), &large_payload).unwrap();
+        engine.sync_file(Path::new("large.bin")).unwrap();
+        assert_eq!(fs::read(dst.join("large.bin")).unwrap(), large_payload);
+
+        // Deletion and archive verification
+        fs::remove_file(src.join("small.txt")).unwrap();
+        engine
+            .delete_file_from_dest(Path::new("small.txt"), &dst)
+            .unwrap();
+        assert!(!dst.join("small.txt").exists());
+        assert!(dst.join(".syncdir_archive").exists());
+
+        // Full scan verification
+        let scan_res = engine.run_full_scan().unwrap();
+        assert!(matches!(scan_res, ScanOutcome::Success { .. }));
     }
 }

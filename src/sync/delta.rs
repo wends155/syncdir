@@ -213,7 +213,6 @@ pub(crate) struct DeltaTransferEngine<S: HashStore> {
 }
 
 impl<S: HashStore> DeltaTransferEngine<S> {
-    #[allow(dead_code)]
     pub(crate) fn new(db: S, config: TargetSyncConfig) -> Self {
         Self {
             db,
@@ -452,31 +451,13 @@ impl<S: HashStore> DeltaTransferEngine<S> {
 }
 
 impl<S: HashStore> LocalSyncEngine<S> {
+    #[cfg(test)]
     pub(crate) fn sync_delta_large_file_core(
         &self,
         task: &FileSyncTask<'_>,
         scratch: &mut [u8],
     ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
-        let pool = self
-            .dirty_range_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let engine = DeltaTransferEngine {
-            db: &self.db,
-            config: self.config.clone(),
-            dirty_range_pool: std::sync::Mutex::new(pool),
-        };
-        let res = engine.sync_delta_large_file_core(task, scratch);
-        let returned_pool = engine
-            .dirty_range_pool
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *self
-            .dirty_range_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = returned_pool;
-        res
+        self.delta_engine.sync_delta_large_file_core(task, scratch)
     }
 
     #[cfg(test)]

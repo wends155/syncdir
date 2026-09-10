@@ -206,13 +206,13 @@ impl SmallFileTransferEngine {
 }
 
 impl<S: HashStore> LocalSyncEngine<S> {
+    #[cfg(test)]
     pub(crate) fn sync_small_file_core(
         &self,
         task: &FileSyncTask<'_>,
         scratch: &mut [u8],
     ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
-        let engine = SmallFileTransferEngine::new(self.config.clone());
-        engine.sync_small_file_core(task, scratch)
+        self.small_file_engine.sync_small_file_core(task, scratch)
     }
 
     #[cfg(test)]

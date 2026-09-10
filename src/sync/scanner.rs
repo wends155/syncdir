@@ -186,8 +186,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         let mut source_files: HashSet<PathBuf> = HashSet::new();
         let mut scan_complete = true;
-        let scanner = DirectoryScanner::new(self.config.clone());
-        scanner.scan_dir_cancellable(
+        self.scanner.scan_dir_cancellable(
             resolved_source,
             &mut source_files,
             &mut scan_complete,

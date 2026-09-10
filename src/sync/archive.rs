@@ -235,7 +235,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
         rel_path: &Path,
         dest_dir: &Path,
     ) -> Result<(), SyncError> {
-        ArchiveManager::new(self.config.clone()).archive_dest_file_only(rel_path, dest_dir)
+        self.archive_manager
+            .archive_dest_file_only(rel_path, dest_dir)
     }
 
     /// Handle deletion of a file on a specific destination directory.
@@ -253,7 +254,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
     /// Prune old and excess files in the destination archive.
     pub fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
-        ArchiveManager::new(self.config.clone()).prune_destination_archive(dest_dir)
+        self.archive_manager.prune_destination_archive(dest_dir)
     }
 }
 
