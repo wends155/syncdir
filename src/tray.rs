@@ -2,7 +2,7 @@ pub(crate) mod assets;
 pub(crate) use assets::{generate_default_icon, get_cached_icon};
 
 use crate::error::SyncError;
-use crate::sync::{ConnectivityState, WatcherState};
+use crate::sync::{ConnectivityState, SyncStatusObserver, WatcherState};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -14,42 +14,10 @@ use winit::event_loop::ControlFlow;
 
 /// Open a file or directory in the system default application.
 ///
-/// Strictly verifies that `%SystemRoot%\explorer.exe` exists as a file
-/// before executing on Windows, preventing command hijack attacks.
-pub(crate) fn open_path(path: &Path) -> Result<(), SyncError> {
-    if !path.exists() {
-        return Err(SyncError::validation(format!(
-            "Path does not exist: {}",
-            path.display()
-        )));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let explorer = crate::config::system_root().join("explorer.exe");
-        if !explorer.is_file() {
-            return Err(SyncError::validation(format!(
-                "Explorer executable not found at {}",
-                explorer.display()
-            )));
-        }
-        std::process::Command::new(explorer)
-            .arg(path)
-            .spawn()
-            .map_err(SyncError::Io)?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        std::process::Command::new(opener)
-            .arg(path)
-            .spawn()
-            .map_err(SyncError::Io)?;
-    }
-    Ok(())
+/// Delegates to [`crate::path_util::open_path`].
+#[allow(dead_code)]
+pub fn open_path(path: &Path) -> Result<(), SyncError> {
+    crate::path_util::open_path(path).map_err(SyncError::Io)
 }
 
 /// Status of the background sync engine.
@@ -464,7 +432,7 @@ pub(crate) struct TrayMenuIds {
 }
 
 /// Encapsulates tray icon menus, event dispatching, and UI state synchronization.
-pub struct TrayController<H: TrayActionHandler + ?Sized> {
+pub(crate) struct TrayController<H: TrayActionHandler + ?Sized> {
     tray_icon: tray_icon::TrayIcon,
     menu_ids: TrayMenuIds,
     startup_toggle: CheckMenuItem,
@@ -773,11 +741,13 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
     }
 
     /// Retrieve the current exit reason.
+    #[allow(dead_code)]
     pub fn exit_reason(&self) -> TrayExitReason {
         self.exit_reason.get()
     }
 
     /// Read-only access to inner TrayState for inspection.
+    #[allow(dead_code)]
     pub fn state(&self) -> &TrayState {
         &self.state
     }
@@ -840,6 +810,28 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
     Ok(exit_reason.get())
 }
 
+struct WinitStatusObserver {
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+}
+
+impl SyncStatusObserver for WinitStatusObserver {
+    fn on_target_status_change(&self, target_index: usize, state: ConnectivityState) {
+        let _ = self
+            .proxy
+            .send_event(UserEvent::StatusUpdate(TargetStatusUpdate {
+                target_index,
+                dest_online: state,
+            }));
+    }
+
+    fn on_watcher_status_change(&self, source: ConnectivityState, watcher: WatcherState) {
+        let _ = self.proxy.send_event(UserEvent::WatcherStatus {
+            source_online: source,
+            watcher_active: watcher,
+        });
+    }
+}
+
 /// Wrapper around the native UI event loop to encapsulate windowing dependencies.
 pub struct TrayEventLoop {
     inner: winit::event_loop::EventLoop<UserEvent>,
@@ -857,6 +849,13 @@ impl TrayEventLoop {
     /// Create an event proxy for dispatching events from background threads.
     pub fn create_proxy(&self) -> winit::event_loop::EventLoopProxy<UserEvent> {
         self.inner.create_proxy()
+    }
+
+    /// Create a status observer handle that dispatches status updates to the tray event loop.
+    pub fn status_observer(&self) -> Arc<dyn SyncStatusObserver> {
+        Arc::new(WinitStatusObserver {
+            proxy: self.create_proxy(),
+        })
     }
 
     /// Run the tray event loop, blocking the main thread.

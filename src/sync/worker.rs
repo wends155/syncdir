@@ -490,6 +490,25 @@ impl<E: SyncEngine> SyncWorkerContext<E> {
     pub fn source_online_atomic(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.source_connectivity.raw_arc()
     }
+
+    /// Construct a test-friendly `SyncWorkerContext`.
+    pub fn for_test(
+        target_index: usize,
+        config: impl Into<TargetSyncConfig>,
+        engine: E,
+        rx: std::sync::mpsc::Receiver<SyncCommand>,
+        observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
+        source_connectivity: impl Into<SourceConnectivityTracker>,
+    ) -> Self {
+        Self::new(
+            target_index,
+            config,
+            engine,
+            rx,
+            observer,
+            source_connectivity,
+        )
+    }
 }
 
 /// Calculates exponential backoff duration based on the number of attempts.
@@ -538,11 +557,11 @@ pub enum WorkerTickOutcome {
 /// Encapsulates worker context, debounce priority queues, reachability monitors, and execution
 /// state, allowing deterministic, zero-sleep stepping through time via [`SyncWorkerRunner::tick`].
 pub struct SyncWorkerRunner<E: SyncEngine> {
-    pub context: SyncWorkerContext<E>,
-    pub queue: DebounceQueue,
-    pub reachability: ReachabilityMonitor,
+    pub(crate) context: SyncWorkerContext<E>,
+    pub(crate) queue: DebounceQueue,
+    pub(crate) reachability: ReachabilityMonitor,
     pub(crate) state: SyncWorkerState,
-    pub drain_threshold: usize,
+    pub(crate) drain_threshold: usize,
 }
 
 impl<E: SyncEngine> SyncWorkerRunner<E> {

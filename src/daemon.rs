@@ -106,11 +106,11 @@ impl<R: RegistryBackend + Send + Sync + 'static> TrayActionHandler for DaemonTra
     }
 
     fn on_open_config(&self) -> Result<(), SyncError> {
-        crate::tray::open_path(&self.config_path)
+        crate::path_util::open_path(&self.config_path).map_err(SyncError::Io)
     }
 
     fn on_view_logs(&self) -> Result<(), SyncError> {
-        crate::tray::open_path(&self.log_dir)
+        crate::path_util::open_path(&self.log_dir).map_err(SyncError::Io)
     }
 }
 

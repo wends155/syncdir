@@ -9,37 +9,11 @@ use std::sync::Arc;
 use syncdir::config::Config;
 use syncdir::daemon::{DaemonTrayHandler, SyncDaemon};
 use syncdir::error::SyncError;
-use syncdir::sync::{ConnectivityState, SyncStatusObserver, WatcherState};
+use syncdir::sync::ConnectivityState;
 use syncdir::tray::{DestinationState, TrayEventLoop, TrayExitReason};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-struct WinitStatusObserver {
-    proxy: winit::event_loop::EventLoopProxy<syncdir::tray::UserEvent>,
-}
-
-impl SyncStatusObserver for WinitStatusObserver {
-    fn on_target_status_change(&self, target_index: usize, state: ConnectivityState) {
-        let _ = self
-            .proxy
-            .send_event(syncdir::tray::UserEvent::StatusUpdate(
-                syncdir::tray::TargetStatusUpdate {
-                    target_index,
-                    dest_online: state,
-                },
-            ));
-    }
-
-    fn on_watcher_status_change(&self, source: ConnectivityState, watcher: WatcherState) {
-        let _ = self
-            .proxy
-            .send_event(syncdir::tray::UserEvent::WatcherStatus {
-                source_online: source,
-                watcher_active: watcher,
-            });
-    }
-}
 
 fn try_main(app_dir: PathBuf) -> Result<TrayExitReason, SyncError> {
     let log_dir = app_dir.join("logs");
@@ -103,16 +77,13 @@ retry_interval_seconds = 10
 
     // Initialize winit event loop on main thread before creating threads
     let tray_loop = TrayEventLoop::new()?;
-    let event_proxy = tray_loop.create_proxy();
+    let observer = tray_loop.status_observer();
 
     let destinations: Vec<DestinationState> = config
         .resolved_dest_dirs()
         .into_iter()
         .map(|d| DestinationState::new(d, ConnectivityState::Offline))
         .collect();
-
-    let observer: Arc<dyn SyncStatusObserver> =
-        Arc::new(WinitStatusObserver { proxy: event_proxy });
 
     // Start daemon orchestrator
     let daemon = SyncDaemon::start(config, &app_dir, Some(observer))?;
