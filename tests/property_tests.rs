@@ -68,7 +68,7 @@ proptest! {
         let dest_mod = src_mod + delta;
 
         let record = if has_matching_record {
-            Some(syncdir::db::FileRecord::new(PathBuf::from("file.bin"), size, src_mod).with_id(1))
+            Some(syncdir::db::FileRecord::new(PathBuf::from("file.bin"), size as u64, src_mod).with_id(1))
         } else {
             None
         };

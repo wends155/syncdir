@@ -15,6 +15,7 @@ use super::path_safety::{
 };
 use super::scanner::scan_dir;
 
+#[allow(unused_imports)]
 pub use super::types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
 
 /// Commands sent from the file watcher or tray UI to the sync worker thread.
@@ -260,8 +261,8 @@ impl FileMetadataSnapshot {
         record: Option<&crate::db::FileRecord>,
     ) -> bool {
         if let Some(record) = record
-            && record.file_size == self.size
-            && record.last_modified == self.modified_epoch_millis
+            && record.file_size() as i64 == self.size
+            && record.last_modified() == self.modified_epoch_millis
             && dest.size == self.size
             && dest
                 .modified_epoch_millis
@@ -277,8 +278,8 @@ impl FileMetadataSnapshot {
 impl From<&crate::db::FileRecord> for FileMetadataSnapshot {
     fn from(record: &crate::db::FileRecord) -> Self {
         Self {
-            size: record.file_size.max(0),
-            modified_epoch_millis: record.last_modified.max(0),
+            size: record.file_size() as i64,
+            modified_epoch_millis: record.last_modified().max(0),
         }
     }
 }
@@ -635,8 +636,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
             if dest_size == src_size && dest_mod.abs_diff(src_mod) <= 2000 {
                 if let Some(record) = file_record
                     && record.is_tracked()
-                    && record.file_size == src_size
-                    && record.last_modified == src_mod
+                    && record.file_size() == src_size as u64
+                    && record.last_modified() == src_mod
                 {
                     tracing::debug!(path = %rel_path.display(), "Local signature cache hit and destination matches, skipping sync");
                     return Ok(None);
@@ -657,7 +658,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             }
         }
 
-        let cached_id = file_record.and_then(|r| r.id);
+        let cached_id = file_record.and_then(|r| r.id());
         let task = FileSyncTask {
             rel_path,
             src_path: &src_path,
@@ -765,7 +766,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let cached_records = self.db.list_all_records()?;
         let cached_lookup: HashMap<PathBuf, &FileRecord> = cached_records
             .values()
-            .map(|rec| (crate::path_util::normalize_path(&rec.relative_path), rec))
+            .map(|rec| (crate::path_util::normalize_path(rec.relative_path()), rec))
             .collect();
 
         // Sync all source files
@@ -1364,7 +1365,7 @@ mod tests {
         let src_size = meta.len() as i64;
         let src_mod = safe_modified_millis(&meta).unwrap();
 
-        let record = FileRecord::new(file_rel.to_path_buf(), src_size, src_mod).with_id(42);
+        let record = FileRecord::new(file_rel.to_path_buf(), src_size as u64, src_mod).with_id(42);
 
         let config = Config::test_default(src, dst.clone());
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
@@ -1400,7 +1401,7 @@ mod tests {
         let src_size = meta.len() as i64;
         let src_mod = safe_modified_millis(&meta).unwrap();
 
-        let record = FileRecord::new(file_rel.to_path_buf(), src_size, src_mod).with_id(99);
+        let record = FileRecord::new(file_rel.to_path_buf(), src_size as u64, src_mod).with_id(99);
         let config = Config::test_default(src, dst.clone());
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
@@ -1508,12 +1509,8 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
 
         // 1. Verify From<&FileRecord> for FileMetadataSnapshot
-        let rec = crate::db::FileRecord {
-            id: Some(42),
-            relative_path: PathBuf::from("rec.txt"),
-            file_size: 1024,
-            last_modified: 1_700_000_000_000,
-        };
+        let rec = crate::db::FileRecord::new(PathBuf::from("rec.txt"), 1024, 1_700_000_000_000)
+            .with_id(42);
         let snap = FileMetadataSnapshot::from(&rec);
         assert_eq!(snap.size, 1024);
         assert_eq!(snap.modified_epoch_millis, 1_700_000_000_000);
@@ -1720,7 +1717,8 @@ mod tests {
         engine.sync_small_file(&task).unwrap();
         let record = store.get_file(Path::new("small.txt")).unwrap().unwrap();
         assert_eq!(
-            record.file_size, 500,
+            record.file_size(),
+            500,
             "Saved record must use actual bytes copied (500), not stale task.src_size (1000)"
         );
     }
@@ -1983,12 +1981,7 @@ mod tests {
         // Case 1: Destination file exists but has an exclusive lock
         let locked_file = dst.join("locked.txt");
         std::fs::write(&locked_file, "secret").unwrap();
-        let rec1 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("locked.txt"),
-            file_size: 6,
-            last_modified: 100,
-        };
+        let rec1 = FileRecord::new(PathBuf::from("locked.txt"), 6, 100);
         store.save_file(&rec1, &[]).unwrap();
 
         #[cfg(windows)]
@@ -2012,12 +2005,7 @@ mod tests {
         }
 
         // Case 2: Destination file is genuinely absent (NotFound)
-        let rec2 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("absent.txt"),
-            file_size: 10,
-            last_modified: 200,
-        };
+        let rec2 = FileRecord::new(PathBuf::from("absent.txt"), 10, 200);
         store.save_file(&rec2, &[]).unwrap();
         assert!(store.get_file(Path::new("absent.txt")).unwrap().is_some());
 
@@ -2042,12 +2030,7 @@ mod tests {
         let target_cfg_no_prop =
             TargetSyncConfig::from_config(&config_no_prop, dst.clone()).unwrap();
         let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
-        let rec3 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("unprop.txt"),
-            file_size: 4,
-            last_modified: 300,
-        };
+        let rec3 = FileRecord::new(PathBuf::from("unprop.txt"), 4, 300);
         store.save_file(&rec3, &[]).unwrap();
         assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_some());
 
@@ -2260,12 +2243,7 @@ mod tests {
         std::fs::write(dst.join("README.TXT"), b"hello").unwrap();
 
         let db = MockHashStore::new();
-        let old_record = FileRecord {
-            id: Some(1),
-            relative_path: PathBuf::from("README.TXT"),
-            file_size: 5,
-            last_modified: 1000,
-        };
+        let old_record = FileRecord::new(PathBuf::from("README.TXT"), 5, 1000).with_id(1);
         db.save_file(&old_record, &[]).unwrap();
 
         let config = Config::builder(src.clone())

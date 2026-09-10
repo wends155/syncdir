@@ -187,12 +187,12 @@ impl SmallFileTransferEngine {
         fs::rename(&temp_path, task.dest_path)?;
         temp_guard.disarm();
 
-        let record = FileRecord {
-            id: task.cached_id,
-            relative_path: task.rel_path.to_path_buf(),
-            file_size: total_bytes_copied as i64,
-            last_modified: task.src_mod,
-        };
+        let record = FileRecord::new(
+            task.rel_path.to_path_buf(),
+            total_bytes_copied,
+            task.src_mod,
+        )
+        .with_optional_id(task.cached_id);
         tracing::info!(
             path = %task.rel_path.display(),
             target = %task.dest_dir.display(),
@@ -392,8 +392,8 @@ mod tests {
 
         let mut scratch = vec![0u8; 64 * 1024];
         let (record, block_hashes) = engine.sync_small_file_core(&task, &mut scratch).unwrap();
-        assert_eq!(record.relative_path, Path::new("hello.txt"));
-        assert_eq!(record.file_size, meta.len() as i64);
+        assert_eq!(record.relative_path(), Path::new("hello.txt"));
+        assert_eq!(record.file_size(), meta.len());
         assert!(block_hashes.is_empty());
         assert_eq!(fs::read(&dst_file).unwrap(), b"Hello standalone engine!");
     }
@@ -430,7 +430,7 @@ mod tests {
 
         let mut scratch = vec![0u8; 64 * 1024];
         let (record, hashes) = engine.sync_small_file_core(&task, &mut scratch).unwrap();
-        assert_eq!(record.file_size, content.len() as i64);
+        assert_eq!(record.file_size(), content.len() as u64);
         assert!(hashes.is_empty());
         assert_eq!(fs::read(&dst_file).unwrap(), content);
     }

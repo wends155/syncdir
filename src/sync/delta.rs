@@ -444,12 +444,9 @@ impl<S: HashStore> DeltaTransferEngine<S> {
                 );
             }
 
-            let record = FileRecord {
-                id: task.cached_id,
-                relative_path: task.rel_path.to_path_buf(),
-                file_size: total_bytes_read as i64,
-                last_modified: task.src_mod,
-            };
+            let record =
+                FileRecord::new(task.rel_path.to_path_buf(), total_bytes_read, task.src_mod)
+                    .with_optional_id(task.cached_id);
             tracing::info!(
                 path = %task.rel_path.display(),
                 target = %task.dest_dir.display(),
@@ -735,12 +732,7 @@ mod tests {
         let store = MockHashStore::new();
         let h0 = *blake3::hash(&[0xEE; 512]).as_bytes();
         let h1 = *blake3::hash(&[0xEE; 512]).as_bytes();
-        let rec = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("large.bin"),
-            file_size: 1024,
-            last_modified: 100,
-        };
+        let rec = FileRecord::new(PathBuf::from("large.bin"), 1024, 100);
         store.save_file(&rec, &[h0, h1]).unwrap();
 
         let dst_file_clone = dst_file.clone();
@@ -891,8 +883,8 @@ mod tests {
         let (record, block_hashes) = engine
             .sync_delta_large_file_core(&task, &mut scratch)
             .unwrap();
-        assert_eq!(record.relative_path, Path::new("large.bin"));
-        assert_eq!(record.file_size, 1024);
+        assert_eq!(record.relative_path(), Path::new("large.bin"));
+        assert_eq!(record.file_size(), 1024);
         assert_eq!(block_hashes.len(), 2);
         assert_eq!(fs::read(&dst_file).unwrap(), payload);
         assert!(

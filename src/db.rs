@@ -12,16 +12,16 @@ use std::sync::Mutex;
 /// Metadata record for a tracked file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
-    pub(crate) id: Option<i64>,
-    pub relative_path: PathBuf,
-    /// File size in bytes. Uses `i64` to match SQLite INTEGER column type.
-    pub file_size: i64,
-    pub last_modified: i64,
+    id: Option<i64>,
+    relative_path: PathBuf,
+    /// File size in bytes.
+    file_size: u64,
+    last_modified: i64,
 }
 
 impl FileRecord {
     /// Create a new file record without a database surrogate ID.
-    pub fn new(relative_path: impl Into<PathBuf>, file_size: i64, last_modified: i64) -> Self {
+    pub fn new(relative_path: impl Into<PathBuf>, file_size: u64, last_modified: i64) -> Self {
         Self {
             id: None,
             relative_path: relative_path.into(),
@@ -30,21 +30,48 @@ impl FileRecord {
         }
     }
 
-    /// Attach a surrogate database ID to the record (used for testing and persistence).
+    /// Attach a surrogate database ID to the record.
     #[must_use]
     pub fn with_id(mut self, id: i64) -> Self {
         self.id = Some(id);
         self
     }
 
+    /// Attach an optional surrogate database ID to the record.
+    #[must_use]
+    pub fn with_optional_id(mut self, id: Option<i64>) -> Self {
+        self.id = id;
+        self
+    }
+
     /// Returns the database surrogate ID if persisted.
+    #[must_use]
     pub fn id(&self) -> Option<i64> {
         self.id
     }
 
     /// Returns `true` if this file record has been persisted to the database.
+    #[must_use]
     pub fn is_tracked(&self) -> bool {
         self.id.is_some()
+    }
+
+    /// Returns the relative path of the file.
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    /// Returns the size of the file in bytes.
+    #[must_use]
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Returns the last modified timestamp in milliseconds since UNIX epoch.
+    #[must_use]
+    pub fn last_modified(&self) -> i64 {
+        self.last_modified
     }
 }
 
@@ -363,10 +390,11 @@ impl HashStore for SqliteHashStore {
         let mut rows = stmt.query(params![key])?;
         if let Some(row) = rows.next()? {
             let path_str: String = row.get(1)?;
+            let size_i64: i64 = row.get(2)?;
             Ok(Some(FileRecord {
                 id: Some(row.get(0)?),
                 relative_path: PathBuf::from(path_str),
-                file_size: row.get(2)?,
+                file_size: size_i64.max(0) as u64,
                 last_modified: row.get(3)?,
             }))
         } else {
@@ -388,7 +416,7 @@ impl HashStore for SqliteHashStore {
                file_size = excluded.file_size, \
                last_modified = excluded.last_modified \
              RETURNING id",
-            params![key, record.file_size, record.last_modified],
+            params![key, record.file_size as i64, record.last_modified],
             |row| row.get(0),
         )?;
 
@@ -425,7 +453,7 @@ impl HashStore for SqliteHashStore {
                    file_size = excluded.file_size, \
                    last_modified = excluded.last_modified \
                  RETURNING id",
-                params![key, record.file_size, record.last_modified],
+                params![key, record.file_size as i64, record.last_modified],
                 |row| row.get(0),
             )?;
             {
@@ -549,7 +577,7 @@ impl HashStore for SqliteHashStore {
                 FileRecord {
                     id: Some(id),
                     relative_path: rel_path,
-                    file_size,
+                    file_size: file_size.max(0) as u64,
                     last_modified,
                 },
             );
@@ -654,8 +682,7 @@ impl HashStore for MockHashStore {
             assigned
         };
 
-        let mut updated = record.clone();
-        updated.id = Some(id);
+        let updated = record.clone().with_id(id);
         inner.records.insert(key, updated);
         inner.hashes.insert(id, hashes.to_vec());
         Ok(())
@@ -767,8 +794,7 @@ impl HashStore for MockHashStore {
                 inner.next_id += 1;
                 assigned
             };
-            let mut updated = (*record).clone();
-            updated.id = Some(id);
+            let updated = (*record).clone().with_id(id);
             inner.records.insert(key, updated);
             inner.hashes.insert(id, hashes.to_vec());
         }
@@ -819,6 +845,19 @@ mod tests {
 
     fn dummy_store_config(block_size: u64) -> StoreConfig {
         StoreConfig::new(block_size, block_size * 2).expect("test block_size must be > 0")
+    }
+
+    #[test]
+    fn test_file_record_encapsulation_and_getters() {
+        use crate::db::FileRecord;
+        let rec = FileRecord::new("sub/doc.txt", 4096u64, 1690000000i64).with_id(99);
+        assert_eq!(rec.relative_path(), std::path::Path::new("sub/doc.txt"));
+        assert_eq!(rec.file_size(), 4096u64);
+        assert_eq!(rec.last_modified(), 1690000000i64);
+        assert_eq!(rec.id(), Some(99));
+
+        let rec2 = FileRecord::new("test.bin", 0u64, 100i64).with_optional_id(None);
+        assert_eq!(rec2.id(), None);
     }
 
     #[test]
@@ -1277,7 +1316,11 @@ mod tests {
         let records: Vec<(FileRecord, Vec<BlockHash>)> = (0..100)
             .map(|i| {
                 (
-                    FileRecord::new(format!("file_{}.txt", i), i * 100, i * 1000),
+                    FileRecord::new(
+                        format!("file_{}.txt", i),
+                        (i as u64) * 100,
+                        (i as i64) * 1000,
+                    ),
                     vec![],
                 )
             })
@@ -1315,7 +1358,11 @@ mod tests {
         )
         .unwrap();
         for i in 0..10 {
-            let record = FileRecord::new(format!("file_{}.txt", i), i * 100, i * 1000);
+            let record = FileRecord::new(
+                format!("file_{}.txt", i),
+                (i as u64) * 100,
+                (i as i64) * 1000,
+            );
             store.save_file(&record, &[]).unwrap();
         }
         assert_eq!(store.list_files().unwrap().len(), 10);
