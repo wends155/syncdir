@@ -6,6 +6,7 @@
 use crate::config::Config;
 use crate::db::{SqliteHashStore, StoreConfig};
 use crate::error::SyncError;
+use crate::path_util::is_same_or_descendant;
 use crate::startup::RegistryBackend;
 use crate::sync::{
     LocalSyncEngine, SyncCommand, SyncEngine, SyncStatusObserver, SyncWorkerContext,
@@ -142,10 +143,7 @@ impl SyncEngineFactory for SqliteEngineFactory {
         app_dir: &Path,
     ) -> Result<Self::Engine, SyncError> {
         let dest = target_config.dest_dir();
-        let dest_str = dest.to_string_lossy();
-        let hash = blake3::hash(dest_str.as_bytes());
-        let db_filename = format!("sigcache_{}.db", hash.to_hex());
-        let db_path = app_dir.join(db_filename);
+        let db_path = SqliteHashStore::cache_db_path(app_dir, dest);
 
         tracing::info!(
             target_index = target_index + 1,
@@ -195,12 +193,12 @@ impl SyncDaemon {
 
         // 1. Check source vs destination loops
         for (dest, dest_unc) in &dests {
-            let is_loop = crate::config::is_same_or_descendant(&src_unc, dest_unc)
-                || crate::config::is_same_or_descendant(dest_unc, &src_unc)
-                || crate::config::is_same_or_descendant(src_orig, dest_unc)
-                || crate::config::is_same_or_descendant(dest_unc, src_orig)
-                || crate::config::is_same_or_descendant(&src_unc, dest)
-                || crate::config::is_same_or_descendant(dest, &src_unc);
+            let is_loop = is_same_or_descendant(&src_unc, dest_unc)
+                || is_same_or_descendant(dest_unc, &src_unc)
+                || is_same_or_descendant(src_orig, dest_unc)
+                || is_same_or_descendant(dest_unc, src_orig)
+                || is_same_or_descendant(&src_unc, dest)
+                || is_same_or_descendant(dest, &src_unc);
 
             if is_loop {
                 return Err(SyncError::validation(format!(
@@ -219,12 +217,12 @@ impl SyncDaemon {
                 let (d1, d1_unc) = &dests[i];
                 let (d2, d2_unc) = &dests[j];
 
-                let is_dest_dest_overlap = crate::config::is_same_or_descendant(d1_unc, d2_unc)
-                    || crate::config::is_same_or_descendant(d2_unc, d1_unc)
-                    || crate::config::is_same_or_descendant(d1, d2_unc)
-                    || crate::config::is_same_or_descendant(d2_unc, d1)
-                    || crate::config::is_same_or_descendant(d1_unc, d2)
-                    || crate::config::is_same_or_descendant(d2, d1_unc);
+                let is_dest_dest_overlap = is_same_or_descendant(d1_unc, d2_unc)
+                    || is_same_or_descendant(d2_unc, d1_unc)
+                    || is_same_or_descendant(d1, d2_unc)
+                    || is_same_or_descendant(d2_unc, d1)
+                    || is_same_or_descendant(d1_unc, d2)
+                    || is_same_or_descendant(d2, d1_unc);
 
                 if is_dest_dest_overlap {
                     return Err(SyncError::validation(format!(

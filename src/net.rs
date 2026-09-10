@@ -192,7 +192,7 @@ mod ffi {
 /// to its underlying remote UNC share path (e.g. "\\\\172.16.0.193\\share").
 /// Returns `None` on non-Windows platforms, unmapped drives, or API errors.
 #[cfg(target_os = "windows")]
-pub(crate) fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
+fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     let local_name: Vec<u16> = std::ffi::OsStr::new(drive_prefix)
         .encode_wide()
@@ -218,14 +218,14 @@ pub(crate) fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn resolve_mapped_drive_unc(_drive_prefix: &str) -> Option<String> {
+fn resolve_mapped_drive_unc(_drive_prefix: &str) -> Option<String> {
     None
 }
 
 /// Attempt to convert a path starting with a Windows drive letter into a full UNC network path.
 /// If the path starts with a drive letter and `WNetGetConnectionW` succeeds, returns the combined UNC path.
 /// Otherwise, returns the original normalized path unchanged.
-pub(crate) fn try_resolve_unc_path(path: impl AsRef<Path>) -> PathBuf {
+fn try_resolve_unc_path(path: impl AsRef<Path>) -> PathBuf {
     let normalized = normalize_path(path);
     let s = normalized.to_string_lossy();
 
@@ -252,7 +252,7 @@ pub(crate) fn try_resolve_unc_path(path: impl AsRef<Path>) -> PathBuf {
 /// Returns `SyncError::Validation` if the path is not a valid UNC path or share,
 /// or `SyncError::Io` if `WNetAddConnection2W` fails.
 #[cfg(target_os = "windows")]
-pub(crate) fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
+fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
     use std::os::windows::ffi::OsStrExt;
     let unc_path = unc_path.as_ref();
     let (host, share) = crate::path_util::parse_unc_host_and_share(unc_path).ok_or_else(|| {
@@ -295,7 +295,7 @@ pub(crate) fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(),
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
+fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
     let unc_path = unc_path.as_ref();
     if crate::path_util::parse_unc_host_and_share(unc_path).is_none() {
         return Err(SyncError::validation(format!(
@@ -337,7 +337,7 @@ fn find_prefix_byte_boundary(original: &str, lower_prefix: &str) -> Option<usize
 
 /// Reverse-lookup active Win32 mapped drive letters ('A'..='Z') to find a drive letter
 /// mapped to a prefix of the given UNC path.
-pub(crate) fn find_mapped_drive_for_unc(unc_path: impl AsRef<Path>) -> Option<PathBuf> {
+fn find_mapped_drive_for_unc(unc_path: impl AsRef<Path>) -> Option<PathBuf> {
     let normalized = normalize_path(unc_path);
     let original_str = normalized.to_string_lossy();
     let unc_str_lower = original_str.to_lowercase();
@@ -391,7 +391,7 @@ pub(crate) fn find_mapped_drive_for_unc(unc_path: impl AsRef<Path>) -> Option<Pa
 ///    and `find_mapped_drive_for_unc`.
 ///
 /// Returns the resolved alternate path if accessible, or original normalized path.
-pub(crate) fn try_resolve_alternate_path(path: impl AsRef<Path>) -> PathBuf {
+fn try_resolve_alternate_path(path: impl AsRef<Path>) -> PathBuf {
     let normalized = normalize_path(path);
 
     // If path is accessible directly, return normalized

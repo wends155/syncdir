@@ -40,13 +40,13 @@ impl MockSyncEngine {
 
     /// Set an error factory to be returned by future sync and delete operations.
     pub fn set_sync_error(&self, error_fn: impl Fn() -> SyncError + Send + Sync + 'static) {
-        let mut err = self.sync_error_fn.lock().unwrap();
+        let mut err = self.sync_error_fn.lock().unwrap_or_else(|p| p.into_inner());
         *err = Some(std::sync::Arc::new(error_fn));
     }
 
     /// Clear configured sync error factory.
     pub fn clear_sync_error(&self) {
-        let mut err = self.sync_error_fn.lock().unwrap();
+        let mut err = self.sync_error_fn.lock().unwrap_or_else(|p| p.into_inner());
         *err = None;
     }
 
@@ -55,13 +55,13 @@ impl MockSyncEngine {
         &self,
         handler: impl Fn(&Path) -> Result<(), SyncError> + Send + Sync + 'static,
     ) {
-        let mut h = self.sync_handler.lock().unwrap();
+        let mut h = self.sync_handler.lock().unwrap_or_else(|p| p.into_inner());
         *h = Some(std::sync::Arc::new(handler));
     }
 
     /// Clear configured sync handler.
     pub fn clear_sync_handler(&self) {
-        let mut h = self.sync_handler.lock().unwrap();
+        let mut h = self.sync_handler.lock().unwrap_or_else(|p| p.into_inner());
         *h = None;
     }
 
@@ -70,40 +70,58 @@ impl MockSyncEngine {
         &self,
         handler: impl Fn(&Path) -> Result<(), SyncError> + Send + Sync + 'static,
     ) {
-        let mut h = self.delete_handler.lock().unwrap();
+        let mut h = self
+            .delete_handler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         *h = Some(std::sync::Arc::new(handler));
     }
 
     /// Clear configured delete handler.
     pub fn clear_delete_handler(&self) {
-        let mut h = self.delete_handler.lock().unwrap();
+        let mut h = self
+            .delete_handler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         *h = None;
     }
 
     /// Set the scan outcome to be returned by `run_full_scan`.
     pub fn set_scan_outcome(&self, outcome: Option<ScanOutcome>) {
-        let mut sc = self.scan_outcome.lock().unwrap();
+        let mut sc = self.scan_outcome.lock().unwrap_or_else(|p| p.into_inner());
         *sc = outcome;
     }
 
     /// Return recorded (rel_path, dest_dir) tuples for `sync_file` calls.
     pub fn synced_calls(&self) -> Vec<(PathBuf, PathBuf)> {
-        self.synced_calls.lock().unwrap().clone()
+        self.synced_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Return recorded (rel_path, dest_dir) tuples for `delete_file` calls.
     pub fn deleted_calls(&self) -> Vec<(PathBuf, PathBuf)> {
-        self.deleted_calls.lock().unwrap().clone()
+        self.deleted_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Return recorded failed calls with path and error description.
     pub fn failed_calls(&self) -> Vec<(PathBuf, String)> {
-        self.failed_calls.lock().unwrap().clone()
+        self.failed_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Return recorded `prune_archive` destination directories.
     pub fn prune_archive_calls(&self) -> Vec<PathBuf> {
-        self.prune_calls.lock().unwrap().clone()
+        self.prune_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Return recorded `prune_archive` destination directories (alias).
@@ -113,7 +131,7 @@ impl MockSyncEngine {
 
     /// Return count of `run_full_scan` calls.
     pub fn full_scans_count(&self) -> usize {
-        *self.full_scans.lock().unwrap()
+        *self.full_scans.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -129,11 +147,19 @@ impl SyncEngine for MockSyncEngine {
         _scratch: &mut [u8],
     ) -> Result<(), SyncError> {
         let res: Result<(), SyncError> = (|| {
-            let handler = self.sync_handler.lock().unwrap().clone();
+            let handler = self
+                .sync_handler
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             if let Some(h) = handler {
                 h(path)?;
             } else {
-                let err_fn = self.sync_error_fn.lock().unwrap().clone();
+                let err_fn = self
+                    .sync_error_fn
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
                 if let Some(f) = err_fn {
                     return Err(f());
                 }
@@ -145,14 +171,14 @@ impl SyncEngine for MockSyncEngine {
             Ok(()) => {
                 self.synced_calls
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .push((path.to_path_buf(), dest_dir.to_path_buf()));
                 Ok(())
             }
             Err(e) => {
                 self.failed_calls
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .push((path.to_path_buf(), e.to_string()));
                 Err(e)
             }
@@ -165,11 +191,19 @@ impl SyncEngine for MockSyncEngine {
 
     fn delete_file_from_dest(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
         let res: Result<(), SyncError> = (|| {
-            let handler = self.delete_handler.lock().unwrap().clone();
+            let handler = self
+                .delete_handler
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             if let Some(h) = handler {
                 h(path)?;
             } else {
-                let err_fn = self.sync_error_fn.lock().unwrap().clone();
+                let err_fn = self
+                    .sync_error_fn
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
                 if let Some(f) = err_fn {
                     return Err(f());
                 }
@@ -181,14 +215,14 @@ impl SyncEngine for MockSyncEngine {
             Ok(()) => {
                 self.deleted_calls
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .push((path.to_path_buf(), dest_dir.to_path_buf()));
                 Ok(())
             }
             Err(e) => {
                 self.failed_calls
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .push((path.to_path_buf(), e.to_string()));
                 Err(e)
             }
@@ -196,13 +230,17 @@ impl SyncEngine for MockSyncEngine {
     }
 
     fn prune_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
-        let err_fn = self.sync_error_fn.lock().unwrap().clone();
+        let err_fn = self
+            .sync_error_fn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         if let Some(f) = err_fn {
             return Err(f());
         }
         self.prune_calls
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .push(dest_dir.to_path_buf());
         Ok(())
     }
@@ -215,12 +253,21 @@ impl SyncEngine for MockSyncEngine {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(SyncError::Cancelled);
         }
-        *self.full_scans.lock().unwrap() += 1;
-        let err_fn = self.sync_error_fn.lock().unwrap().clone();
+        *self.full_scans.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        let err_fn = self
+            .sync_error_fn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         if let Some(f) = err_fn {
             return Err(f());
         }
-        if let Some(outcome) = self.scan_outcome.lock().unwrap().clone() {
+        if let Some(outcome) = self
+            .scan_outcome
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
             return Ok(outcome);
         }
         Ok(ScanOutcome::Success { synced: 0 })

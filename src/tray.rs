@@ -12,14 +12,6 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use winit::event::Event;
 use winit::event_loop::ControlFlow;
 
-/// Open a file or directory in the system default application.
-///
-/// Delegates to [`crate::path_util::open_path`].
-#[allow(dead_code)]
-pub fn open_path(path: &Path) -> Result<(), SyncError> {
-    crate::path_util::open_path(path).map_err(SyncError::Io)
-}
-
 /// Status of the background sync engine.
 ///
 /// Communicates the connectivity state of the source and destination directories
@@ -984,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_tray_open_path_nonexistent() {
-        let res = open_path(Path::new("Z:\\nonexistent_dir_12345\\missing"));
+        let res = crate::path_util::open_path(Path::new("Z:\\nonexistent_dir_12345\\missing"));
         assert!(res.is_err());
     }
 

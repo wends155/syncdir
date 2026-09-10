@@ -167,6 +167,7 @@ AND unrelated paths return `false`
 | `HashStore::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
 | `HashStore::list_files` | `(&self) -> Result<Vec<PathBuf>, SyncError>` | `Vec<PathBuf>` | `SyncError::Db` |
 | `SqliteHashStore::new` | `(db_path: &Path, config: impl Into<StoreConfig>) -> Result<Self, SyncError>` | `SqliteHashStore` | `SyncError::Db` |
+| `SqliteHashStore::cache_db_path` | `(app_dir: &Path, target_dest: &Path) -> PathBuf` | `PathBuf` | — (deterministic `sigcache_<blake3>.db` path generation) |
 | `MockHashStore::new` | `() -> Self` | `MockHashStore` | — |
 | `path_to_sqlite_key` | `(path: &Path) -> Result<String, SyncError>` | `String` | `SyncError::Validation` |
 | `StoreConfig::new` | `(block_size_bytes: u64, block_sync_threshold_bytes: u64) -> Self` | `StoreConfig` | — |
@@ -214,7 +215,7 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `SyncWorkerContext::new` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>, resolver: Arc<dyn NetworkResolver>) -> Self` | `SyncWorkerContext<E>` | — |
 | `SyncWorkerContext::for_test` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>) -> Self` | `SyncWorkerContext<E>` | — |
 | `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — (composes 4 collaborating transfer/scan engines) |
-| `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (reusable scratch buffer lease for zero-lock streaming) |
+| `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (pub(crate) reusable scratch buffer lease for zero-lock streaming) |
 | `LocalSyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (clears reparse cache) |
 | `LocalSyncEngine::evict_verified_dir` | `(&self, dir: &Path)` | `()` | — (evicts dir and descendants from cache) |
 | `SmallFileTransferEngine::new` | `(config: TargetSyncConfig) -> Self` | `SmallFileTransferEngine` | — (pub(crate) atomic small-file streaming) |
@@ -228,14 +229,14 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `FileMetadataSnapshot::from` | `(record: &FileRecord) -> Self` | `FileMetadataSnapshot` | — (converts database record to metadata snapshot) |
 | `MockSyncEngine::new` | `() -> Self` | `MockSyncEngine` | — |
 | `SourceConnectivityTracker::new` | `(initial: bool) -> Self` | `SourceConnectivityTracker` | — |
-| `DebounceQueue::new` | `(max_capacity: usize) -> Self` | `DebounceQueue` | — |
-| `DebounceQueue::len` | `(&self) -> usize` | `usize` | — (total count of pending syncs and deletes) |
-| `ReachabilityMonitor::new` | `(target_index: usize, configured_dest: PathBuf, retry_interval_seconds: u64, resolver: Arc<dyn NetworkResolver>) -> Self` | `ReachabilityMonitor` | — |
+| `DebounceQueue::new` | `(max_capacity: usize) -> Self` | `DebounceQueue` | — (pub(crate) internal debounce queue) |
+| `DebounceQueue::len` | `(&self) -> usize` | `usize` | — (pub(crate) total count of pending syncs and deletes) |
+| `ReachabilityMonitor::new` | `(target_index: usize, configured_dest: PathBuf, retry_interval_seconds: u64, resolver: Arc<dyn NetworkResolver>) -> Self` | `ReachabilityMonitor` | — (pub(crate) internal reachability monitor) |
 | `SyncWorkerState::new` | `(block_size_bytes: u64) -> Self` | `SyncWorkerState` | — |
-| `calculate_exponential_backoff` | `(attempts: u32, base_interval: Duration) -> Duration` | `Duration` | Capped at 300s |
+| `calculate_exponential_backoff` | `(attempts: u32, base_interval: Duration) -> Duration` | `Duration` | pub(crate) capped at 300s |
 | `is_metadata_up_to_date_raw` | `(record_mod: i64, record_size: i64, src_mod: i64, src_size: i64, dest_mod: i64, dest_size: i64) -> bool` | `bool` | Evaluates SMB ±2000ms timestamp tolerance |
 | `verify_destination_not_reparse` | `(dest_dir: &Path, rel_path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (rejects directory junctions in path) |
-| `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, verified_dirs: &mut HashSet<PathBuf>) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | `SyncError::Validation` (caches verified ancestor and root directories) |
+| `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, verified_dirs: &mut HashSet<PathBuf>) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | `SyncError::Validation` (pub(crate) caches verified ancestor and root directories) |
 | `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | — (rejects `..`, ADS, drive letters, reserved names) |
  
 #### Behavioral Scenarios

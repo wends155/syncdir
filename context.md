@@ -529,11 +529,23 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Reverse `db -> config` and `config -> db` coupling eliminated.
 >   - `main.rs` coupling to `winit` eliminated.
 
+---
 
-
-
-
-
-
-
-
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Bucket 1: Leaf & Facade Encapsulation Refactoring (`review_report.md` Findings 3, 4, 7, 9, 11, 12, 15, 17)
+> * **Changes:**
+>   - **DB & Daemon Cache Path Encapsulation (O1)**: Introduced `SqliteHashStore::cache_db_path(app_dir: &Path, target_dest: &Path) -> PathBuf` in `src/db.rs` with dedicated TDD unit test `test_sqlite_cache_db_path`. Removed raw Blake3 hashing and `sigcache_<hex>.db` path formatting from `SqliteEngineFactory::create_engine` in `src/daemon.rs`.
+>   - **Config & Daemon Path Coupling Severance (O2)**: Removed `pub use crate::path_util::{is_same_or_descendant, system_root};` from `src/config.rs`. Migrated 12 `is_same_or_descendant` callers in `src/daemon.rs` directly to `crate::path_util::is_same_or_descendant`. Updated `config.rs` unit tests to import `system_root` directly from `crate::path_util`.
+>   - **Leaf Module Encapsulation (Net, Monitor, Tray) (O3)**: Demoted 5 internal free functions (`resolve_mapped_drive_unc`, `try_resolve_unc_path`, `establish_smb_connection`, `find_mapped_drive_for_unc`, `try_resolve_alternate_path`) in `src/net.rs` to private `fn` across both Windows and non-Windows targets. Demoted `handle_watcher_result` and `dispatch_event` in `src/monitor.rs` to private `fn`. Deleted dead delegation wrapper `tray::open_path` in `src/tray.rs` and updated `test_tray_open_path_nonexistent` to invoke `crate::path_util::open_path`.
+>   - **Sync Subsystem Facade & Zero-Panic Mock (O4)**: Restricted `LocalSyncEngine::acquire_dirty_range_lease` visibility to `pub(crate)`. Replaced all 25 unchecked `.lock().unwrap()` calls in `MockSyncEngine` (`src/sync/mock.rs`) with `.lock().unwrap_or_else(|p| p.into_inner())` to satisfy zero-panic policy. Pruned unused worker internals (`DebounceQueue`, `ReachabilityMonitor`, `calculate_exponential_backoff`, `verify_destination_not_reparse_cached`) from `syncdir::sync` public facade while preserving `is_metadata_up_to_date_raw` for property tests.
+>   - **Full Quality Verification Gate (O5)**: Verified zero formatting diffs (`cargo fmt --all -- --check`), zero lint warnings (`cargo clippy --all-targets --all-features -- -D warnings`), and 100% test pass rate across all 299 automated tests (`cargo test --all-features`).
+> * **New Constraints:**
+>   - Callers generating cache database paths must invoke `SqliteHashStore::cache_db_path` rather than constructing database filenames directly.
+>   - `daemon.rs` must import path utilities directly from `crate::path_util`, never through re-exports in `config.rs`.
+>   - `MockSyncEngine` mutex locks must recover from poison via `unwrap_or_else(|p| p.into_inner())`.
+> * **Pruned:**
+>   - Leaked DB filename format and raw Blake3 hashing in `daemon.rs` eliminated.
+>   - Phantom dependency of `daemon.rs` on `config.rs` for path operations eliminated.
+>   - Dead `tray::open_path` wrapper eliminated.
+>   - Unchecked mutex lock panics in `MockSyncEngine` eliminated.
+>   - Clutter in `syncdir::sync` crate facade eliminated.

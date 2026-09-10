@@ -58,7 +58,7 @@ impl DirectoryWatcher {
         Ok(DirectoryWatcher { _watcher: watcher })
     }
 
-    pub(crate) fn handle_watcher_result(
+    fn handle_watcher_result(
         res: Result<Event, notify::Error>,
         source_root: &Path,
         tx: &Sender<SyncCommand>,
@@ -127,7 +127,7 @@ impl DirectoryWatcher {
     }
 
     /// Dispatches a filesystem notification event, translating paths relative to `source_root`.
-    pub(crate) fn dispatch_event(event: Event, source_root: &Path, tx: &Sender<SyncCommand>) {
+    fn dispatch_event(event: Event, source_root: &Path, tx: &Sender<SyncCommand>) {
         let mut send = |cmd: SyncCommand| -> bool {
             if let Err(e) = tx.send(cmd) {
                 tracing::error!(

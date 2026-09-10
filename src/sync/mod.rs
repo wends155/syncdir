@@ -19,9 +19,4 @@ pub use engine::{
 };
 pub use mock::MockSyncEngine;
 pub use path_safety::is_safe_relative_path;
-#[doc(hidden)]
-pub use path_safety::verify_destination_not_reparse_cached;
-pub use worker::{
-    DebounceQueue, ReachabilityMonitor, SourceConnectivityTracker, SyncWorkerContext,
-    calculate_exponential_backoff, start_sync_worker,
-};
+pub use worker::{SourceConnectivityTracker, SyncWorkerContext, start_sync_worker};

@@ -208,16 +208,19 @@ impl DebounceQueue {
     }
 
     /// Return true if both pending sync and delete queues are empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.pending_syncs.is_empty() && self.pending_deletes.is_empty()
     }
 
     /// Return count of pending syncs.
+    #[allow(dead_code)]
     pub fn pending_sync_count(&self) -> usize {
         self.pending_syncs.len()
     }
 
     /// Return count of pending deletes.
+    #[allow(dead_code)]
     pub fn pending_delete_count(&self) -> usize {
         self.pending_deletes.len()
     }
@@ -229,6 +232,7 @@ impl DebounceQueue {
 
     /// Returns the total number of pending operations (syncs + deletes).
     #[inline]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.pending_count()
     }

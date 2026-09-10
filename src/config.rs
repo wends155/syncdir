@@ -4,8 +4,8 @@
 //! exist and runtime parameters are sane.
 
 use crate::error::SyncError;
+use crate::path_util::is_same_or_descendant;
 use crate::path_util::normalize_path;
-pub use crate::path_util::{is_same_or_descendant, system_root};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -1191,6 +1191,7 @@ fn escape_backslashes_in_quotes(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_util::system_root;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 

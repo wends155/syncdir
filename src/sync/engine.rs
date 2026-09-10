@@ -433,7 +433,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
     /// # Returns
     ///
     /// A [`DirtyRangeLease`] handle providing mutable access to a pooled or newly allocated buffer.
-    pub fn acquire_dirty_range_lease(&self) -> DirtyRangeLease<'_> {
+    #[allow(dead_code)]
+    pub(crate) fn acquire_dirty_range_lease(&self) -> DirtyRangeLease<'_> {
         self.delta_engine.acquire_dirty_range_lease()
     }
 

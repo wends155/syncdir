@@ -226,6 +226,20 @@ pub struct SqliteHashStore {
 }
 
 impl SqliteHashStore {
+    /// Generate deterministic cache database path for a target destination directory.
+    ///
+    /// Naming format is `sigcache_<blake3_hex>.db` within `app_dir`.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic.
+    #[must_use]
+    pub fn cache_db_path(app_dir: &Path, target_dest: &Path) -> PathBuf {
+        let dest_str = target_dest.to_string_lossy();
+        let hash = blake3::hash(dest_str.as_bytes());
+        app_dir.join(format!("sigcache_{}.db", hash.to_hex()))
+    }
+
     /// Open (or create) the SQLite database and initialize the schema.
     ///
     /// Enforces foreign keys, creates tables if missing, and validates
@@ -1362,5 +1376,17 @@ mod tests {
             }
         })));
         assert!(store.list_all_records().is_err());
+    }
+
+    #[test]
+    fn test_sqlite_cache_db_path() {
+        let app_dir = Path::new(r"C:\AppData\syncdir");
+        let target = Path::new(r"\\server\share\folder");
+        let expected_hash = blake3::hash(target.to_string_lossy().as_bytes());
+        let expected_path = app_dir.join(format!("sigcache_{}.db", expected_hash.to_hex()));
+        assert_eq!(
+            SqliteHashStore::cache_db_path(app_dir, target),
+            expected_path
+        );
     }
 }
