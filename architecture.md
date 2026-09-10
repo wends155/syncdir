@@ -79,46 +79,47 @@ syncdir/
 ## 5. Module Boundaries
 
 ### `config`
-* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, strongly-typed path domain modeling via `TargetDir` (`TargetDir::new` enforcing drive roots `R:\`, UNC repair `\\172...`, and slash conversion at construction) and `DestinationCollection` (encapsulating destination lists with Windows case-insensitive deduplication while strictly preserving insertion order), encapsulated `TargetSyncConfig` with private fields and `TargetSyncConfigBuilder` enforcing construction invariants (non-empty destination collections, path format validation, recursive sync loop containment via `validate_target_containment`, strictly positive debounce and retry intervals, block size caps $\le 64$MB and positivity, and `block_sync_threshold_bytes >= block_size_bytes`), zero-copy `destinations()` slice, Serde backward-compatibility bridging via `RawConfig`, quote-aware TOML bracket parsing (`preprocess_config_toml`), strict path format validation (`Config::validate()` and `TargetDir::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\`), and runtime settings.
+* **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, strongly-typed path domain modeling via `TargetDir` (`TargetDir::new` enforcing drive roots `R:\`, UNC repair `\\172...`, and slash conversion at construction) and `DestinationCollection` (encapsulating destination lists with Windows case-insensitive deduplication while strictly preserving insertion order), encapsulated `TargetSyncConfig` with private fields and `TargetSyncConfigBuilder` enforcing construction invariants (non-empty destination collections, path format validation, recursive sync loop containment via `validate_target_containment`, strictly positive debounce and retry intervals, block size caps $\le 64$MB and positivity, and `block_sync_threshold_bytes >= block_size_bytes`), zero-copy `destinations()` slice, Serde backward-compatibility bridging via `RawConfig`, quote-aware TOML bracket parsing (`preprocess_config_toml`), strict path format validation (`Config::validate()` and `TargetDir::validate()` enforcing UNC network prefixes `\\` or drive letter targets `C:\`, `X:\`), `TargetSyncConfig::from_config` invariant enforcement returning `Result<Self, SyncError>`, `TryFrom<&Config> for StoreConfig` conversion, and runtime settings.
 * **Does NOT own**: Network path resolution (delegated to `net`), filesystem synchronization, database access.
 * **Trait Interfaces**: None.
 
 ### `path_util`
-* **Owns**: Crate-private path canonicalization leaf (`normalize_path`), drive root slash repair (`C:` -> `C:\`), single-backslash root normalization (`\` -> `\`), UNC backslash preservation, UNC host/share parsing (`parse_unc_host_and_share`), and lexical parent component collapsing (`collapse_components`). Pure leaf module with zero internal crate dependencies, resolving the historical circular dependency between `config` and `net`.
-* **Does NOT own**: Filesystem access, configuration modeling, network resolution.
+* **Owns**: Crate-private path canonicalization leaf (`normalize_path`), drive root slash repair (`C:` -> `C:\`), single-backslash root normalization (`\` -> `\`), UNC backslash preservation, UNC host/share parsing (`parse_unc_host_and_share`), lexical parent component collapsing (`collapse_components`), pure path hierarchy comparison (`is_same_or_descendant`), Windows `%SystemRoot%` lookup (`system_root`), and default shell application launcher (`open_path`). Leaf module with zero internal crate dependencies except `error::SyncError`.
+* **Does NOT own**: Filesystem synchronization, configuration parsing, network resolution.
 * **Trait Interfaces**: None.
 
 ### `net`
-* **Owns**: Win32 network UNC and mapped drive FFI (`WNetGetConnectionW`, `WNetAddConnection2W`), `find_mapped_drive_for_unc` with `GetLogicalDrives()` bitmask optimization and Unicode prefix boundary detection, `try_resolve_alternate_path` translating between drive letters and UNC paths, and stack-allocated `[0u16; 512]` buffer management with clamped slice length.
+* **Owns**: Win32 network UNC and mapped drive FFI (`WNetGetConnectionW`, `WNetAddConnection2W`), `find_mapped_drive_for_unc` with `GetLogicalDrives()` bitmask optimization and Unicode prefix boundary detection, `try_resolve_alternate_path` translating between drive letters and UNC paths, stack-allocated `[0u16; 512]` buffer management with clamped slice length, and encapsulated free functions (`pub(crate)`). External callers consume network resolution through `NetworkResolver`.
 * **Does NOT own**: Config parsing, database operations, sync worker logic.
 * **Trait Interfaces**:
   * `NetworkResolver`: Trait abstraction for UNC alternate path resolution and authenticated SMB sessions.
 * **Mock Availability**: `MockNetworkResolver` (implemented in `src/net.rs`) with configurable mappings and simulated SMB connection failures for unit testing.
 
 ### `daemon`
-* **Owns**: Background daemon lifecycle (`SyncDaemon`), generic worker orchestration via `SyncEngineFactory` (`SqliteEngineFactory`), non-blocking asynchronous startup (deferring network checks to background threads), central directory watcher thread coordination (`spawn_watcher_coordinator`), command broadcasting (`spawn_command_broadcaster`), target sync loop validation against network shares (`SyncDaemon::validate_target_loops` accepting `&dyn NetworkResolver`), reconnection scan triggering, `DaemonHandle`, and RAII shutdown (`perform_shutdown`).
+* **Owns**: Background daemon lifecycle (`SyncDaemon`), generic worker orchestration via `SyncEngineFactory` (`SqliteEngineFactory`), non-blocking asynchronous startup (deferring network checks to background threads), central directory watcher thread coordination (`spawn_watcher_coordinator`), command broadcasting (`spawn_command_broadcaster`), target sync loop validation against network shares (`SyncDaemon::validate_target_loops` accepting `&dyn NetworkResolver`), reconnection scan triggering, `DaemonHandle`, Explorer path browsing via `path_util::open_path` (severing dependency on `tray`), and RAII shutdown (`perform_shutdown`).
 * **Does NOT own**: Low-level delta sync hashing, schema migrations, tray UI event loop.
 * **Trait Interfaces**:
   * `SyncEngineFactory`: Abstract factory interface for engine instantiation per target directory.
 
 ### `db`
-* **Owns**: Connection management to isolated local SQLite databases with WAL mode (`PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, `foreign_keys = ON`), composite index `idx_block_hashes_file_block` on `(file_id, block_index)`, unique index `idx_file_metadata_relative_path`, prepared statement caching (`prepare_cached`), schema versioning (`db_version = "4"`), recording and retrieving file metadata and fixed 32-byte block digests (`BlockHash = [u8; 32]`), path-keyed block hash lookups, single-query bulk metadata preload (`list_all_records`), single-block UPSERT updates with `RETURNING id` (`save_file`), in-place path key sanitization (`.drain()`), and safe directory deletion via exact prefix matching `substr(relative_path, 1, length(?1) + 1) = ?1 || '/'`. Generates separate cache database files (`sigcache_<hash>.db`) named using the Blake3 hash of the target path to prevent collisions.
-* **Does NOT own**: Calculating block hashes or filesystem read/writes.
+* **Owns**: Connection management to isolated local SQLite databases with WAL mode (`PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, `foreign_keys = ON`), composite index `idx_block_hashes_file_block` on `(file_id, block_index)`, unique index `idx_file_metadata_relative_path`, prepared statement caching (`prepare_cached`), schema versioning (`db_version = "4"`), recording and retrieving file metadata and fixed 32-byte block digests (`BlockHash = [u8; 32]`), path-keyed block hash lookups, single-query bulk metadata preload (`list_all_records`), single-block UPSERT updates with `RETURNING id` (`save_file`), in-place path key sanitization (`.drain()`), and safe directory deletion via exact prefix matching `substr(relative_path, 1, length(?1) + 1) = ?1 || '/'`. Generates separate cache database files (`sigcache_<hash>.db`) named using the Blake3 hash of the target path to prevent collisions. Decoupled from `config`: `StoreConfig` is a pure configuration value object constructed via `StoreConfig::new(block_size, threshold)` with zero imports of `config.rs`. `HashStore` is implemented for `Arc<S>` and `&S` for zero-copy multi-threaded sharing.
+* **Does NOT own**: Calculating block hashes, filesystem read/writes, or configuration parsing.
 * **Trait Interfaces**:
   * `HashStore`: Interface for persisting and querying file block signatures (`BlockHash`).
 * **Mock Availability**: `MockHashStore` (implemented in `src/db.rs`) for in-memory unit testing.
 
 ### `sync`
-* **Owns**: Scanning directory trees with symlink and intermediate directory junction skipping (`verify_destination_not_reparse` validating all ancestor components) and recursion depth limits (`scan_dir` skipping `PermissionDenied` folders), path safety validation (`is_safe_relative_path`), comparing source/destination state with ±2000 ms SMB timestamp tolerance (`is_metadata_up_to_date_raw`), fast-path metadata bypass before hashing, active destination truncation/corruption repair in `sync_file_to_dest_core` (`dest_size == src_size` and timestamp verification), 64KB streamed small-file write verification (`verify_small_file_write`), worker scratch buffer reuse in delta sync, TOCTOU file length truncation protection using actual streamed byte counts, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, reusable dirty range buffer memory management (`DirtyBlockRange::reset`), decoupled periodic and post-full-scan archive pruning with root junction safety in `prune_archive` (verifying `archive_dir` itself is not a junction before traversal, enforcing recursion depth $\le 32$), Windows case-insensitive deletion detection in `run_full_scan`, worker sub-components (`DebounceQueue`, `ReachabilityMonitor`, `SyncWorkerState`), thread-safe source presence tracking (`SourceConnectivityTracker`), testable discrete worker state machine (`SyncWorkerRunner<E>` with deterministic `tick(now)` stepping and `handle_command`), and running background worker loops (`start_sync_worker`) with exponential backoff retries on `WriteVerificationFailed` and permanent validation error eviction.
-* **Submodules**:
-  * `sync::engine`: Core `SyncEngine` trait and concrete implementation (`LocalSyncEngine`) for file sync/deletion, destination repair, scan execution, and dynamic reparse cache invalidation (`invalidate_verified_dirs`, `evict_verified_dir`).
-  * `sync::delta`: In-place delta synchronization, chunked file reading, Blake3 block hashing, and dirty range management.
-  * `sync::small_file`: Fast-path atomic small-file streaming, write verification, and staging.
-  * `sync::scanner`: Directory traversal, case-insensitive deletion detection, cancellation, and safety threshold checks.
-  * `sync::archive`: Retention-based archive subfolder management, timestamped backups, root junction verification, and safe directory pruning.
+* **Owns**: Scanning directory trees with symlink and intermediate directory junction skipping (`verify_destination_not_reparse` validating all ancestor components) and recursion depth limits (`scan_dir` skipping `PermissionDenied` folders), path safety validation (`is_safe_relative_path`), comparing source/destination state with ±2000 ms SMB timestamp tolerance (`is_metadata_up_to_date_raw`), fast-path metadata bypass before hashing, active destination truncation/corruption repair in `sync_file_to_dest_core` (`dest_size == src_size` and timestamp verification), 64KB streamed small-file write verification (`verify_small_file_write`), worker scratch buffer reuse in delta sync, TOCTOU file length truncation protection using actual streamed byte counts, delta sync destination existence checking, robust chunked reads (`read_block`), hashing files in 1MB blocks via Blake3 returning `BlockHash` arrays, performing in-place block updates, reusable dirty range buffer memory management (`DirtyBlockRange::reset`), decoupled periodic and post-full-scan archive pruning with root junction safety in `prune_archive` (verifying `archive_dir` itself is not a junction before traversal, enforcing recursion depth $\le 32$), Windows case-insensitive deletion detection in `run_full_scan`, worker sub-components (`DebounceQueue`, `ReachabilityMonitor`, `SyncWorkerState`), thread-safe source presence tracking (`SourceConnectivityTracker`), testable discrete worker state machine (`SyncWorkerRunner<E>` with deterministic `tick(now)` stepping and `handle_command`), dependency injection of `Arc<dyn NetworkResolver>` into `SyncWorkerContext`, and running background worker loops (`start_sync_worker`) with exponential backoff retries on `WriteVerificationFailed` and permanent validation error eviction.
+* **Collaborating Components (Decomposed Engine)**:
+  * `sync::small_file::SmallFileTransferEngine`: Fast-path atomic small-file streaming, write verification, and staging.
+  * `sync::delta::DeltaTransferEngine<S: HashStore>`: In-place delta synchronization, chunked file reading, Blake3 block hashing, and dirty range pooling.
+  * `sync::archive::ArchiveManager<S: HashStore>`: Retention-based archive subfolder management, timestamped backups, root junction verification, and safe directory pruning.
+  * `sync::scanner::DirectoryScanner<S: HashStore>`: Directory traversal, batch DB record saving, case-insensitive deletion detection, cancellation, and safety threshold checks.
+  * `sync::engine::LocalSyncEngine<S: HashStore>`: Composes the 4 collaborating structs, implementing `SyncEngine` by delegation. Converts `db::FileRecord` to `FileMetadataSnapshot` via `From` implementation.
   * `sync::path_safety`: Win32 reparse point validation, ancestor junction guards, two-phase non-blocking cache verification, and path traversal defenses.
-  * `sync::worker`: Discrete worker state machine (`SyncWorkerRunner`), worker lifecycle loop (`start_sync_worker`), debounce priority queues, exponential backoff, and reachability tracking.
+  * `sync::worker`: Discrete worker state machine (`SyncWorkerRunner` with `pub(crate)` fields), worker lifecycle loop (`start_sync_worker`), debounce priority queues, exponential backoff, and reachability tracking.
   * `sync::mock`: Thread-safe mock implementation (`MockSyncEngine`) for unit and integration testing.
+* **Encapsulation**: All submodules are encapsulated via `pub(crate) mod`. The crate-level facade `syncdir::sync` exposes `SyncEngine`, `LocalSyncEngine`, `SyncCommand`, `ScanOutcome`, `ConnectivityState`, `WatcherState`, `SyncWorkerContext`, `start_sync_worker`, and `MockSyncEngine`.
 * **Does NOT own**: Watching directories, UI interactions, daemon lifecycle.
 * **Trait Interfaces**:
   * `SyncEngine`: Core sync execution controller (featuring `sync_file`, `sync_file_buffered`, `sync_file_to_dest_buffered`, `delete_file`, `delete_file_from_dest`, `prune_archive`, `run_full_scan`, `invalidate_verified_dirs`).
@@ -130,11 +131,11 @@ syncdir/
 * **Does NOT own**: Config parsing, sync execution (delegates to `SyncEngine` worker threads).
 
 ### `main`
-* **Owns**: Application entry point, CLI argument parsing, single-instance process mutex acquisition (`acquire_single_instance_mutex` / `SingleInstanceGuard`), dual-writer logging setup, system diagnostic telemetry collection (`SystemDiagnosticInfo::collect()`), panic hook registration, process restart handoff (dropping mutex guard before spawning new process), and `WinitStatusObserver` adapter connecting `start_sync_worker` to the tray event loop.
+* **Owns**: Application entry point, CLI argument parsing, single-instance process mutex acquisition (`acquire_single_instance_mutex` / `SingleInstanceGuard`), dual-writer logging setup, system diagnostic telemetry collection (`SystemDiagnosticInfo::collect()`), panic hook registration, process restart handoff (dropping mutex guard before spawning new process), and obtaining status observer directly via `tray_loop.status_observer()` with zero dependencies on `winit`.
 * **Does NOT own**: Filesystem watching, tray menu construction, or SQLite database operations.
 
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), event dispatching and UI loop abstraction via `TrayController`, managing `TrayState` (pure state container tracking strongly-typed `ConnectivityState` and `WatcherState` domain enum transitions, online destination counts, scan notices, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping with encapsulated precomputed `display_label`, state-transition-gated repaint Win32 IPC (suppressing duplicate `Shell_NotifyIconW` calls), guarded config reload background thread execution, qualified `%SystemRoot%\explorer.exe` process execution (`open_path`), and toggling Windows startup registration via injected `RegistryBackend` trait (`run_tray<H, R>`).
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `run_tray`, displaying native error modal dialogs (`show_error_dialog`), event dispatching and UI loop abstraction via `TrayController` (`pub(crate)`), encapsulating winit event proxy behind `TrayEventLoop::status_observer() -> Arc<dyn SyncStatusObserver>`, managing `TrayState` (pure state container tracking strongly-typed `ConnectivityState` and `WatcherState` domain enum transitions, online destination counts, scan notices, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping with encapsulated precomputed `display_label`, state-transition-gated repaint Win32 IPC (suppressing duplicate `Shell_NotifyIconW` calls), guarded config reload background thread execution, qualified `%SystemRoot%\explorer.exe` process execution delegating to `path_util::open_path`, and toggling Windows startup registration via injected `RegistryBackend` trait (`run_tray<H, R>`).
 * **Submodules**:
   * `tray::assets`: Compile-time 32×32 RGBA icon buffer generation (`const fn generate_status_rgba`), static `.rdata` tables (`STATUS_RGBA`), zero-panic array caching (`ICON_CACHE` via `OnceLock<[Icon; EngineStatus::COUNT]>`), and graceful healthy fallback.
 * **Does NOT own**: Filesystem watching or database execution.
@@ -152,20 +153,20 @@ syncdir/
 
 | Module | May Import | Must NOT Import |
 |--------|-----------|-----------------|
-| `main` | `daemon`, `tray`, `config`, `sync`, `startup`, `error` | `db` (direct) |
-| `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `tray`, `startup`, `path_util`, `error` | `main` |
-| `tray` | `sync`, `config`, `error`, `startup` (trait), `tray::assets` | `db` (direct), `main`, `daemon` |
+| `main` | `daemon`, `tray`, `config`, `sync`, `startup`, `error` | `db` (direct), `winit` |
+| `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `startup`, `path_util`, `error` | `main`, `tray` |
+| `tray` | `sync`, `config`, `error`, `startup` (trait), `path_util`, `tray::assets` | `db` (direct), `main`, `daemon` |
 | `tray::assets` | `EngineStatus` (super), `error`, `tray-icon` | All other modules |
 | `monitor` | `sync`, `error` | `config`, `db`, `tray`, `main`, `daemon` |
 | `sync` | `db` (trait), `config`, `net`, `path_util`, `error` | `monitor`, `tray`, `main`, `daemon` |
-| `db` | `config`, `error` | `sync`, `monitor`, `tray`, `main`, `daemon` |
+| `db` | `error` | `config`, `sync`, `monitor`, `tray`, `main`, `daemon` |
 | `startup` | `config`, `error` | `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
 | `net` | `path_util`, `error` | `config`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
-| `config` | `path_util`, `error` | `net`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
-| `path_util` | `std::path` only | All internal modules |
+| `config` | `path_util`, `db` (types only), `error` | `net`, `sync`, `monitor`, `tray`, `main`, `daemon` |
+| `path_util` | `error` | All other internal modules |
 | `error` | None | All |
 
-> **Cycle Resolution Note**: The historical circular dependency between `config` and `net` is permanently resolved by extracting path canonicalization into `path_util`. `config` imports `path_util` and `error` only; `net` imports `path_util` and `error` only. `monitor` does not import `config`, accepting `impl AsRef<Path>` instead.
+> **Cycle Resolution Note**: The historical circular dependency between `config` and `net` is permanently resolved by extracting path canonicalization into `path_util`. `db` is completely decoupled from `config`, importing `error` only. `daemon` is decoupled from `tray`, using `path_util::open_path`. `main` is decoupled from `winit`, consuming `Arc<dyn SyncStatusObserver>` from `tray`.
 
 ---
 
@@ -187,7 +188,7 @@ syncdir/
 * **Network Disconnect Classification**: `SyncError::is_network_offline()` inspects `std::io::Error::raw_os_error()` for Win32 SMB disconnect codes (53 `ERROR_BAD_NETPATH`, 59 `ERROR_UNEXP_NET_ERR`, 64 `ERROR_NETNAME_DELETED`, 67 `ERROR_BAD_NET_NAME`).
 * **Panic-Free Architecture**: Production code contains zero `.unwrap()` or `.expect()` calls. Worker threads return `Result<JoinHandle<()>, SyncError>` and worker execution loops handle errors gracefully with retry queues.
 * **Timestamp Safety**: File modification timestamps are normalized via `safe_modified_millis()` (clamping pre-1970 timestamps to 0 with warning logs) and restored via `safe_epoch_duration_millis()` (preventing wrapping integer underflow on `src_mod as u64`).
-* **Permanent Validation Failure Classification**: `SyncError::is_permanent_validation_failure()` identifies non-retryable security and invariant violations (path traversal, reserved DOS device names, reparse point junctions, invalid UTF-8 encodings) via semantic constructors `SyncError::validation_security` and `SyncError::validation_invariant`. This allows worker retry queues to immediately evict unrecoverable items without retry exhaustion while preserving exponential backoff retries for transient failures.
+* **Permanent Validation Failure Classification**: `SyncError::Validation { kind: ValidationKind, message: String }` categorizes errors via the strongly-typed `ValidationKind` enum (`Security`, `ReparsePoint`, `RecursiveLoop`, `Invariant`, `Transient`). `SyncError::is_permanent_validation_failure()` inspects `kind.is_permanent()` using pattern matching rather than fragile substring comparisons. Permanent security and invariant violations (path traversal, reserved DOS device names, reparse point junctions, recursive sync loops) trigger immediate eviction from worker retry queues without retry exhaustion, while transient errors preserve exponential backoff retries.
 
 
 ## 9. Observability & Logging
@@ -198,13 +199,13 @@ syncdir/
 * **Log Levels**: `INFO` for file copy telemetry and target reachability, `WARN` for recoverable errors/unreachable targets, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
-* **Test Suite Metrics**: 289 total automated tests passing with zero regressions and zero warnings across all targets (235 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, and 11 doc-tests).
-* **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing), `src/startup.rs`, `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), `src/monitor.rs` (watcher buffer overflow recovery and event dispatching), and the decomposed `src/sync/` submodules:
-  * `src/sync/engine.rs`: Metadata timestamp tolerances, TOCTOU size protection, directory creation, destination file truncation repair, two-phase lock release, and reparse cache invalidation.
-  * `src/sync/delta.rs`: Blake3 chunk hashing, delta sync dirty block updates, and read-back verification.
-  * `src/sync/small_file.rs`: Fast-path atomic staging, sampled verification, and zero-byte files.
-  * `src/sync/scanner.rs`: Directory traversal recursion limits, permission bypass, and case-insensitive deletion detection.
-  * `src/sync/archive.rs`: Retention-based archive subfolder management, timestamped backups, root junction verification, and safe directory pruning.
+* **Test Suite Metrics**: 298 total automated tests passing with zero regressions and zero warnings across all targets (244 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, and 11 doc-tests).
+* **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing, hierarchy comparison, system root detection), `src/startup.rs`, `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), `src/monitor.rs` (watcher buffer overflow recovery and event dispatching), and the decomposed `src/sync/` submodules:
+  * `src/sync/engine.rs`: Composed `LocalSyncEngine` end-to-end regression, metadata timestamp tolerances, TOCTOU size protection, directory creation, destination file truncation repair, two-phase lock release, and reparse cache invalidation.
+  * `src/sync/delta.rs`: Standalone `DeltaTransferEngine` Blake3 chunk hashing, delta sync dirty block updates, and read-back verification.
+  * `src/sync/small_file.rs`: Standalone `SmallFileTransferEngine` fast-path atomic staging, sampled verification, and zero-byte files.
+  * `src/sync/scanner.rs`: Standalone `DirectoryScanner` directory traversal recursion limits, permission bypass, and case-insensitive deletion detection.
+  * `src/sync/archive.rs`: Standalone `ArchiveManager` retention-based archive subfolder management, timestamped backups, root junction verification, and safe directory pruning.
   * `src/sync/path_safety.rs`: Traversal defense, reserved DOS devices, ADS rejection, ancestor junction caching, and two-phase non-blocking checks.
   * `src/sync/worker.rs`: Discrete `SyncWorkerRunner` stepping, debounce min-heap queue stress testing, exponential backoff, reachability tracking, and permanent validation error eviction.
   * `src/sync/mock.rs`: Recording mock engine verification.
@@ -249,13 +250,13 @@ syncdir/
 ```mermaid
 graph TD
     main --> daemon & tray & config & sync & startup & error
-    daemon --> config & net & monitor & sync & tray & startup & path_util & error
+    daemon --> config & net & monitor & sync & startup & path_util & error
     daemon -.->|via factory| db
-    tray --> sync & config & error & startup
+    tray --> sync & config & path_util & startup & error
     monitor --> sync & error
     sync --> db & config & net & path_util & error
-    db --> config & error
-    config --> path_util & error
+    db --> error
+    config --> path_util & db & error
     net --> path_util & error
     startup --> error
 ```

@@ -22,7 +22,8 @@
 |-------------------|-----------|---------|--------|
 | `Config::load` | `(path: &Path) -> Result<Config, SyncError>` | `Config` | `SyncError::Io` (read failed), `SyncError::Config` (parse failure) |
 | `Config::validate` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid parameters, relative paths, or missing destination directories) |
-| `Config::resolved_source_dir` | `(&self) -> &Path` | `&Path` | — (pure non-blocking getter) |
+| `Config::source_dir` | `(&self) -> &Path` | `&Path` | — (primary non-blocking getter) |
+| `Config::resolved_source_dir` | `(&self) -> &Path` | `&Path` | — (deprecated in favor of `source_dir`) |
 | `Config::destinations` | `(&self) -> &DestinationCollection` | `&DestinationCollection` | — |
 | `Config::resolved_dest_dirs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `Config::target_configs` | `(&self) -> Vec<TargetSyncConfig>` | `Vec<TargetSyncConfig>` | — |
@@ -44,15 +45,17 @@
 | `DestinationCollection::is_empty` | `(&self) -> bool` | `bool` | — |
 | `DestinationCollection::get` | `(&self, idx: usize) -> Option<&TargetDir>` | `Option<&TargetDir>` | — |
 | `DestinationCollection::to_path_bufs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
-| `TargetSyncConfig::from_config` | `(config: &Config, dest_dir: PathBuf) -> Self` | `TargetSyncConfig` | — |
+| `TargetSyncConfig::from_config` | `(config: &Config, dest_dir: impl Into<TargetDir>) -> Result<Self, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` (validates invariants via builder) |
 | `TargetSyncConfig::builder` | `(source_dir: impl Into<PathBuf>, dest_dir: impl Into<PathBuf>) -> TargetSyncConfigBuilder` | `TargetSyncConfigBuilder` | — |
 | `TargetSyncConfig::block_size_nonzero` | `(&self) -> std::num::NonZeroU64` | `NonZeroU64` | — (safely defaults to 64KB on zero) |
 | `TargetSyncConfigBuilder::build` | `(self) -> Result<TargetSyncConfig, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` |
+| `StoreConfig::try_from` | `(config: &Config) -> Result<StoreConfig, SyncError>` | `StoreConfig` | `SyncError::Validation` |
 | `preprocess_config_toml` | `(raw_toml: &str) -> String` | `String` | — (preserves multi-line arrays and quotes) |
-| `system_root` | `() -> PathBuf` | `PathBuf` | — |
- 
+| `system_root` | `() -> PathBuf` | `PathBuf` | — (re-exported from `path_util`) |
+| `is_same_or_descendant` | `(base: &Path, target: &Path) -> bool` | `bool` | — (re-exported from `path_util`) |
+
 #### Behavioral Scenarios
- 
+
 [HAPPY] Config file successfully loaded and validated
 GIVEN a configuration file at a valid path with source "C:/Src" and destination "D:/Dest" (both accessible folders)
 WHEN `load` is called followed by `validate`
@@ -74,22 +77,22 @@ AND a warning is logged
 [ERROR] Zero debounce seconds
 GIVEN a config where `debounce_seconds` is zero
 WHEN `validate` is called
-THEN `SyncError::Validation("Debounce seconds must be greater than zero")` is returned
-
+THEN `SyncError::Validation` with `ValidationKind::Invariant` is returned
+ 
 [ERROR] Zero retry interval seconds
 GIVEN a config where `retry_interval_seconds` is zero
 WHEN `validate` is called
-THEN `SyncError::Validation("Retry interval seconds must be greater than zero")` is returned
+THEN `SyncError::Validation` with `ValidationKind::Invariant` is returned
 
 [ERROR] No destination directory specified
 GIVEN a config where `dest_dir` is `None` and `dest_dirs` is `None` (or empty)
 WHEN `validate` is called
-THEN `SyncError::Validation("At least one destination directory must be specified (via dest_dir or dest_dirs)")` is returned
+THEN `SyncError::Validation` with `ValidationKind::Invariant` is returned
 
 [ERROR] Invalid relative destination path
 GIVEN a config where destination path is a relative path "relative/folder/path" (not starting with `C:\` or `\\`)
 WHEN `validate` is called
-THEN `SyncError::Validation` is returned rejecting the invalid destination path format
+THEN `SyncError::Validation` with `ValidationKind::Invariant` is returned rejecting the invalid destination path format
 
 [ERROR] Structural UNC path validation missing share name
 GIVEN a destination path `\\hostname` without a share name component
@@ -112,7 +115,7 @@ AND construction fails immediately
 
 ### 2. Path Util Module
  
-> Pure leaf module providing path canonicalization, slash normalization, component collapsing, and UNC parsing.
+> Pure leaf module providing path canonicalization, slash normalization, component collapsing, hierarchy checks, and UNC parsing.
  
 #### Public API
  
@@ -121,6 +124,9 @@ AND construction fails immediately
 | `normalize_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | Replaces `/` with `\`, normalizes root backslashes, collapses `.` |
 | `parse_unc_host_and_share` | `(path: impl AsRef<Path>) -> Option<(&str, &str)>` | `Option<(&str, &str)>` | Extracts host and share from UNC paths |
 | `collapse_components` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | Lexically resolves `..` parent segments without disk I/O |
+| `is_same_or_descendant` | `(base: &Path, target: &Path) -> bool` | `bool` | Evaluates path hierarchy without I/O or canonicalization |
+| `system_root` | `() -> PathBuf` | `PathBuf` | Resolves Windows `%SystemRoot%` with fallback to `C:\Windows` |
+| `open_path` | `(path: &Path) -> std::io::Result<()>` | `std::io::Result<()>` | Launches system default application / Explorer |
 
 #### Behavioral Scenarios
 
@@ -138,6 +144,12 @@ THEN `Some(("server", "share"))` is returned
 GIVEN a path `"C:\\source\\subdir\\..\\dest"`
 WHEN `collapse_components` is called
 THEN it returns `"C:\\source\\dest"`
+
+[HAPPY] Path hierarchy comparison
+GIVEN a base path `"C:\\Backup"` and a target path `"C:\\Backup\\Subfolder\\file.txt"`
+WHEN `is_same_or_descendant` is called
+THEN it returns `true`
+AND unrelated paths return `false`
 
 ---
 
@@ -196,17 +208,24 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `SyncEngine::run_full_scan` | `(&self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
 | `SyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (default no-op clearing directory safety cache) |
 | `start_sync_worker` | `<E: SyncEngine + 'static>(context: SyncWorkerContext<E>) -> Result<JoinHandle<()>, SyncError>` | `Result<JoinHandle<()>, SyncError>` | `SyncError::Io` (thread spawn failure) |
-| `SyncWorkerRunner::new` | `(context: SyncWorkerContext<E>) -> Self` | `SyncWorkerRunner<E>` | — (discrete, testable worker state machine) |
+| `SyncWorkerRunner::new` | `(context: SyncWorkerContext<E>) -> Self` | `SyncWorkerRunner<E>` | — (discrete, testable worker state machine with `pub(crate)` fields) |
 | `SyncWorkerRunner::handle_command` | `(&mut self, cmd: SyncCommand) -> bool` | `bool` | — (false indicates shutdown requested) |
 | `SyncWorkerRunner::tick` | `(&mut self, now: Instant) -> Result<WorkerTickOutcome, SyncError>` | `WorkerTickOutcome` | `SyncError` |
-| `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — |
+| `SyncWorkerContext::new` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>, resolver: Arc<dyn NetworkResolver>) -> Self` | `SyncWorkerContext<E>` | — |
+| `SyncWorkerContext::for_test` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>) -> Self` | `SyncWorkerContext<E>` | — |
+| `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — (composes 4 collaborating transfer/scan engines) |
 | `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (reusable scratch buffer lease for zero-lock streaming) |
 | `LocalSyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (clears reparse cache) |
 | `LocalSyncEngine::evict_verified_dir` | `(&self, dir: &Path)` | `()` | — (evicts dir and descendants from cache) |
+| `SmallFileTransferEngine::new` | `(config: TargetSyncConfig) -> Self` | `SmallFileTransferEngine` | — (pub(crate) atomic small-file streaming) |
+| `DeltaTransferEngine::new` | `(db: S, config: TargetSyncConfig) -> Self` | `DeltaTransferEngine<S>` | — (pub(crate) in-place delta sync with chunk hashing) |
+| `ArchiveManager::new` | `(config: TargetSyncConfig) -> Self` | `ArchiveManager` | — (pub(crate) timestamped backup management and safe pruning) |
+| `DirectoryScanner::new` | `(config: TargetSyncConfig) -> Self` | `DirectoryScanner` | — (pub(crate) directory recursion and batch record saves) |
 | `DirtyBlockRange::new` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (infallible zero-panic constructor) |
 | `DirtyBlockRange::new_nonzero` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (alias for `new`) |
 | `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` (if `block_size == 0`) |
 | `DirtyBlockRange::block_size_nonzero` | `(&self) -> NonZeroU64` | `NonZeroU64` | — |
+| `FileMetadataSnapshot::from` | `(record: &FileRecord) -> Self` | `FileMetadataSnapshot` | — (converts database record to metadata snapshot) |
 | `MockSyncEngine::new` | `() -> Self` | `MockSyncEngine` | — |
 | `SourceConnectivityTracker::new` | `(initial: bool) -> Self` | `SourceConnectivityTracker` | — |
 | `DebounceQueue::new` | `(max_capacity: usize) -> Self` | `DebounceQueue` | — |
@@ -227,11 +246,10 @@ WHEN `prune_archive` is called
 THEN `fs::symlink_metadata` inspects the root path before traversal
 AND `SyncError::Validation` is returned, refusing to prune arbitrary directories outside the destination tree
 
-[RECOVERY] Truncated destination file detection and repair
-GIVEN a destination file whose size does not match the source size (e.g. truncated or corrupted prior write)
+[HAPPY] Truncated or corrupted destination file repair
+GIVEN a destination file whose size does not match the source (`dest_size != src_size`) or whose timestamp drift exceeds 2000ms
 WHEN `sync_file_to_dest_core` executes
-THEN the size mismatch triggers re-synchronization rather than skipping
-AND the destination file is overwritten and repaired to match the source file
+THEN the engine actively repairs and synchronizes the corrupted destination file rather than bypassing it via fast-path check
 
 [PERFORMANCE] Two-phase directory reparse verification
 GIVEN a directory path verification check via `LocalSyncEngine::verify_destination_cached`
@@ -280,7 +298,7 @@ AND any directory junction is rejected with `SyncError::Validation`
 [SECURITY/VALIDATION] DirtyBlockRange zero block size rejection
 GIVEN an invocation of `DirtyBlockRange::try_new(0)`
 WHEN the constructor validates the block size
-THEN `SyncError::Validation("DirtyBlockRange block_size must be greater than zero")` is returned
+THEN `SyncError::Validation` is returned
 AND `new` requires `NonZeroU64`, preventing zero block size values at compile time
 
 [CONCURRENCY] SyncWorker non-spinning poll timeout during network offline
@@ -386,8 +404,9 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | Function / Component | Signature | Returns | Errors |
 |----------------------|-----------|---------|--------|
 | `run_tray` | `<H: TrayActionHandler + ?Sized>(event_loop: EventLoop<UserEvent>, action_handler: Arc<H>, dests: Vec<DestinationState>) -> Result<TrayExitReason, SyncError>` | `TrayExitReason` | `SyncError::Tray` |
-| `open_path` | `(path: &Path) -> Result<(), SyncError>` | `()` | Requires verified `%SystemRoot%\explorer.exe` |
-| `TrayController::new` | `(...) -> Result<Self, SyncError>` | `TrayController<H>` | `SyncError::Tray` |
+| `TrayEventLoop::status_observer` | `(&self) -> Arc<dyn SyncStatusObserver>` | `Arc<dyn SyncStatusObserver>` | Encapsulates `winit` event loop proxy |
+| `open_path` | `(path: &Path) -> Result<(), SyncError>` | `()` | Delegates to `path_util::open_path` |
+| `TrayController::new` | `(...) -> Result<Self, SyncError>` | `TrayController<H>` | `SyncError::Tray` (pub(crate)) |
 | `DestinationState::new` | `(path: impl Into<PathBuf>, is_online: impl Into<ConnectivityState>) -> Self` | `DestinationState` | — |
 | `DestinationState::with_resolved_unc` | `(mut self, resolved_unc: impl Into<Option<PathBuf>>) -> Self` | `DestinationState` | — |
 | `TrayState::new` | `(initial_dest_online: Vec<ConnectivityState>) -> Self` | `TrayState` | — |
@@ -429,11 +448,11 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `trait NetworkResolver` | `Send + Sync` | — | Abstraction for network resolution and SMB sessions |
 | `Win32NetworkResolver` | `struct` | `Win32NetworkResolver` | Production Win32 implementation |
 | `MockNetworkResolver::new` | `() -> Self` | `MockNetworkResolver` | In-memory mock for testing |
-| `resolve_mapped_drive_unc` | `(drive_prefix: &str) -> Option<String>` | `Option<String>` | Uses stack-allocated FFI buffers |
-| `try_resolve_unc_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | — |
-| `establish_smb_connection` | `(unc_path: impl AsRef<Path>) -> Result<(), SyncError>` | `()` | `SyncError::Validation`, `SyncError::Io` |
-| `find_mapped_drive_for_unc` | `(unc_path: impl AsRef<Path>) -> Option<PathBuf>` | `Option<PathBuf>` | — |
-| `try_resolve_alternate_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | — |
+| `resolve_mapped_drive_unc` | `(drive_prefix: &str) -> Option<String>` | `Option<String>` | Uses stack-allocated FFI buffers (pub(crate)) |
+| `try_resolve_unc_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | — (pub(crate)) |
+| `establish_smb_connection` | `(unc_path: impl AsRef<Path>) -> Result<(), SyncError>` | `()` | `SyncError::Validation`, `SyncError::Io` (pub(crate)) |
+| `find_mapped_drive_for_unc` | `(unc_path: impl AsRef<Path>) -> Option<PathBuf>` | `Option<PathBuf>` | — (pub(crate)) |
+| `try_resolve_alternate_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | — (pub(crate)) |
 
 ---
 
@@ -449,24 +468,28 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `SyncError::Io` | `(#[from] std::io::Error)` | Standard I/O errors |
 | `SyncError::Db` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | SQLite database errors |
 | `SyncError::Config` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | TOML parse or validation errors |
-| `SyncError::Validation` | `(String)` | Semantic configuration validation errors |
+| `SyncError::Validation` | `{ kind: ValidationKind, message: String }` | Semantic configuration & security validation errors |
+| `ValidationKind` | `enum: Security, ReparsePoint, RecursiveLoop, Invariant, Transient` | Typed validation classification with `is_permanent(&self) -> bool` |
 | `SyncError::WriteVerificationFailed` | `{ path: PathBuf }` | Distinct retryable write integrity failure |
 | `SyncError::LockPoison` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Mutex poisoning errors |
 | `SyncError::Watcher` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Directory watcher errors |
 | `SyncError::Tray` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | GUI / Tray notification errors |
 | `SyncError::Registry` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Windows registry errors |
-| `SyncError::validation` | `(msg: impl Into<String>) -> Self` | Semantic validation error constructor |
-| `SyncError::validation_security` | `(msg: impl Into<String>) -> Self` | Security validation constructor (junctions, traversal) |
-| `SyncError::validation_invariant` | `(msg: impl Into<String>) -> Self` | Domain invariant constructor (debounce, intervals) |
-| `SyncError::is_permanent_validation_failure` | `(&self) -> bool` | Detects non-retryable fatal violations |
-| `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps 9 standard `ErrorKind` variants (TimedOut, ConnectionReset, ConnectionAborted, NotConnected, BrokenPipe, NetworkUnreachable, HostUnreachable, NetworkDown, ConnectionRefused) and 11 Win32 error codes (53, 59, 64, 65, 67, 121, 1326) |
+| `SyncError::validation` | `(msg: impl Into<String>) -> Self` | Semantic validation error constructor (default Invariant) |
+| `SyncError::validation_kind` | `(kind: ValidationKind, msg: impl Into<String>) -> Self` | Explicit typed validation constructor |
+| `SyncError::validation_security` | `(msg: impl Into<String>) -> Self` | Security validation constructor (Security) |
+| `SyncError::validation_reparse` | `(msg: impl Into<String>) -> Self` | Reparse validation constructor (ReparsePoint) |
+| `SyncError::validation_loop` | `(msg: impl Into<String>) -> Self` | Recursive loop validation constructor (RecursiveLoop) |
+| `SyncError::validation_invariant` | `(msg: impl Into<String>) -> Self` | Domain invariant constructor (Invariant) |
+| `SyncError::is_permanent_validation_failure` | `(&self) -> bool` | Detects non-retryable fatal violations via `kind.is_permanent()` |
+| `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps 9 standard `ErrorKind` variants and 11 Win32 error codes |
 
 #### Behavioral Scenarios
 
 [ERROR] Permanent validation failure classification and queue eviction
 GIVEN a `SyncError` produced during sync worker execution
 WHEN `is_permanent_validation_failure` is evaluated
-THEN permanent security and invariant violations (path traversal, directory junctions, reserved DOS names) return `true`
+THEN permanent security and invariant violations (`Security`, `ReparsePoint`, `RecursiveLoop`) return `true`
 AND the item is evicted from the debounce retry queue without looping retries
 AND transient errors return `false`, preserving exponential backoff retries
 

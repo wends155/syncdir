@@ -502,12 +502,33 @@ This file documents the chronological history, design decisions, and rules conte
 >   - **Section 8 (`Error Handling Strategy`)**: Documented `SyncError::is_permanent_validation_failure()` classification and semantic constructors (`validation_security`, `validation_invariant`) for worker queue eviction without retry exhaustion.
 >   - **Section 10 (`Testing Strategy`)**: Synchronized test suite metrics to 289 passing automated tests (235 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration, 8 property, 20 snapshot, 11 doc-tests) and refreshed submodule unit test descriptions.
 >   - **Section 14 (`Known Constraints & Technical Debt`)**: Documented two-phase locking in `verify_destination_cached` for SMB latency optimization and dynamic reparse cache invalidation hooks.
-> * **Verification:**
->   - Full test suite passed (289/289 automated tests, zero warnings).
->   - Format and clippy gates clean.
->   - Changes committed in `cbbe903` and pushed to `origin/refactor/hardening`.
-> * **New Constraints:** None (documentation synchronization only).
-> * **Pruned:** Outdated test counts and missing module boundary descriptions in `architecture.md` eliminated.
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Syncdir Architecture Decoupling & Module-Scoped Refactoring (All 15 findings from `review_report.md` resolved)
+> * **Changes:**
+>   - **Strongly-Typed Error Classification (O1)**: Introduced `ValidationKind` enum (`Security`, `ReparsePoint`, `RecursiveLoop`, `Invariant`, `Transient`) in `src/error.rs`. Refactored `SyncError::Validation { kind, message }` with exact display format `\"Validation error: {message}\"`. Refactored `is_permanent_validation_failure(&self) -> bool` to use pattern matching rather than fragile substring comparisons, preserving all 20 golden snapshots byte-for-byte.
+>   - **Leaf Utility Relocation (O2)**: Relocated `is_same_or_descendant`, `system_root`, and `open_path` to `src/path_util.rs`. Decoupled `daemon.rs` from `tray.rs` and decoupled `tray.rs` from `config.rs`.
+>   - **Persistence & Configuration Decoupling (O3)**: Completely severed `src/db.rs` imports of `src/config.rs`. `StoreConfig` is now a pure configuration value object constructed via `StoreConfig::new(block_size, threshold)`. Implemented `TryFrom<&Config> for StoreConfig` in `src/config.rs`. Implemented `HashStore` for `Arc<S>` and `&S` in `src/db.rs`.
+>   - **Invariant Enforcement in Config (O5)**: Refactored `TargetSyncConfig::from_config` to route through `TargetSyncConfigBuilder` returning `Result<Self, SyncError>`, enforcing recursive containment, non-empty paths, and positive timeouts. Deprecated `Config::resolved_source_dir` in favor of `Config::source_dir`.
+>   - **`LocalSyncEngine` Decomposition (O6)**: Decomposed God struct partial class pattern across 5 files into 4 collaborating components:
+>     - `SmallFileTransferEngine` (`src/sync/small_file.rs`): fast-path small-file streaming and atomic staging.
+>     - `DeltaTransferEngine<S: HashStore>` (`src/sync/delta.rs`): in-place delta synchronization, chunk hashing, and dirty range pooling.
+>     - `ArchiveManager<S: HashStore>` (`src/sync/archive.rs`): retention-based archive management, timestamped backups, and safe directory pruning.
+>     - `DirectoryScanner<S: HashStore>` (`src/sync/scanner.rs`): directory traversal, batch DB persistence, and case-insensitive deletion detection.
+>     - `LocalSyncEngine<S>` (`src/sync/engine.rs`): cleanly composes the 4 collaborating structs and implements `SyncEngine` by delegation. Implemented `From<&FileRecord> for FileMetadataSnapshot`.
+>   - **Public Interface Hardening & DIP (O4)**: Injected `Arc<dyn NetworkResolver>` into `SyncWorkerContext::new` (with `for_test` constructor). Demoted `SyncWorkerRunner` fields to `pub(crate)`. Demoted standalone free functions in `src/net.rs` to `pub(crate)`. Encapsulated `winit` event proxy in `TrayEventLoop::status_observer(&self) -> Arc<dyn SyncStatusObserver>`, completely decoupling `src/main.rs` from `winit`. Demoted `TrayController` to `pub(crate)`.
+>   - **Submodule Encapsulation (O7)**: Encapsulated all `src/sync/` submodules (`archive`, `delta`, `engine`, `mock`, `path_safety`, `scanner`, `small_file`, `worker`) as `pub(crate) mod`. Re-exported required facade types from `syncdir::sync`. Updated integration and doctest imports.
+>   - **Full Verification Pipeline (O8)**: 298 total automated tests passing with zero regressions and zero compiler warnings (244 unit tests, 3 bin tests, 12 integration tests, 8 property tests, 20 snapshot tests matching byte-for-byte, 11 doctests).
+> * **New Constraints:**
+>   - Submodules within `src/sync/` must remain `pub(crate) mod`. External consumers interact exclusively through `syncdir::sync` facade.
+>   - Future database access must remain decoupled from `config.rs`.
+>   - Permanent validation error detection must use `ValidationKind::is_permanent()`.
+>   - `TargetSyncConfig::from_config` must return `Result<TargetSyncConfig, SyncError>`.
+> * **Pruned:**
+>   - Partial class `LocalSyncEngine` pattern across 5 files eliminated.
+>   - Stringly-typed error matching in `is_permanent_validation_failure` eliminated.
+>   - Reverse `db -> config` and `config -> db` coupling eliminated.
+>   - `main.rs` coupling to `winit` eliminated.
+
 
 
 
