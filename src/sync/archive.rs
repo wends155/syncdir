@@ -2,15 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::TargetSyncConfig;
-use crate::db::HashStore;
-use crate::error::SyncError;
-
-use super::engine::LocalSyncEngine;
 use super::path_safety::{
     is_reparse_or_symlink, is_reparse_or_symlink_meta, is_safe_relative_path,
     verify_destination_not_reparse,
 };
+use crate::config::TargetSyncConfig;
+use crate::error::SyncError;
 
 /// Global atomic counter for unique archive path generation across threads and timestamps.
 static ARCHIVE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -228,42 +225,10 @@ impl ArchiveManager {
     }
 }
 
-impl<S: HashStore> LocalSyncEngine<S> {
-    /// Archive or remove a file on destination filesystem without updating the database.
-    pub(crate) fn archive_dest_file_only(
-        &self,
-        rel_path: &Path,
-        dest_dir: &Path,
-    ) -> Result<(), SyncError> {
-        self.archive_manager
-            .archive_dest_file_only(rel_path, dest_dir)
-    }
-
-    /// Handle deletion of a file on a specific destination directory.
-    pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
-        self.archive_dest_file_only(rel_path, dest_dir)?;
-        let dest_path = dest_dir.join(rel_path);
-        if let Some(parent) = dest_path.parent() {
-            self.evict_verified_dir(parent);
-        }
-        if self.config.propagate_deletions() || !dest_path.exists() {
-            self.db.delete_file(rel_path)?;
-        }
-        Ok(())
-    }
-
-    /// Prune old and excess files in the destination archive.
-    pub fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
-        self.archive_manager.prune_destination_archive(dest_dir)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, TargetSyncConfig};
-    use crate::db::{FileRecord, MockHashStore, SqliteHashStore};
-    use crate::sync::SyncEngine;
     use tempfile::tempdir;
 
     fn test_config(source: std::path::PathBuf, dest: std::path::PathBuf) -> Config {
@@ -296,109 +261,6 @@ mod tests {
             }
         }
         Ok(())
-    }
-
-    #[test]
-    fn test_deletion_archive() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("src");
-        let dest = dir.path().join("dst");
-        let db_path = dir.path().join("sig.db");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&dest).unwrap();
-
-        let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(
-            &db_path,
-            crate::db::StoreConfig::new(
-                config.block_size_bytes(),
-                config.block_sync_threshold_bytes(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
-        let engine = LocalSyncEngine::new(store, target_cfg);
-
-        // Sync a file first
-        fs::write(source.join("doomed.txt"), b"bye").unwrap();
-        engine.sync_file(Path::new("doomed.txt")).unwrap();
-        assert!(dest.join("doomed.txt").exists());
-
-        // Delete it
-        engine.delete_file(Path::new("doomed.txt")).unwrap();
-
-        // Original dest file should be gone
-        assert!(!dest.join("doomed.txt").exists());
-
-        // Should be in .syncdir_archive
-        let archive = dest.join(".syncdir_archive");
-        assert!(archive.exists());
-        let entries: Vec<_> = fs::read_dir(&archive)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(entries.len(), 1);
-        let archived_name = entries[0].file_name().to_string_lossy().to_string();
-        assert!(archived_name.ends_with("_doomed.txt"));
-
-        // DB record should be gone
-        assert!(
-            engine
-                .db
-                .get_file(Path::new("doomed.txt"))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_nested_directory_deletion_archive() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("src");
-        let dest = dir.path().join("dst");
-        let db_path = dir.path().join("sig.db");
-        fs::create_dir_all(source.join("subdir")).unwrap();
-        fs::create_dir_all(&dest).unwrap();
-
-        let config = Config::test_default(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(
-            &db_path,
-            crate::db::StoreConfig::new(
-                config.block_size_bytes(),
-                config.block_sync_threshold_bytes(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
-        let engine = LocalSyncEngine::new(store, target_cfg);
-
-        // Sync a nested file
-        fs::write(source.join("subdir").join("deep.txt"), b"nested content").unwrap();
-        engine.sync_file(Path::new("subdir/deep.txt")).unwrap();
-        assert!(dest.join("subdir").join("deep.txt").exists());
-
-        // Delete it
-        engine.delete_file(Path::new("subdir/deep.txt")).unwrap();
-
-        // Original should be gone
-        assert!(!dest.join("subdir").join("deep.txt").exists());
-
-        // Should be in .syncdir_archive with nested path preserved
-        let archive = dest.join(".syncdir_archive");
-        assert!(archive.exists());
-        let entries: Vec<_> = fs::read_dir(&archive)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(entries.len(), 1);
-        let archived_entry = &entries[0];
-        let nested = archived_entry.path().join("deep.txt");
-        assert!(
-            nested.exists(),
-            "Archived nested file should preserve directory structure"
-        );
     }
 
     #[test]
@@ -468,13 +330,13 @@ mod tests {
             .build()
             .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let engine = std::sync::Arc::new(LocalSyncEngine::new(MockHashStore::new(), target_cfg));
+        let archive_manager = std::sync::Arc::new(ArchiveManager::new(target_cfg));
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(50));
         let mut handles = Vec::new();
 
         for i in 0..50 {
-            let engine = engine.clone();
+            let archive_manager = archive_manager.clone();
             let barrier = barrier.clone();
             let dst = dst.clone();
             handles.push(std::thread::spawn(move || {
@@ -482,8 +344,8 @@ mod tests {
                 let file_path = dst.join(&file_name);
                 std::fs::write(&file_path, format!("content {i}")).unwrap();
                 barrier.wait();
-                engine
-                    .delete_file_from_dest(Path::new(&file_name), &dst)
+                archive_manager
+                    .archive_dest_file_only(Path::new(&file_name), &dst)
                     .unwrap();
             }));
         }
@@ -523,102 +385,6 @@ mod tests {
                 parts[1]
             );
         }
-    }
-
-    #[test]
-    fn test_conditional_db_deletion_on_dest_state() {
-        let temp = tempdir().unwrap();
-        let src = temp.path().join("source");
-        let dst = temp.path().join("dest");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-        let config = Config::builder(src.clone())
-            .dest_dir(dst.clone())
-            .propagate_deletions(true)
-            .build()
-            .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
-
-        // Case 1: Destination file exists but has an exclusive lock
-        let locked_file = dst.join("locked.txt");
-        std::fs::write(&locked_file, "secret").unwrap();
-        let rec1 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("locked.txt"),
-            file_size: 6,
-            last_modified: 100,
-        };
-        store.save_file(&rec1, &[]).unwrap();
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            let _exclusive_handle = std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(0)
-                .open(&locked_file)
-                .unwrap();
-
-            let res = engine.delete_file_from_dest(Path::new("locked.txt"), &dst);
-            assert!(
-                res.is_err(),
-                "delete_file_from_dest must fail on locked/inaccessible destination"
-            );
-            assert!(
-                store.get_file(Path::new("locked.txt")).unwrap().is_some(),
-                "DB record must be retained when destination is locked/inaccessible"
-            );
-        }
-
-        // Case 2: Destination file is genuinely absent (NotFound)
-        let rec2 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("absent.txt"),
-            file_size: 10,
-            last_modified: 200,
-        };
-        store.save_file(&rec2, &[]).unwrap();
-        assert!(store.get_file(Path::new("absent.txt")).unwrap().is_some());
-
-        let res = engine.delete_file_from_dest(Path::new("absent.txt"), &dst);
-        assert!(
-            res.is_ok(),
-            "delete_file_from_dest must succeed when file is NotFound"
-        );
-        assert!(
-            store.get_file(Path::new("absent.txt")).unwrap().is_none(),
-            "DB record must be deleted when destination file is confirmed NotFound"
-        );
-
-        // Case 3: Destination file exists with propagate_deletions = false
-        let unprop_file = dst.join("unprop.txt");
-        std::fs::write(&unprop_file, "data").unwrap();
-        let config_no_prop = Config::builder(src)
-            .dest_dir(dst.clone())
-            .propagate_deletions(false)
-            .build()
-            .unwrap();
-        let target_cfg_no_prop =
-            TargetSyncConfig::from_config(&config_no_prop, dst.clone()).unwrap();
-        let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
-        let rec3 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("unprop.txt"),
-            file_size: 4,
-            last_modified: 300,
-        };
-        store.save_file(&rec3, &[]).unwrap();
-        assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_some());
-
-        let res = engine_no_prop.delete_file_from_dest(Path::new("unprop.txt"), &dst);
-        assert!(res.is_ok());
-        assert!(
-            store.get_file(Path::new("unprop.txt")).unwrap().is_some(),
-            "DB record must be retained when propagate_deletions = false and destination file still exists"
-        );
-        assert!(unprop_file.exists());
     }
 
     #[test]
@@ -751,12 +517,12 @@ mod tests {
             .build()
             .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+        let archive_manager = ArchiveManager::new(target_cfg);
 
         let file = dst.join("victim.txt");
         std::fs::write(&file, "payload").unwrap();
 
-        let res = engine.archive_dest_file_only(Path::new("victim.txt"), &dst);
+        let res = archive_manager.archive_dest_file_only(Path::new("victim.txt"), &dst);
         assert!(
             res.is_err(),
             "Must reject archiving when .syncdir_archive is a reparse point"

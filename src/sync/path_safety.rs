@@ -1,6 +1,9 @@
+#[cfg(test)]
 use std::collections::HashSet;
 use std::fs::{self, Metadata};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use crate::error::SyncError;
 
@@ -70,7 +73,7 @@ pub(crate) fn verify_destination_not_reparse(
     Ok(leaf_meta)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 #[doc(hidden)]
 pub fn verify_destination_not_reparse_cached(
     dest_dir: &Path,
@@ -128,7 +131,7 @@ pub fn verify_destination_not_reparse_cached(
     Ok(leaf_meta)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 #[doc(hidden)]
 pub fn verify_destination_not_reparse_cached(
     dest_dir: &Path,

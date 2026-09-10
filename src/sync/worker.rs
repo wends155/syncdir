@@ -131,8 +131,9 @@ impl DebounceQueue {
             if *deadline > now {
                 break;
             }
-            let std::cmp::Reverse((deadline, path)) = self.sync_heap.pop().unwrap();
-            if self.pending_syncs.get(&path) == Some(&deadline) {
+            if let Some(std::cmp::Reverse((deadline, path))) = self.sync_heap.pop()
+                && self.pending_syncs.get(&path) == Some(&deadline)
+            {
                 self.pending_syncs.remove(&path);
                 ready.push(path);
             }
@@ -147,8 +148,9 @@ impl DebounceQueue {
             if *deadline > now {
                 break;
             }
-            let std::cmp::Reverse((deadline, path)) = self.delete_heap.pop().unwrap();
-            if self.pending_deletes.get(&path) == Some(&deadline) {
+            if let Some(std::cmp::Reverse((deadline, path))) = self.delete_heap.pop()
+                && self.pending_deletes.get(&path) == Some(&deadline)
+            {
                 self.pending_deletes.remove(&path);
                 ready.push(path);
             }
@@ -432,18 +434,129 @@ impl SyncWorkerState {
 
 /// Execution context for a target synchronization worker thread.
 pub struct SyncWorkerContext<E: SyncEngine> {
-    pub target_index: usize,
-    pub config: TargetSyncConfig,
-    pub engine: E,
-    pub rx: std::sync::mpsc::Receiver<SyncCommand>,
-    pub observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
-    pub source_connectivity: SourceConnectivityTracker,
-    pub resolver: std::sync::Arc<dyn crate::net::NetworkResolver>,
-    pub cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub max_pending_queue: usize,
+    pub(crate) target_index: usize,
+    pub(crate) config: TargetSyncConfig,
+    pub(crate) engine: E,
+    pub(crate) rx: std::sync::mpsc::Receiver<SyncCommand>,
+    pub(crate) observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
+    pub(crate) source_connectivity: SourceConnectivityTracker,
+    pub(crate) resolver: std::sync::Arc<dyn crate::net::NetworkResolver>,
+    pub(crate) cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) max_pending_queue: usize,
+}
+
+/// Builder for constructing a [`SyncWorkerContext`] with validated configuration invariants.
+pub struct SyncWorkerContextBuilder<E: SyncEngine> {
+    target_index: usize,
+    config: TargetSyncConfig,
+    engine: E,
+    rx: std::sync::mpsc::Receiver<SyncCommand>,
+    observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
+    source_connectivity: SourceConnectivityTracker,
+    resolver: Option<std::sync::Arc<dyn crate::net::NetworkResolver>>,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    max_pending_queue: usize,
+}
+
+impl<E: SyncEngine> SyncWorkerContextBuilder<E> {
+    /// Create a new builder with required parameters and default options.
+    pub fn new(
+        target_index: usize,
+        config: impl Into<TargetSyncConfig>,
+        engine: E,
+        rx: std::sync::mpsc::Receiver<SyncCommand>,
+        source_connectivity: impl Into<SourceConnectivityTracker>,
+    ) -> Self {
+        Self {
+            target_index,
+            config: config.into(),
+            engine,
+            rx,
+            observer: None,
+            source_connectivity: source_connectivity.into(),
+            resolver: None,
+            cancellation: None,
+            max_pending_queue: 50_000,
+        }
+    }
+
+    /// Attach a status observer.
+    pub fn observer(mut self, observer: std::sync::Arc<dyn SyncStatusObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Optionally attach a status observer.
+    pub fn maybe_observer(
+        mut self,
+        observer: Option<std::sync::Arc<dyn SyncStatusObserver>>,
+    ) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Attach a custom network resolver.
+    pub fn resolver(mut self, resolver: std::sync::Arc<dyn crate::net::NetworkResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Attach a cancellation flag.
+    pub fn cancellation(
+        mut self,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Set the maximum capacity of the pending debounce queue.
+    pub fn max_pending_queue(mut self, max: usize) -> Self {
+        self.max_pending_queue = max;
+        self
+    }
+
+    /// Build the `SyncWorkerContext`, validating invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Validation` if `max_pending_queue == 0`.
+    pub fn build(self) -> Result<SyncWorkerContext<E>, SyncError> {
+        if self.max_pending_queue == 0 {
+            return Err(SyncError::validation_invariant(
+                "max_pending_queue must be greater than zero",
+            ));
+        }
+        Ok(SyncWorkerContext {
+            target_index: self.target_index,
+            config: self.config,
+            engine: self.engine,
+            rx: self.rx,
+            observer: self.observer,
+            source_connectivity: self.source_connectivity,
+            resolver: self
+                .resolver
+                .unwrap_or_else(|| std::sync::Arc::new(crate::net::Win32NetworkResolver)),
+            cancellation: self
+                .cancellation
+                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            max_pending_queue: self.max_pending_queue,
+        })
+    }
 }
 
 impl<E: SyncEngine> SyncWorkerContext<E> {
+    /// Return a builder for `SyncWorkerContext`.
+    pub fn builder(
+        target_index: usize,
+        config: impl Into<TargetSyncConfig>,
+        engine: E,
+        rx: std::sync::mpsc::Receiver<SyncCommand>,
+        source_connectivity: impl Into<SourceConnectivityTracker>,
+    ) -> SyncWorkerContextBuilder<E> {
+        SyncWorkerContextBuilder::new(target_index, config, engine, rx, source_connectivity)
+    }
+
     /// Create a new sync worker context.
     pub fn new(
         target_index: usize,
@@ -464,6 +577,51 @@ impl<E: SyncEngine> SyncWorkerContext<E> {
             cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_pending_queue: 50_000,
         }
+    }
+
+    /// Read-only target index accessor.
+    pub fn target_index(&self) -> usize {
+        self.target_index
+    }
+
+    /// Read-only target config accessor.
+    pub fn config(&self) -> &TargetSyncConfig {
+        &self.config
+    }
+
+    /// Read-only engine reference.
+    pub fn engine(&self) -> &E {
+        &self.engine
+    }
+
+    /// Mutable engine reference.
+    pub fn engine_mut(&mut self) -> &mut E {
+        &mut self.engine
+    }
+
+    /// Read-only observer reference.
+    pub fn observer(&self) -> Option<&std::sync::Arc<dyn SyncStatusObserver>> {
+        self.observer.as_ref()
+    }
+
+    /// Read-only source connectivity tracker reference.
+    pub fn source_connectivity(&self) -> &SourceConnectivityTracker {
+        &self.source_connectivity
+    }
+
+    /// Read-only network resolver reference.
+    pub fn resolver(&self) -> &std::sync::Arc<dyn crate::net::NetworkResolver> {
+        &self.resolver
+    }
+
+    /// Read-only cancellation token reference.
+    pub fn cancellation(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+        &self.cancellation
+    }
+
+    /// Read-only max pending queue capacity.
+    pub fn max_pending_queue(&self) -> usize {
+        self.max_pending_queue
     }
 
     /// Set a custom maximum pending queue capacity.
@@ -1147,6 +1305,40 @@ mod tests {
     }
 
     #[test]
+    fn test_debounce_queue_drain_safety() {
+        let mut q = DebounceQueue::new(10);
+        let now = Instant::now();
+
+        // Empty queue drain returns empty vec without panic
+        assert!(q.drain_ready_syncs(now).is_empty());
+        assert!(q.drain_ready_deletes(now).is_empty());
+
+        // Enqueue items
+        let p1 = PathBuf::from("ready_sync.txt");
+        let p2 = PathBuf::from("future_sync.txt");
+        let d1 = PathBuf::from("ready_del.txt");
+        let d2 = PathBuf::from("future_del.txt");
+
+        q.enqueue_sync(p1.clone(), Duration::from_millis(0));
+        q.enqueue_sync(p2.clone(), Duration::from_secs(60));
+        q.enqueue_delete(d1.clone(), Duration::from_millis(0));
+        q.enqueue_delete(d2.clone(), Duration::from_secs(60));
+
+        // Sleep 1ms to ensure deadline is passed
+        std::thread::sleep(Duration::from_millis(1));
+        let check_now = Instant::now();
+
+        let syncs = q.drain_ready_syncs(check_now);
+        assert_eq!(syncs, vec![p1]);
+
+        let deletes = q.drain_ready_deletes(check_now);
+        assert_eq!(deletes, vec![d1]);
+
+        // Future items remain pending
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
     fn test_calculate_worker_poll_timeout() {
         let now = Instant::now();
 
@@ -1803,5 +1995,52 @@ mod tests {
         assert_eq!(runner.queue.pending_count(), 0);
         assert_eq!(engine.synced_calls().len(), 1);
         assert_eq!(engine.synced_calls()[0].0, PathBuf::from("transient.txt"));
+    }
+
+    #[test]
+    fn test_sync_worker_context_builder_invariants() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _tx = tx;
+        let target_cfg = TargetSyncConfig::builder(src, dst).build().unwrap();
+        let engine = MockSyncEngine::new();
+
+        // 1. Zero max_pending_queue must fail validation
+        let err = SyncWorkerContext::builder(0, target_cfg.clone(), engine.clone(), rx, true)
+            .max_pending_queue(0)
+            .build();
+        assert!(err.is_err(), "max_pending_queue = 0 must fail validation");
+        let err = err.err().unwrap();
+        assert!(matches!(err, SyncError::Validation { .. }));
+        assert!(err.to_string().contains("greater than zero"));
+
+        // 2. Successful build with defaults
+        let (_tx2, rx2) = std::sync::mpsc::channel();
+        let ctx = SyncWorkerContext::builder(1, target_cfg.clone(), engine.clone(), rx2, true)
+            .build()
+            .unwrap();
+        assert_eq!(ctx.target_index(), 1);
+        assert_eq!(ctx.max_pending_queue(), 50_000);
+        assert!(ctx.observer().is_none());
+        assert!(!ctx.cancellation().load(std::sync::atomic::Ordering::SeqCst));
+
+        // 3. Custom options
+        let (_tx3, rx3) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx3 = SyncWorkerContext::builder(2, target_cfg, engine, rx3, true)
+            .max_pending_queue(100)
+            .cancellation(cancel)
+            .build()
+            .unwrap();
+        assert_eq!(ctx3.target_index(), 2);
+        assert_eq!(ctx3.max_pending_queue(), 100);
+        assert!(
+            ctx3.cancellation()
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }

@@ -8,8 +8,7 @@ use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 
 use super::engine::{
-    DirtyRangeLease, FileSyncTask, LocalSyncEngine, safe_epoch_duration_millis,
-    safe_modified_millis,
+    DirtyRangeLease, FileSyncTask, safe_epoch_duration_millis, safe_modified_millis,
 };
 
 /// Contiguous range of dirty blocks to coalesce delta writes and reduce seek overhead.
@@ -450,34 +449,12 @@ impl<S: HashStore> DeltaTransferEngine<S> {
     }
 }
 
-impl<S: HashStore> LocalSyncEngine<S> {
-    #[cfg(test)]
-    pub(crate) fn sync_delta_large_file_core(
-        &self,
-        task: &FileSyncTask<'_>,
-        scratch: &mut [u8],
-    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
-        self.delta_engine.sync_delta_large_file_core(task, scratch)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sync_delta_large_file(
-        &self,
-        task: &FileSyncTask<'_>,
-        scratch: &mut [u8],
-    ) -> Result<(), SyncError> {
-        let (record, hashes) = self.sync_delta_large_file_core(task, scratch)?;
-        self.db.save_file(&record, &hashes)?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, TargetSyncConfig};
     use crate::db::{MockHashStore, SqliteHashStore};
-    use crate::sync::SyncEngine;
+    use crate::sync::LocalSyncEngine;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
@@ -587,78 +564,93 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_block_multiple_sync() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("src");
-        let dest = dir.path().join("dst");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&dest).unwrap();
+    fn test_verification_mode_metadata_and_flush() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
 
-        let config = Config::builder(source.clone())
-            .dest_dir(dest.clone())
-            .block_sync_threshold_bytes(4)
-            .block_size_bytes(4)
+        let file_name = "large_2block.bin";
+        let content = vec![0xABu8; 1024];
+        std::fs::write(src.join(file_name), &content).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+            .block_size_bytes(512)
+            .block_sync_threshold_bytes(512)
+            .verification_mode(VerificationMode::MetadataAndFlush)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+
+        assert_eq!(
+            target_cfg.verification_mode(),
+            VerificationMode::MetadataAndFlush
+        );
+
         let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, target_cfg);
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
-        // 8 bytes payload = exactly 2 blocks of 4 bytes
-        fs::write(source.join("exact.bin"), b"12345678").unwrap();
-        engine.sync_file(Path::new("exact.bin")).unwrap();
+        let src_file_path = src.join(file_name);
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
 
-        assert_eq!(fs::read(dest.join("exact.bin")).unwrap(), b"12345678");
-        let hashes = engine.db.get_block_hashes(Path::new("exact.bin")).unwrap();
-        assert_eq!(hashes.len(), 2);
+        let mut scratch = vec![0u8; 512];
+        let task = FileSyncTask {
+            rel_path: Path::new(file_name),
+            src_path: &src_file_path,
+            dest_path: &dst.join(file_name),
+            dest_dir: &dst,
+            src_size: 1024,
+            src_mod,
+            cached_id: None,
+        };
+
+        engine.sync_delta_large_file(&task, &mut scratch).unwrap();
+
+        let dst_file = dst.join(file_name);
+        assert!(dst_file.exists());
+        assert_eq!(std::fs::metadata(&dst_file).unwrap().len(), 1024);
     }
 
     #[test]
-    fn test_delta_sync_large_file() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("src");
-        let dest = dir.path().join("dst");
-        let db_path = dir.path().join("sig.db");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&dest).unwrap();
+    fn test_verification_mode_sampled() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
 
-        let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(
-            &db_path,
-            crate::db::StoreConfig::new(
-                config.block_size_bytes(),
-                config.block_sync_threshold_bytes(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let file_name = "large_6block.bin";
+        let content = vec![0xCDu8; 1536];
+        let src_file_path = src.join(file_name);
+        std::fs::write(&src_file_path, &content).unwrap();
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+            .block_size_bytes(256)
+            .block_sync_threshold_bytes(256)
+            .verification_mode(VerificationMode::Sampled)
+            .build()
+            .unwrap();
+
+        let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, target_cfg);
 
-        // 12 bytes > 10 byte threshold -> delta sync path (3 blocks of 4)
-        fs::write(source.join("big.bin"), b"AAAABBBBcccc").unwrap();
-        engine.sync_file(Path::new("big.bin")).unwrap();
+        let mut scratch = vec![0u8; 256];
+        let task = FileSyncTask {
+            rel_path: Path::new(file_name),
+            src_path: &src_file_path,
+            dest_path: &dst.join(file_name),
+            dest_dir: &dst,
+            src_size: 1536,
+            src_mod,
+            cached_id: None,
+        };
 
-        let synced = fs::read(dest.join("big.bin")).unwrap();
-        assert_eq!(synced, b"AAAABBBBcccc");
+        engine.sync_delta_large_file(&task, &mut scratch).unwrap();
 
-        // Modify only block 1 (bytes 4-7)
-        let big_bin_path = source.join("big.bin");
-        fs::write(&big_bin_path, b"AAAAZZZZCCCC").unwrap();
-        let f = OpenOptions::new().write(true).open(&big_bin_path).unwrap();
-        f.set_times(
-            fs::FileTimes::new()
-                .set_modified(SystemTime::now() + std::time::Duration::from_secs(5)),
-        )
-        .unwrap();
-
-        engine.sync_file(Path::new("big.bin")).unwrap();
-
-        let synced = fs::read(dest.join("big.bin")).unwrap();
-        assert_eq!(synced, b"AAAAZZZZCCCC");
-
-        let hashes = engine.db.get_block_hashes(Path::new("big.bin")).unwrap();
-        assert_eq!(hashes.len(), 3);
+        let dst_file = dst.join(file_name);
+        assert!(dst_file.exists());
+        assert_eq!(std::fs::metadata(&dst_file).unwrap().len(), 1536);
     }
 
     #[test]
@@ -794,65 +786,6 @@ mod tests {
         let result = engine.sync_delta_large_file(&task, &mut scratch);
         assert!(result.is_ok());
         assert_eq!(std::fs::read(&dst_file).unwrap(), vec![0xCC; 1024]);
-    }
-
-    #[test]
-    fn test_local_sync_engine_dirty_range_buffer_reuse() {
-        let temp = tempdir().unwrap();
-        let src = temp.path().join("source");
-        let dst = temp.path().join("dest");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-        let config = Config::builder(src.clone())
-            .dest_dir(dst.clone())
-            .block_size_bytes(512)
-            .build()
-            .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
-
-        // Sync file 1
-        let f1 = "file1.bin";
-        std::fs::write(src.join(f1), vec![0x11; 1024]).unwrap();
-        let src_meta1 = std::fs::metadata(src.join(f1)).unwrap();
-        let task1 = FileSyncTask {
-            rel_path: Path::new(f1),
-            src_path: &src.join(f1),
-            dest_path: &dst.join(f1),
-            dest_dir: &dst,
-            src_size: src_meta1.len() as i64,
-            src_mod: safe_modified_millis(&src_meta1).unwrap(),
-            cached_id: None,
-        };
-        let mut scratch = vec![0u8; 512];
-        engine.sync_delta_large_file(&task1, &mut scratch).unwrap();
-
-        let cap1 = engine.dirty_range_capacity();
-        assert!(
-            cap1 >= 512,
-            "dirty_range buffer must have allocated capacity"
-        );
-
-        // Sync file 2
-        let f2 = "file2.bin";
-        std::fs::write(src.join(f2), vec![0x22; 1024]).unwrap();
-        let src_meta2 = std::fs::metadata(src.join(f2)).unwrap();
-        let task2 = FileSyncTask {
-            rel_path: Path::new(f2),
-            src_path: &src.join(f2),
-            dest_path: &dst.join(f2),
-            dest_dir: &dst,
-            src_size: src_meta2.len() as i64,
-            src_mod: safe_modified_millis(&src_meta2).unwrap(),
-            cached_id: None,
-        };
-        engine.sync_delta_large_file(&task2, &mut scratch).unwrap();
-
-        let cap2 = engine.dirty_range_capacity();
-        assert!(
-            cap2 >= cap1,
-            "dirty_range capacity should be retained or grown across files"
-        );
     }
 
     #[test]

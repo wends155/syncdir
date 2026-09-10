@@ -594,3 +594,26 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Public / crate-private field leakage on `TargetSyncConfig` eliminated.
 >   - Unchecked direct struct construction of `TargetSyncConfig` by consumers eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Bucket 4: Sync Subsystem Restructuring (`review_report.md` Findings 6, 8, 13, 14)
+> * **Changes:**
+>   - **DebounceQueue Drain Safety & Zero-Panic Mandate (O1)**: Replaced unchecked `.pop().unwrap()` in `DebounceQueue::drain_ready_syncs` and `drain_ready_deletes` with `if let Some(...)` bounds in `src/sync/worker.rs`. Added unit test `test_debounce_queue_drain_safety`.
+>   - **Reparse Verification Lock Release & Cache Poisoning Prevention (O1)**: Rewrote `verify_destination_cached` in `src/sync/engine.rs` to inspect ancestor cache under a brief lock, release the lock during remote filesystem I/O, verify `meta.is_dir()`, stop caching on `NotFound`, and re-acquire the lock solely for verified directories. Gated unused `verify_destination_not_reparse_cached` under `#[cfg(test)]` in `src/sync/path_safety.rs`.
+>   - **Atomic Coordination Consolidation (O2)**: Consolidated all cross-module coordination methods (`run_cancellable_full_scan_impl`, `flush_record_batch`, `delete_file_from_dest`, `prune_destination_archive`, `archive_dest_file_only`, `sync_delta_large_file_core`, `sync_delta_large_file`, `sync_small_file_core`, `sync_small_file`) into `src/sync/engine.rs`. Stripped all `impl LocalSyncEngine` blocks from `scanner.rs`, `archive.rs`, `delta.rs`, and `small_file.rs`, completely eliminating cross-submodule fragmentation without compiler duplicate definition conflicts.
+>   - **Unit Test Decoupling & Relocation (O3)**: Decoupled unit tests in `src/sync/small_file.rs`, `src/sync/delta.rs`, `src/sync/archive.rs`, and `src/sync/scanner.rs` to test `SmallFileTransferEngine`, `DeltaTransferEngine`, `ArchiveManager`, and `DirectoryScanner` directly. Relocated all 20 end-to-end integration orchestration tests into `src/sync/engine.rs::mod tests`.
+>   - **Engine Field Encapsulation (O3)**: Encapsulated all 8 fields of `LocalSyncEngine` (`db`, `config`, `resolved_dest`, `verified_dirs`, `small_file_engine`, `delta_engine`, `archive_manager`, `scanner`) to strictly private.
+>   - **Worker Context Encapsulation & Builder Pattern (O4)**: Demoted all 9 fields of `SyncWorkerContext` in `src/sync/worker.rs` to `pub(crate)`. Introduced `SyncWorkerContextBuilder` enforcing `max_pending_queue > 0` validation (`SyncError::Validation { kind: ValidationKind::Invariant, .. }`). Added read-only borrowing getters and fluent setters (`with_resolver`, `with_cancellation`, `with_max_pending_queue`). Updated `tests/integration_tests.rs` to use fluent chaining.
+>   - **Trait Contract Documentation & Quality Verification Gate (O5)**: Re-exported `SyncWorkerContextBuilder` in `src/sync/mod.rs`. Enriched doc comments and error contracts on `SyncEngine` trait and methods in `src/sync/engine.rs`. Verified zero formatting diffs (`cargo fmt`), zero lint warnings (`cargo clippy -D warnings`), and 100% test pass rate with 302 passing tests (`cargo test --all-features`).
+> * **New Constraints:**
+>   - Submodules within `src/sync/` (`scanner.rs`, `archive.rs`, `delta.rs`, `small_file.rs`) must remain specialized leaf transfer engines. `LocalSyncEngine` coordination logic must live exclusively in `src/sync/engine.rs`.
+>   - `SyncWorkerContext` fields must remain `pub(crate)` with access mediated by borrowing getters. Construction should prefer `SyncWorkerContext::builder` or fluent configuration helpers.
+>   - Directory ancestor verification caching must never hold mutex locks across blocking network filesystem calls.
+> * **Pruned:**
+>   - Fragmented `impl LocalSyncEngine` blocks across leaf submodules eliminated.
+>   - Public field exposure on `LocalSyncEngine` eliminated.
+>   - Unchecked `.pop().unwrap()` in debounce queue drainage eliminated.
+>   - Lock contention and cache poisoning risks in destination verification eliminated.
+
+

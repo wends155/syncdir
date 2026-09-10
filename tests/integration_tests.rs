@@ -457,9 +457,9 @@ fn test_worker_reachability_and_offline_drain_guard() {
     let (tx, rx) = channel();
     let cancellation = Arc::new(AtomicBool::new(false));
 
-    let mut context = SyncWorkerContext::new(0, target_cfg, mock_engine.clone(), rx, None, true);
-    context.resolver = mock_resolver.clone();
-    context.cancellation = cancellation.clone();
+    let context = SyncWorkerContext::new(0, target_cfg, mock_engine.clone(), rx, None, true)
+        .with_resolver(mock_resolver.clone())
+        .with_cancellation(cancellation.clone());
 
     let handle = start_sync_worker(context).unwrap();
 

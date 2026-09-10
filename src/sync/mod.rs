@@ -19,4 +19,6 @@ pub use engine::{
 };
 pub use mock::MockSyncEngine;
 pub use path_safety::is_safe_relative_path;
-pub use worker::{SourceConnectivityTracker, SyncWorkerContext, start_sync_worker};
+pub use worker::{
+    SourceConnectivityTracker, SyncWorkerContext, SyncWorkerContextBuilder, start_sync_worker,
+};

@@ -4,12 +4,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::config::{TargetSyncConfig, VerificationMode};
-use crate::db::{FileRecord, HashStore};
+use crate::db::FileRecord;
 use crate::error::SyncError;
 
-use super::engine::{
-    FileSyncTask, LocalSyncEngine, safe_epoch_duration_millis, safe_modified_millis,
-};
+use super::engine::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
 
 /// RAII guard for temporary staging files during atomic small-file sync.
 /// Automatically removes the temporary file on drop unless disarmed.
@@ -205,31 +203,10 @@ impl SmallFileTransferEngine {
     }
 }
 
-impl<S: HashStore> LocalSyncEngine<S> {
-    #[cfg(test)]
-    pub(crate) fn sync_small_file_core(
-        &self,
-        task: &FileSyncTask<'_>,
-        scratch: &mut [u8],
-    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
-        self.small_file_engine.sync_small_file_core(task, scratch)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sync_small_file(&self, task: &FileSyncTask<'_>) -> Result<(), SyncError> {
-        let mut stack_scratch = [0u8; 64 * 1024];
-        let (record, _) = self.sync_small_file_core(task, &mut stack_scratch)?;
-        self.db.save_file(&record, &[])?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, TargetSyncConfig};
-    use crate::db::{MockHashStore, SqliteHashStore};
-    use crate::sync::SyncEngine;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -243,268 +220,6 @@ mod tests {
             .block_size_bytes(4)
             .build()
             .unwrap()
-    }
-
-    #[test]
-    fn test_small_file_sync() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("src");
-        let dest = dir.path().join("dst");
-        let db_path = dir.path().join("sig.db");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&dest).unwrap();
-
-        let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(
-            &db_path,
-            crate::db::StoreConfig::new(
-                config.block_size_bytes(),
-                config.block_sync_threshold_bytes(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
-        let engine = LocalSyncEngine::new(store, target_cfg);
-
-        // Write a small file (< 10 bytes threshold)
-        fs::write(source.join("tiny.txt"), b"hi").unwrap();
-        engine.sync_file(Path::new("tiny.txt")).unwrap();
-
-        let content = fs::read_to_string(dest.join("tiny.txt")).unwrap();
-        assert_eq!(content, "hi");
-
-        // DB should have a record
-        assert!(engine.db.get_file(Path::new("tiny.txt")).unwrap().is_some());
-    }
-
-    #[test]
-    fn test_zero_byte_file_sync() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("src");
-        let dest = dir.path().join("dst");
-        let db_path = dir.path().join("sig.db");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&dest).unwrap();
-
-        let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(
-            &db_path,
-            crate::db::StoreConfig::new(
-                config.block_size_bytes(),
-                config.block_sync_threshold_bytes(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
-        let engine = LocalSyncEngine::new(store, target_cfg);
-
-        // 0-byte file
-        fs::write(source.join("empty.txt"), b"").unwrap();
-        engine.sync_file(Path::new("empty.txt")).unwrap();
-
-        assert!(dest.join("empty.txt").exists());
-        assert_eq!(fs::read(dest.join("empty.txt")).unwrap().len(), 0);
-        assert!(
-            engine
-                .db
-                .get_file(Path::new("empty.txt"))
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_sync_small_file_skips_block_hashes() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("src");
-        let dest = dir.path().join("dst");
-        let db_path = dir.path().join("sig.db");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&dest).unwrap();
-
-        let config = Config::builder(source.clone())
-            .dest_dir(dest.clone())
-            .block_sync_threshold_bytes(1024)
-            .block_size_bytes(256)
-            .build()
-            .unwrap();
-        let store = SqliteHashStore::new(
-            &db_path,
-            crate::db::StoreConfig::new(
-                config.block_size_bytes(),
-                config.block_sync_threshold_bytes(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
-        let engine = LocalSyncEngine::new(store, target_cfg);
-
-        fs::write(source.join("small.txt"), b"under threshold").unwrap();
-        engine.sync_file(Path::new("small.txt")).unwrap();
-
-        assert_eq!(
-            fs::read(dest.join("small.txt")).unwrap(),
-            b"under threshold"
-        );
-        let block_hashes = engine.db.get_block_hashes(Path::new("small.txt")).unwrap();
-        assert!(
-            block_hashes.is_empty(),
-            "Small files should not record block hashes"
-        );
-    }
-
-    #[test]
-    fn test_sync_file_small_file_verify_writes() {
-        let temp = tempdir().unwrap();
-        let src = temp.path().join("source");
-        let dst = temp.path().join("dest");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-        let config = Config::test_default(src.clone(), dst.clone());
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let engine =
-            LocalSyncEngine::new(MockHashStore::new(), target_cfg.with_verify_writes(true));
-        std::fs::write(src.join("small.txt"), b"payload").unwrap();
-        let mut scratch = vec![0u8; 4096];
-        assert!(
-            engine
-                .sync_file_to_dest_buffered(Path::new("small.txt"), &dst, &mut scratch)
-                .is_ok()
-        );
-        assert_eq!(std::fs::read(dst.join("small.txt")).unwrap(), b"payload");
-    }
-
-    #[test]
-    fn test_sync_small_file_records_actual_bytes_copied() {
-        let temp = tempdir().unwrap();
-        let src = temp.path().join("source");
-        let dst = temp.path().join("dest");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-        let config = Config::builder(src.clone())
-            .dest_dir(dst.clone())
-            .block_size_bytes(512)
-            .verify_writes(false)
-            .build()
-            .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
-
-        let src_file = src.join("small.txt");
-        let dst_file = dst.join("small.txt");
-        std::fs::write(&src_file, vec![0x42; 500]).unwrap();
-
-        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
-        let task = FileSyncTask {
-            rel_path: Path::new("small.txt"),
-            src_path: &src_file,
-            dest_path: &dst_file,
-            dest_dir: &dst,
-            src_size: 1000,
-            src_mod,
-            cached_id: None,
-        };
-
-        engine.sync_small_file(&task).unwrap();
-        let record = store.get_file(Path::new("small.txt")).unwrap().unwrap();
-        assert_eq!(
-            record.file_size, 500,
-            "Saved record must use actual bytes copied (500), not stale task.src_size (1000)"
-        );
-    }
-
-    #[test]
-    fn test_verification_mode_metadata_and_flush() {
-        let temp = tempdir().unwrap();
-        let src = temp.path().join("source");
-        let dst = temp.path().join("dest");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-
-        let file_name = "large_2block.bin";
-        let content = vec![0xABu8; 1024];
-        std::fs::write(src.join(file_name), &content).unwrap();
-
-        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
-            .block_size_bytes(512)
-            .block_sync_threshold_bytes(512)
-            .verification_mode(VerificationMode::MetadataAndFlush)
-            .build()
-            .unwrap();
-
-        assert_eq!(
-            target_cfg.verification_mode(),
-            VerificationMode::MetadataAndFlush
-        );
-
-        let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
-
-        let src_file_path = src.join(file_name);
-        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
-
-        let mut scratch = vec![0u8; 512];
-        let task = FileSyncTask {
-            rel_path: Path::new(file_name),
-            src_path: &src_file_path,
-            dest_path: &dst.join(file_name),
-            dest_dir: &dst,
-            src_size: 1024,
-            src_mod,
-            cached_id: None,
-        };
-
-        engine.sync_delta_large_file(&task, &mut scratch).unwrap();
-
-        let dst_file = dst.join(file_name);
-        assert!(dst_file.exists());
-        assert_eq!(std::fs::metadata(&dst_file).unwrap().len(), 1024);
-    }
-
-    #[test]
-    fn test_verification_mode_sampled() {
-        let temp = tempdir().unwrap();
-        let src = temp.path().join("source");
-        let dst = temp.path().join("dest");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-
-        let file_name = "large_6block.bin";
-        let content = vec![0xCDu8; 1536];
-        let src_file_path = src.join(file_name);
-        std::fs::write(&src_file_path, &content).unwrap();
-        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
-
-        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
-            .block_size_bytes(256)
-            .block_sync_threshold_bytes(256)
-            .verification_mode(VerificationMode::Sampled)
-            .build()
-            .unwrap();
-
-        let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, target_cfg);
-
-        let mut scratch = vec![0u8; 256];
-        let task = FileSyncTask {
-            rel_path: Path::new(file_name),
-            src_path: &src_file_path,
-            dest_path: &dst.join(file_name),
-            dest_dir: &dst,
-            src_size: 1536,
-            src_mod,
-            cached_id: None,
-        };
-
-        engine.sync_delta_large_file(&task, &mut scratch).unwrap();
-
-        let dst_file = dst.join(file_name);
-        assert!(dst_file.exists());
-        assert_eq!(std::fs::metadata(&dst_file).unwrap().len(), 1536);
     }
 
     #[test]
@@ -525,8 +240,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, target_cfg);
+        let engine = SmallFileTransferEngine::new(target_cfg);
 
         let task = FileSyncTask {
             rel_path: Path::new(file_name),
@@ -561,7 +275,7 @@ mod tests {
             .build()
             .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+        let engine = SmallFileTransferEngine::new(target_cfg);
 
         let dst_file = dst.join("target.txt");
         fs::write(&dst_file, b"ORIGINAL_DESTINATION_CONTENT").unwrap();

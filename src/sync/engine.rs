@@ -1,8 +1,9 @@
 //! Core sync engine trait, commands, status types, and LocalSyncEngine coordination.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
 use crate::config::TargetSyncConfig;
@@ -11,8 +12,7 @@ use crate::error::SyncError;
 
 use super::delta::DirtyBlockRange;
 use super::path_safety::{
-    is_reparse_or_symlink_meta, is_safe_relative_path, verify_destination_not_reparse_cached,
-    verify_source_not_reparse,
+    is_reparse_or_symlink_meta, is_safe_relative_path, verify_source_not_reparse,
 };
 use super::scanner::scan_dir;
 
@@ -134,7 +134,14 @@ pub trait SyncStatusObserver: Send + Sync + 'static {
     fn on_write_verification_failed(&self, _path: &Path) {}
 }
 
-/// Core sync execution contract. Implemented by the delta sync engine.
+/// Core sync execution contract for synchronizing files and directory trees.
+///
+/// `SyncEngine` serves as the primary behavioral abstraction decoupling sync workers
+/// and daemon orchestration from low-level filesystem I/O, hash database caching, and delta transfers.
+///
+/// Production implementations (like [`LocalSyncEngine`]) coordinate atomic small-file copies,
+/// block-level delta transfers, path traversal safety checks, and destination archiving. Test
+/// suites utilize [`MockSyncEngine`](crate::sync::MockSyncEngine) to verify worker state machines without live disk access.
 ///
 /// # Examples
 ///
@@ -146,18 +153,25 @@ pub trait SyncStatusObserver: Send + Sync + 'static {
 /// let _ = engine.sync_file(Path::new("document.txt"));
 /// ```
 pub trait SyncEngine: Send + Sync {
-    /// Synchronize a single file from source to destination.
+    /// Synchronize a single file from source to the default configured destination.
+    ///
+    /// Delegates internally to destination-targeted buffered synchronization using an ephemeral scratch buffer.
     ///
     /// # Errors
-    /// Returns `SyncError::Io` on filesystem errors, `SyncError::Db` on database persistence failures,
-    /// or `SyncError::WriteVerificationFailed` if written content does not match source Blake3 hashes.
+    ///
+    /// * `SyncError::Io` on filesystem read, write, or metadata retrieval errors.
+    /// * `SyncError::Db` on signature database cache query or persistence failures.
+    /// * `SyncError::WriteVerificationFailed` if post-write validation fails against source Blake3 block hashes.
+    /// * `SyncError::Validation` if source or destination paths fail path safety constraints (e.g., reparse points).
     fn sync_file(&self, path: &Path) -> Result<(), SyncError>;
 
-    /// Synchronize a file to a specific destination directory with a reusable scratch buffer.
+    /// Synchronize a single file to a specific destination directory with a caller-provided scratch buffer.
     ///
-    /// Required method: implementors must handle the `dest_dir` parameter.
+    /// Allows the background worker to reuse a pre-allocated scratch buffer across thousands of sequential
+    /// file transfers to avoid memory fragmentation and allocation spikes.
     ///
     /// # Errors
+    ///
     /// Returns `SyncError` if reading source, streaming delta, verifying writes, or saving metadata fails.
     fn sync_file_to_dest_buffered(
         &self,
@@ -166,32 +180,46 @@ pub trait SyncEngine: Send + Sync {
         scratch: &mut [u8],
     ) -> Result<(), SyncError>;
 
-    /// Handle deletion of a file (archive on destination).
+    /// Handle deletion of a file by archiving it on the default configured destination.
+    ///
+    /// Moves the deleted destination file into `.syncdir_archive` with a timestamped collision-resistant
+    /// name, then removes the file record from the database.
     ///
     /// # Errors
-    /// Returns `SyncError` if moving the deleted file to archive fails.
+    ///
+    /// Returns `SyncError` if moving the deleted file to the archive or updating the database fails.
     fn delete_file(&self, path: &Path) -> Result<(), SyncError>;
 
     /// Handle deletion of a file on a specific destination directory.
     ///
-    /// Required method: implementors must handle the `dest_dir` parameter.
+    /// Moves the file to the destination's `.syncdir_archive` directory and updates or evicts database records
+    /// according to deletion propagation policies.
     ///
     /// # Errors
-    /// Returns `SyncError` if moving the deleted file to archive fails.
+    ///
+    /// Returns `SyncError` if archiving fails or database records cannot be updated.
     fn delete_file_from_dest(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError>;
 
-    /// Prune archive directory on the destination.
+    /// Prune old and excess files in the destination's archive directory.
+    ///
+    /// Enforces age retention and maximum archive size quotas.
     ///
     /// # Errors
+    ///
     /// Returns `SyncError` if walking or deleting old archive files fails.
     fn prune_archive(&self, _dest_dir: &Path) -> Result<(), SyncError> {
         Ok(())
     }
 
-    /// Run a full scan and sync cycle that can be interrupted by the `cancel` signal.
+    /// Run a full scan and synchronization cycle on `dest_dir` that can be cancelled via an atomic token.
+    ///
+    /// Scans the entire source tree, compares with destination filesystem and cache state, transfers
+    /// outdated or missing files, archives orphaned destination files, and records progress.
     ///
     /// # Errors
-    /// Returns `SyncError::Cancelled` if cancelled, or `SyncError` on scanning/sync failures.
+    ///
+    /// * Returns `SyncError::Cancelled` if the cancellation token is signaled during directory traversal or file sync.
+    /// * Returns `SyncError` on directory scanning or synchronization failures.
     fn run_cancellable_full_scan(
         &self,
         dest_dir: &Path,
@@ -201,13 +229,12 @@ pub trait SyncEngine: Send + Sync {
         Ok(ScanOutcome::Success { synced: 0 })
     }
 
-    /// Perform a full directory scan on `dest_dir` and sync all changed files.
+    /// Perform a full directory scan on `dest_dir` and sync all changed files without cancellation.
+    ///
+    /// Convenience wrapper around [`SyncEngine::run_cancellable_full_scan`].
     ///
     /// # Errors
-    /// Returns `SyncError` on directory traversal or synchronization failure.
-    /// Perform a full directory scan on `dest_dir` and sync all changed files.
     ///
-    /// # Errors
     /// Returns `SyncError` on directory traversal or synchronization failure.
     fn run_full_scan(&self, dest_dir: &Path) -> Result<ScanOutcome, SyncError> {
         static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
@@ -351,14 +378,14 @@ impl<'a> Drop for DirtyRangeLease<'a> {
 
 /// Delta sync engine backed by a `HashStore` for signature caching, composed of collaborating transfer, archive, and scan engines.
 pub struct LocalSyncEngine<S: HashStore> {
-    pub(crate) db: std::sync::Arc<S>,
-    pub(crate) config: TargetSyncConfig,
-    pub(crate) resolved_dest: Option<PathBuf>,
-    pub(crate) verified_dirs: std::sync::Mutex<HashSet<PathBuf>>,
-    pub(crate) small_file_engine: crate::sync::small_file::SmallFileTransferEngine,
-    pub(crate) delta_engine: crate::sync::delta::DeltaTransferEngine<std::sync::Arc<S>>,
-    pub(crate) archive_manager: crate::sync::archive::ArchiveManager,
-    pub(crate) scanner: crate::sync::scanner::DirectoryScanner,
+    db: std::sync::Arc<S>,
+    config: TargetSyncConfig,
+    resolved_dest: Option<PathBuf>,
+    verified_dirs: std::sync::Mutex<HashSet<PathBuf>>,
+    small_file_engine: crate::sync::small_file::SmallFileTransferEngine,
+    delta_engine: crate::sync::delta::DeltaTransferEngine<std::sync::Arc<S>>,
+    archive_manager: crate::sync::archive::ArchiveManager,
+    scanner: crate::sync::scanner::DirectoryScanner,
 }
 
 #[derive(Debug)]
@@ -509,6 +536,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         dest_dir: &Path,
         rel_path: &Path,
     ) -> Result<Option<std::fs::Metadata>, SyncError> {
+        // Phase 1: Inspect cache under brief lock and collect unverified ancestors
         let (root_verified, unverified_ancestors) = {
             let cache = self
                 .verified_dirs
@@ -528,29 +556,73 @@ impl<S: HashStore> LocalSyncEngine<S> {
             (root_ok, unverified)
         };
 
+        // Phase 2: If cache miss, verify ancestors over filesystem without holding lock
         if !root_verified || !unverified_ancestors.is_empty() {
+            let mut verified_to_insert = Vec::new();
+
+            if !root_verified {
+                let meta = fs::symlink_metadata(dest_dir).map_err(SyncError::Io)?;
+                if is_reparse_or_symlink_meta(&meta) {
+                    return Err(SyncError::validation(format!(
+                        "Destination directory '{}' is a symlink or reparse point; refusing to sync",
+                        dest_dir.display()
+                    )));
+                }
+                if meta.is_dir() {
+                    verified_to_insert.push(dest_dir.to_path_buf());
+                }
+            }
+
+            for ancestor in &unverified_ancestors {
+                match fs::symlink_metadata(ancestor) {
+                    Ok(meta) => {
+                        if is_reparse_or_symlink_meta(&meta) {
+                            return Err(SyncError::validation(format!(
+                                "Destination component '{}' is a symlink or reparse point; refusing to write",
+                                ancestor.display()
+                            )));
+                        }
+                        if meta.is_dir() {
+                            verified_to_insert.push(ancestor.clone());
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Intermediate parent does not exist yet; stop caching deeper uncreated children
+                        break;
+                    }
+                    Err(e) => return Err(SyncError::Io(e)),
+                }
+            }
+
+            // Phase 3: Re-acquire lock briefly to insert only genuinely verified directories
             let mut cache = self
                 .verified_dirs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            verify_destination_not_reparse_cached(dest_dir, rel_path, &mut cache)
-        } else {
-            let leaf_path = dest_dir.join(rel_path);
-            let meta = match fs::symlink_metadata(&leaf_path) {
-                Ok(m) => {
-                    if is_reparse_or_symlink_meta(&m) {
-                        return Err(SyncError::validation(format!(
-                            "Destination component '{}' is a symlink or reparse point; refusing to write",
-                            leaf_path.display()
-                        )));
-                    }
-                    Some(m)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(SyncError::Io(e)),
-            };
-            Ok(meta)
+            if cache.len() > 1000 {
+                cache.clear();
+            }
+            for verified in verified_to_insert {
+                cache.insert(verified);
+            }
         }
+
+        // Leaf check
+        let leaf_path = dest_dir.join(rel_path);
+        let meta = match fs::symlink_metadata(&leaf_path) {
+            Ok(m) => {
+                if is_reparse_or_symlink_meta(&m) {
+                    return Err(SyncError::validation(format!(
+                        "Destination component '{}' is a symlink or reparse point; refusing to write",
+                        leaf_path.display()
+                    )));
+                }
+                Some(m)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(SyncError::Io(e)),
+        };
+        Ok(meta)
     }
 
     pub(crate) fn sync_file_to_dest_core(
@@ -671,6 +743,306 @@ impl<S: HashStore> LocalSyncEngine<S> {
             file_record.as_ref(),
         )
     }
+
+    /// Flush accumulated file records and hashes to the database in a single batch.
+    pub(crate) fn flush_record_batch(
+        &self,
+        batch: &mut Vec<(FileRecord, Vec<crate::db::BlockHash>)>,
+    ) -> Result<(), SyncError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<(&FileRecord, &[crate::db::BlockHash])> = batch
+            .iter()
+            .map(|(rec, hashes)| (rec, hashes.as_slice()))
+            .collect();
+        self.db.save_files_batch(&refs)?;
+        batch.clear();
+        Ok(())
+    }
+
+    /// Full scan implementation with cooperative cancellation support.
+    pub(crate) fn run_cancellable_full_scan_impl(
+        &self,
+        dest_dir: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<ScanOutcome, SyncError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SyncError::Cancelled);
+        }
+
+        let resolved_source = self.config.source_dir();
+        if !resolved_source.exists() {
+            return Err(SyncError::validation("Source directory does not exist"));
+        }
+
+        let active_dest = if let Some(ref pre_resolved) = self.resolved_dest {
+            if pre_resolved.exists() && pre_resolved.is_dir() {
+                pre_resolved.clone()
+            } else {
+                dest_dir.to_path_buf()
+            }
+        } else {
+            dest_dir.to_path_buf()
+        };
+
+        if !active_dest.exists() || !active_dest.is_dir() {
+            tracing::warn!(
+                target = %active_dest.display(),
+                "Target destination directory does not exist or is unreachable. Skipping full scan."
+            );
+            return Ok(ScanOutcome::DestinationUnreachable);
+        }
+
+        let mut source_files: HashSet<PathBuf> = HashSet::new();
+        let mut scan_complete = true;
+        self.scanner.scan_dir_cancellable(
+            resolved_source,
+            &mut source_files,
+            &mut scan_complete,
+            cancel,
+        )?;
+
+        let cached_records = self.db.list_all_records()?;
+        let cached_lookup: HashMap<PathBuf, &FileRecord> = cached_records
+            .values()
+            .map(|rec| (crate::path_util::normalize_path(&rec.relative_path), rec))
+            .collect();
+
+        // Sync all source files
+        let mut synced_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut sync_skip_count = 0usize;
+        let mut scratch = vec![0u8; self.config.block_size_bytes() as usize];
+        let mut batch: Vec<(FileRecord, Vec<crate::db::BlockHash>)> = Vec::with_capacity(500);
+        for rel_path in &source_files {
+            if cancel.load(Ordering::Relaxed) {
+                self.flush_record_batch(&mut batch)?;
+                return Err(SyncError::Cancelled);
+            }
+            match self.sync_file_to_dest_core(
+                rel_path,
+                &active_dest,
+                &mut scratch,
+                cached_lookup.get(rel_path).copied(),
+            ) {
+                Ok(Some((record, hashes))) => {
+                    synced_count += 1;
+                    batch.push((record, hashes));
+                    if batch.len() >= 500 {
+                        self.flush_record_batch(&mut batch)?;
+                    }
+                }
+                Ok(None) => {
+                    synced_count += 1;
+                }
+                Err(e) => {
+                    failed_count += 1;
+                    let os_code = match &e {
+                        SyncError::Io(io_err) => io_err.raw_os_error(),
+                        _ => None,
+                    };
+                    if e.is_network_offline() {
+                        tracing::warn!(
+                            path = %rel_path.display(),
+                            target = %active_dest.display(),
+                            error = %e,
+                            os_error = ?os_code,
+                            remaining = source_files.len() - sync_skip_count - 1,
+                            "Target unreachable during full scan, skipping remaining files"
+                        );
+                        sync_skip_count = source_files.len();
+                        break;
+                    }
+                    tracing::warn!(
+                        path = %rel_path.display(),
+                        target = %active_dest.display(),
+                        error = %e,
+                        os_error = ?os_code,
+                        "Skipped file during full scan"
+                    );
+                    sync_skip_count += 1;
+                }
+            }
+        }
+        self.flush_record_batch(&mut batch)?;
+        if sync_skip_count > 0 {
+            tracing::warn!(
+                skipped = sync_skip_count,
+                total = source_files.len(),
+                target = %active_dest.display(),
+                "Full scan completed with sync errors"
+            );
+        }
+
+        // If 100% of files failed to sync (and there were files to sync), destination is inaccessible
+        if !source_files.is_empty() && sync_skip_count == source_files.len() {
+            return Ok(ScanOutcome::DestinationUnreachable);
+        }
+
+        // Detect deletions: files in DB but missing from source
+        let mut delete_skip_count = 0usize;
+        if self.config.propagate_deletions() {
+            if !scan_complete {
+                tracing::warn!(
+                    "Full scan was incomplete due to inaccessible directories or errors; skipping deletion propagation to prevent data loss"
+                );
+            } else if source_files.is_empty() && !cached_records.is_empty() {
+                tracing::warn!(
+                    tracked_count = cached_records.len(),
+                    "Source directory is empty but cache contains tracked files. Skipping deletion propagation to prevent accidental target wipe."
+                );
+                return Ok(ScanOutcome::Success { synced: 0 });
+            } else {
+                #[cfg(windows)]
+                let source_lookup: HashSet<String> = source_files
+                    .iter()
+                    .map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase())
+                    .collect();
+
+                let mut missing_to_delete: Vec<&Path> = Vec::new();
+                for tracked_path in cached_records.keys() {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(SyncError::Cancelled);
+                    }
+                    #[cfg(windows)]
+                    let is_present = source_lookup.contains(
+                        &tracked_path
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                            .to_lowercase(),
+                    );
+                    #[cfg(not(windows))]
+                    let is_present = source_files.contains(tracked_path);
+
+                    if !is_present {
+                        if let Err(e) = self.archive_dest_file_only(tracked_path, &active_dest) {
+                            let os_code = match &e {
+                                SyncError::Io(io_err) => io_err.raw_os_error(),
+                                _ => None,
+                            };
+                            if e.is_network_offline() {
+                                tracing::warn!(
+                                    path = %tracked_path.display(),
+                                    target = %active_dest.display(),
+                                    error = %e,
+                                    os_error = ?os_code,
+                                    "Target unreachable during deletion phase of full scan, aborting deletion pass"
+                                );
+                                delete_skip_count += 1;
+                                break;
+                            }
+                            tracing::warn!(
+                                path = %tracked_path.display(),
+                                target = %active_dest.display(),
+                                error = %e,
+                                os_error = ?os_code,
+                                "Skipped deletion during full scan"
+                            );
+                            delete_skip_count += 1;
+                        } else {
+                            missing_to_delete.push(tracked_path.as_path());
+                        }
+                    }
+                }
+                if !missing_to_delete.is_empty() {
+                    self.db.delete_files_batch(&missing_to_delete)?;
+                }
+                if delete_skip_count > 0 {
+                    tracing::warn!(
+                        skipped = delete_skip_count,
+                        target = %active_dest.display(),
+                        "Full scan completed with deletion errors"
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = self.prune_destination_archive(&active_dest) {
+            tracing::warn!(
+                target = %active_dest.display(),
+                error = %e,
+                "Failed to prune destination archive after full scan"
+            );
+        }
+
+        if failed_count > 0 || delete_skip_count > 0 {
+            Ok(ScanOutcome::PartialFailure {
+                synced: synced_count,
+                failed: failed_count,
+                delete_failed: delete_skip_count,
+            })
+        } else {
+            Ok(ScanOutcome::Success {
+                synced: synced_count,
+            })
+        }
+    }
+
+    /// Archive or remove a file on destination filesystem without updating the database.
+    pub(crate) fn archive_dest_file_only(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+    ) -> Result<(), SyncError> {
+        self.archive_manager
+            .archive_dest_file_only(rel_path, dest_dir)
+    }
+
+    /// Handle deletion of a file on a specific destination directory.
+    pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
+        self.archive_dest_file_only(rel_path, dest_dir)?;
+        let dest_path = dest_dir.join(rel_path);
+        if let Some(parent) = dest_path.parent() {
+            self.evict_verified_dir(parent);
+        }
+        if self.config.propagate_deletions() || !dest_path.exists() {
+            self.db.delete_file(rel_path)?;
+        }
+        Ok(())
+    }
+
+    /// Prune old and excess files in the destination archive.
+    pub fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
+        self.archive_manager.prune_destination_archive(dest_dir)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_delta_large_file_core(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
+        self.delta_engine.sync_delta_large_file_core(task, scratch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_delta_large_file(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
+        let (record, hashes) = self.sync_delta_large_file_core(task, scratch)?;
+        self.db.save_file(&record, &hashes)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_small_file_core(
+        &self,
+        task: &FileSyncTask<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(FileRecord, Vec<crate::db::BlockHash>), SyncError> {
+        self.small_file_engine.sync_small_file_core(task, scratch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_small_file(&self, task: &FileSyncTask<'_>) -> Result<(), SyncError> {
+        let mut stack_scratch = [0u8; 64 * 1024];
+        let (record, _) = self.sync_small_file_core(task, &mut stack_scratch)?;
+        self.db.save_file(&record, &[])?;
+        Ok(())
+    }
 }
 
 impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
@@ -748,6 +1120,18 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    fn test_config(source: PathBuf, dest: PathBuf) -> Config {
+        Config::builder(source)
+            .dest_dir(dest)
+            .debounce_seconds(1)
+            .retry_interval_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(64)
+            .block_size_bytes(16)
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -1212,5 +1596,774 @@ mod tests {
         // Full scan verification
         let scan_res = engine.run_full_scan().unwrap();
         assert!(matches!(scan_res, ScanOutcome::Success { .. }));
+    }
+
+    // =========================================================================
+    // Relocated Small File Tests (5 tests)
+    // =========================================================================
+
+    #[test]
+    fn test_small_file_sync() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = test_config(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        fs::write(source.join("small.txt"), b"hello world").unwrap();
+        engine.sync_file(Path::new("small.txt")).unwrap();
+
+        assert_eq!(fs::read(dest.join("small.txt")).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn test_zero_byte_file_sync() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = test_config(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        fs::write(source.join("empty.txt"), b"").unwrap();
+        engine.sync_file(Path::new("empty.txt")).unwrap();
+
+        assert!(dest.join("empty.txt").exists());
+        assert_eq!(fs::read(dest.join("empty.txt")).unwrap(), b"");
+    }
+
+    #[test]
+    fn test_sync_small_file_skips_block_hashes() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source.clone())
+            .dest_dir(dest.clone())
+            .block_sync_threshold_bytes(1024)
+            .block_size_bytes(256)
+            .build()
+            .unwrap();
+        let store = SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        fs::write(source.join("small.txt"), b"under threshold").unwrap();
+        engine.sync_file(Path::new("small.txt")).unwrap();
+
+        assert_eq!(
+            fs::read(dest.join("small.txt")).unwrap(),
+            b"under threshold"
+        );
+        let block_hashes = engine.db.get_block_hashes(Path::new("small.txt")).unwrap();
+        assert!(
+            block_hashes.is_empty(),
+            "Small files should not record block hashes"
+        );
+    }
+
+    #[test]
+    fn test_sync_file_small_file_verify_writes() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::test_default(src.clone(), dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let engine =
+            LocalSyncEngine::new(MockHashStore::new(), target_cfg.with_verify_writes(true));
+        std::fs::write(src.join("small.txt"), b"payload").unwrap();
+        let mut scratch = vec![0u8; 4096];
+        assert!(
+            engine
+                .sync_file_to_dest_buffered(Path::new("small.txt"), &dst, &mut scratch)
+                .is_ok()
+        );
+        assert_eq!(std::fs::read(dst.join("small.txt")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn test_sync_small_file_records_actual_bytes_copied() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(512)
+            .verify_writes(false)
+            .build()
+            .unwrap();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        let src_file = src.join("small.txt");
+        let dst_file = dst.join("small.txt");
+        std::fs::write(&src_file, vec![0x42; 500]).unwrap();
+
+        let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
+        let task = FileSyncTask {
+            rel_path: Path::new("small.txt"),
+            src_path: &src_file,
+            dest_path: &dst_file,
+            dest_dir: &dst,
+            src_size: 1000,
+            src_mod,
+            cached_id: None,
+        };
+
+        engine.sync_small_file(&task).unwrap();
+        let record = store.get_file(Path::new("small.txt")).unwrap().unwrap();
+        assert_eq!(
+            record.file_size, 500,
+            "Saved record must use actual bytes copied (500), not stale task.src_size (1000)"
+        );
+    }
+
+    // =========================================================================
+    // Relocated Delta Tests (3 tests)
+    // =========================================================================
+
+    #[test]
+    fn test_exact_block_multiple_sync() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source.clone())
+            .dest_dir(dest.clone())
+            .block_sync_threshold_bytes(4)
+            .block_size_bytes(4)
+            .build()
+            .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        // 8 bytes payload = exactly 2 blocks of 4 bytes
+        fs::write(source.join("exact.bin"), b"12345678").unwrap();
+        engine.sync_file(Path::new("exact.bin")).unwrap();
+
+        assert_eq!(fs::read(dest.join("exact.bin")).unwrap(), b"12345678");
+        let hashes = engine.db.get_block_hashes(Path::new("exact.bin")).unwrap();
+        assert_eq!(hashes.len(), 2);
+    }
+
+    #[test]
+    fn test_delta_sync_large_file() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source.clone())
+            .dest_dir(dest.clone())
+            .block_sync_threshold_bytes(10)
+            .block_size_bytes(4)
+            .build()
+            .unwrap();
+        let store = SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        // 12 bytes > 10 byte threshold -> delta sync path (3 blocks of 4)
+        fs::write(source.join("big.bin"), b"AAAABBBBcccc").unwrap();
+        engine.sync_file(Path::new("big.bin")).unwrap();
+
+        let synced = fs::read(dest.join("big.bin")).unwrap();
+        assert_eq!(synced, b"AAAABBBBcccc");
+
+        // Modify only block 1 (bytes 4-7)
+        let big_bin_path = source.join("big.bin");
+        fs::write(&big_bin_path, b"AAAAZZZZCCCC").unwrap();
+        let f = OpenOptions::new().write(true).open(&big_bin_path).unwrap();
+        f.set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+
+        engine.sync_file(Path::new("big.bin")).unwrap();
+
+        let synced = fs::read(dest.join("big.bin")).unwrap();
+        assert_eq!(synced, b"AAAAZZZZCCCC");
+
+        let hashes = engine.db.get_block_hashes(Path::new("big.bin")).unwrap();
+        assert_eq!(hashes.len(), 3);
+    }
+
+    #[test]
+    fn test_local_sync_engine_dirty_range_buffer_reuse() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .block_size_bytes(512)
+            .build()
+            .unwrap();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        // Sync file 1
+        let f1 = "file1.bin";
+        std::fs::write(src.join(f1), vec![0x11; 1024]).unwrap();
+        let src_meta1 = std::fs::metadata(src.join(f1)).unwrap();
+        let task1 = FileSyncTask {
+            rel_path: Path::new(f1),
+            src_path: &src.join(f1),
+            dest_path: &dst.join(f1),
+            dest_dir: &dst,
+            src_size: src_meta1.len() as i64,
+            src_mod: safe_modified_millis(&src_meta1).unwrap(),
+            cached_id: None,
+        };
+        let mut scratch = vec![0u8; 512];
+        engine.sync_delta_large_file(&task1, &mut scratch).unwrap();
+
+        let cap1 = engine.dirty_range_capacity();
+        assert!(
+            cap1 >= 512,
+            "dirty_range buffer must have allocated capacity"
+        );
+
+        // Sync file 2
+        let f2 = "file2.bin";
+        std::fs::write(src.join(f2), vec![0x22; 1024]).unwrap();
+        let src_meta2 = std::fs::metadata(src.join(f2)).unwrap();
+        let task2 = FileSyncTask {
+            rel_path: Path::new(f2),
+            src_path: &src.join(f2),
+            dest_path: &dst.join(f2),
+            dest_dir: &dst,
+            src_size: src_meta2.len() as i64,
+            src_mod: safe_modified_millis(&src_meta2).unwrap(),
+            cached_id: None,
+        };
+        engine.sync_delta_large_file(&task2, &mut scratch).unwrap();
+
+        let cap2 = engine.dirty_range_capacity();
+        assert!(
+            cap2 >= cap1,
+            "dirty_range capacity should be retained or grown across files"
+        );
+    }
+
+    // =========================================================================
+    // Relocated Archive Tests (3 tests)
+    // =========================================================================
+
+    #[test]
+    fn test_deletion_archive() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = test_config(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        fs::write(source.join("doomed.txt"), b"bye").unwrap();
+        engine.sync_file(Path::new("doomed.txt")).unwrap();
+        assert!(dest.join("doomed.txt").exists());
+
+        engine.delete_file(Path::new("doomed.txt")).unwrap();
+        assert!(!dest.join("doomed.txt").exists());
+
+        let archive = dest.join(".syncdir_archive");
+        assert!(archive.exists());
+        let entries: Vec<_> = fs::read_dir(&archive)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let archived_name = entries[0].file_name().to_string_lossy().to_string();
+        assert!(archived_name.ends_with("_doomed.txt"));
+
+        assert!(
+            engine
+                .db
+                .get_file(Path::new("doomed.txt"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_nested_directory_deletion_archive() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(source.join("subdir")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let store = SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        fs::write(source.join("subdir").join("deep.txt"), b"nested content").unwrap();
+        engine.sync_file(Path::new("subdir/deep.txt")).unwrap();
+        assert!(dest.join("subdir").join("deep.txt").exists());
+
+        engine.delete_file(Path::new("subdir/deep.txt")).unwrap();
+        assert!(!dest.join("subdir").join("deep.txt").exists());
+
+        let archive = dest.join(".syncdir_archive");
+        assert!(archive.exists());
+        let entries: Vec<_> = fs::read_dir(&archive)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let archived_entry = &entries[0];
+        let nested = archived_entry.path().join("deep.txt");
+        assert!(
+            nested.exists(),
+            "Archived nested file should preserve directory structure"
+        );
+    }
+
+    #[test]
+    fn test_conditional_db_deletion_on_dest_state() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build()
+            .unwrap();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        // Case 1: Destination file exists but has an exclusive lock
+        let locked_file = dst.join("locked.txt");
+        std::fs::write(&locked_file, "secret").unwrap();
+        let rec1 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("locked.txt"),
+            file_size: 6,
+            last_modified: 100,
+        };
+        store.save_file(&rec1, &[]).unwrap();
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _exclusive_handle = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked_file)
+                .unwrap();
+
+            let res = engine.delete_file_from_dest(Path::new("locked.txt"), &dst);
+            assert!(
+                res.is_err(),
+                "delete_file_from_dest must fail on locked/inaccessible destination"
+            );
+            assert!(
+                store.get_file(Path::new("locked.txt")).unwrap().is_some(),
+                "DB record must be retained when destination is locked/inaccessible"
+            );
+        }
+
+        // Case 2: Destination file is genuinely absent (NotFound)
+        let rec2 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("absent.txt"),
+            file_size: 10,
+            last_modified: 200,
+        };
+        store.save_file(&rec2, &[]).unwrap();
+        assert!(store.get_file(Path::new("absent.txt")).unwrap().is_some());
+
+        let res = engine.delete_file_from_dest(Path::new("absent.txt"), &dst);
+        assert!(
+            res.is_ok(),
+            "delete_file_from_dest must succeed when file is NotFound"
+        );
+        assert!(
+            store.get_file(Path::new("absent.txt")).unwrap().is_none(),
+            "DB record must be deleted when destination file is confirmed NotFound"
+        );
+
+        // Case 3: Destination file exists with propagate_deletions = false
+        let unprop_file = dst.join("unprop.txt");
+        std::fs::write(&unprop_file, "data").unwrap();
+        let config_no_prop = Config::builder(src)
+            .dest_dir(dst.clone())
+            .propagate_deletions(false)
+            .build()
+            .unwrap();
+        let target_cfg_no_prop =
+            TargetSyncConfig::from_config(&config_no_prop, dst.clone()).unwrap();
+        let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
+        let rec3 = FileRecord {
+            id: None,
+            relative_path: PathBuf::from("unprop.txt"),
+            file_size: 4,
+            last_modified: 300,
+        };
+        store.save_file(&rec3, &[]).unwrap();
+        assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_some());
+
+        let res = engine_no_prop.delete_file_from_dest(Path::new("unprop.txt"), &dst);
+        assert!(res.is_ok());
+        assert!(
+            store.get_file(Path::new("unprop.txt")).unwrap().is_some(),
+            "DB record must be retained when propagate_deletions = false and destination file still exists"
+        );
+        assert!(unprop_file.exists());
+    }
+
+    // =========================================================================
+    // Relocated Scanner Tests (9 tests)
+    // =========================================================================
+
+    #[test]
+    fn test_full_scan_continues_past_file_errors() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        fs::write(source.join("good.txt"), b"good content").unwrap();
+
+        fs::create_dir_all(source.join("bad")).unwrap();
+        fs::write(source.join("bad").join("nested.txt"), b"bad content").unwrap();
+
+        fs::write(dest.join("bad"), b"blocking file").unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        assert!(matches!(
+            engine.run_full_scan().unwrap(),
+            ScanOutcome::PartialFailure {
+                synced: 1,
+                failed: 1,
+                delete_failed: 0,
+            }
+        ));
+
+        assert!(dest.join("good.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dest.join("good.txt")).unwrap(),
+            "good content"
+        );
+        assert!(!dest.join("bad").join("nested.txt").exists());
+    }
+
+    #[test]
+    fn test_full_scan_all_skipped_returns_false() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        fs::create_dir_all(source.join("bad")).unwrap();
+        fs::write(source.join("bad").join("nested.txt"), b"bad content").unwrap();
+
+        fs::write(dest.join("bad"), b"blocking file").unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        assert_eq!(
+            engine.run_full_scan().unwrap(),
+            ScanOutcome::DestinationUnreachable
+        );
+    }
+
+    #[test]
+    fn test_full_scan_dest_missing_skips_early() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("nonexistent_dest_dir");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file1.txt"), b"content").unwrap();
+
+        let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        assert_eq!(
+            engine.run_full_scan().unwrap(),
+            ScanOutcome::DestinationUnreachable
+        );
+    }
+
+    #[test]
+    fn test_run_cancellable_full_scan_interruption() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        for i in 0..20 {
+            fs::write(
+                src.join(format!("file_{}.txt", i)),
+                format!("content {}", i),
+            )
+            .unwrap();
+        }
+
+        let config = Config::test_default(src, dst.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        let cancel_token = AtomicBool::new(true);
+        let result = engine.run_cancellable_full_scan(&dst, &cancel_token);
+
+        assert!(
+            result.is_err(),
+            "Full scan should abort when cancel token is set"
+        );
+        match result.unwrap_err() {
+            SyncError::Cancelled => {}
+            other => panic!("Expected SyncError::Cancelled, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_empty_source_safety_threshold() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        let db_path = dir.path().join("sig.db");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source.clone())
+            .dest_dir(dest.clone())
+            .debounce_seconds(1)
+            .retry_interval_seconds(1)
+            .propagate_deletions(true)
+            .block_sync_threshold_bytes(10)
+            .block_size_bytes(4)
+            .build()
+            .unwrap();
+        let store = crate::db::SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        fs::write(source.join("important.txt"), b"save me").unwrap();
+        engine.run_full_scan().unwrap();
+        assert!(dest.join("important.txt").exists());
+
+        fs::remove_file(source.join("important.txt")).unwrap();
+        engine.run_full_scan().unwrap();
+
+        assert!(dest.join("important.txt").exists());
+    }
+
+    #[test]
+    fn test_run_full_scan_uses_save_files_batch() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        for i in 0..5 {
+            std::fs::write(src.join(format!("file_{i}.txt")), format!("content {i}")).unwrap();
+        }
+
+        let store = MockHashStore::new();
+        let config = Config::builder(src).dest_dir(dst).build().unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        let outcome = engine.run_full_scan().unwrap();
+        assert!(matches!(outcome, ScanOutcome::Success { synced: 5 }));
+
+        assert_eq!(
+            store.save_file_count(),
+            0,
+            "Full scan must not call save_file individually"
+        );
+        assert!(
+            store.batch_save_count() >= 1,
+            "Full scan must call save_files_batch"
+        );
+    }
+
+    #[test]
+    fn test_run_full_scan_case_insensitive_deletions() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        std::fs::write(src.join("readme.txt"), b"hello").unwrap();
+        std::fs::write(dst.join("README.TXT"), b"hello").unwrap();
+
+        let db = MockHashStore::new();
+        let old_record = FileRecord {
+            id: Some(1),
+            relative_path: PathBuf::from("README.TXT"),
+            file_size: 5,
+            last_modified: 1000,
+        };
+        db.save_file(&old_record, &[]).unwrap();
+
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build()
+            .unwrap();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let engine = LocalSyncEngine::new(db, target_cfg);
+
+        let outcome = engine.run_full_scan().unwrap();
+        assert_eq!(outcome, ScanOutcome::Success { synced: 1 });
+        assert!(!dst.join(".syncdir_archive").exists());
+    }
+
+    #[test]
+    fn test_full_scan_path_separator_normalization() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let nested_dir = src.join("nested");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let test_file = nested_dir.join("file.txt");
+        fs::write(&test_file, b"content").unwrap();
+
+        let config = Config::test_default(src.clone(), dst.clone());
+        let store = MockHashStore::new();
+        let rec = FileRecord::new(
+            PathBuf::from("nested/file.txt"),
+            7,
+            safe_modified_millis(&fs::metadata(&test_file).unwrap()).unwrap(),
+        )
+        .with_id(1);
+        store.save_file(&rec, &[]).unwrap();
+
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+        let outcome = engine.run_full_scan().unwrap();
+        assert_eq!(outcome, ScanOutcome::Success { synced: 1 });
+        assert!(dst.join("nested").join("file.txt").exists());
+    }
+
+    #[test]
+    fn test_full_scan_db_error_propagated() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let config = Config::test_default(src, dst);
+        let store = MockHashStore::new();
+        store.set_error_hook(Some(Box::new(|op| {
+            if op == "list_all_records" {
+                Some(SyncError::db("Forced list_all_records failure"))
+            } else {
+                None
+            }
+        })));
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+        let result = engine.run_full_scan();
+        assert!(matches!(result, Err(SyncError::Db(..))));
     }
 }
