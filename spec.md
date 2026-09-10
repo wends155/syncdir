@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 8633ddd
+> Last verified against: 15e2d61
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 0.1.13 |
-| **Last Updated** | 2026-09-09 |
+| **Last Updated** | 2026-09-10 |
 
 ---
 
@@ -45,6 +45,7 @@
 | `DestinationCollection::to_path_bufs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `TargetSyncConfig::from_config` | `(config: &Config, dest_dir: PathBuf) -> Self` | `TargetSyncConfig` | — |
 | `TargetSyncConfig::builder` | `(source_dir: impl Into<PathBuf>, dest_dir: impl Into<PathBuf>) -> TargetSyncConfigBuilder` | `TargetSyncConfigBuilder` | — |
+| `TargetSyncConfig::block_size_nonzero` | `(&self) -> std::num::NonZeroU64` | `NonZeroU64` | — (safely defaults to 64KB on zero) |
 | `TargetSyncConfigBuilder::build` | `(self) -> Result<TargetSyncConfig, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` |
 | `preprocess_config_toml` | `(raw_toml: &str) -> String` | `String` | — (preserves multi-line arrays and quotes) |
 | `system_root` | `() -> PathBuf` | `PathBuf` | — |
@@ -182,6 +183,11 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `SyncEngine::run_full_scan` | `(&self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
 | `start_sync_worker` | `<E: SyncEngine + 'static>(context: SyncWorkerContext<E>) -> Result<JoinHandle<()>, SyncError>` | `Result<JoinHandle<()>, SyncError>` | `SyncError::Io` (thread spawn failure) |
 | `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — |
+| `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (reusable scratch buffer lease for zero-lock streaming) |
+| `DirtyBlockRange::new` | `(block_size: u64) -> Self` | `DirtyBlockRange` | Panics if `block_size == 0` |
+| `DirtyBlockRange::new_nonzero` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — |
+| `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` |
+| `DirtyBlockRange::block_size_nonzero` | `(&self) -> NonZeroU64` | `NonZeroU64` | — |
 | `MockSyncEngine::new` | `() -> Self` | `MockSyncEngine` | — |
 | `SourceConnectivityTracker::new` | `(initial: bool) -> Self` | `SourceConnectivityTracker` | — |
 | `DebounceQueue::new` | `(max_capacity: usize) -> Self` | `DebounceQueue` | — |
@@ -190,6 +196,7 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `calculate_exponential_backoff` | `(attempts: u32, base_interval: Duration) -> Duration` | `Duration` | Capped at 300s |
 | `is_metadata_up_to_date_raw` | `(record_mod: i64, record_size: i64, src_mod: i64, src_size: i64, dest_mod: i64, dest_size: i64) -> bool` | `bool` | Evaluates SMB ±2000ms timestamp tolerance |
 | `verify_destination_not_reparse` | `(dest_dir: &Path, rel_path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (rejects directory junctions in path) |
+| `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, verified_dirs: &mut HashSet<PathBuf>) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | `SyncError::Validation` (caches verified ancestor and root directories) |
 | `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | — (rejects `..`, ADS, drive letters, reserved names) |
  
 #### Behavioral Scenarios
@@ -219,6 +226,29 @@ GIVEN a destination path containing intermediate directory junctions or symlinks
 WHEN `verify_destination_not_reparse` executes
 THEN all ancestor directory components between `dest_dir` and the target file are verified
 AND any directory junction is rejected with `SyncError::Validation`
+
+[SECURITY/VALIDATION] DirtyBlockRange zero block size rejection
+GIVEN an invocation of `DirtyBlockRange::try_new(0)`
+WHEN the constructor validates the block size
+THEN `SyncError::Validation("DirtyBlockRange block_size must be greater than zero")` is returned
+AND `new(0)` panics with the same invariant message
+
+[CONCURRENCY] SyncWorker non-spinning poll timeout during network offline
+GIVEN a worker queue with expired debounce items
+AND the target destination or source is detected as offline
+WHEN `calculate_worker_poll_timeout` determines the receiver timeout
+THEN a minimum sleep of 1 second is enforced to prevent 100% CPU busy-spinning
+
+[PERFORMANCE] LocalSyncEngine signature cache hit fast-path
+GIVEN a file synchronization task where the local SQLite record matches source file size and modification time
+WHEN `sync_file_to_dest_core` executes
+THEN `Ok(None)` is returned immediately without querying remote SMB file metadata or performing redundant reparse traversals
+
+[CONCURRENCY] RAII DirtyRangeLease zero-lock streaming
+GIVEN a multi-gigabyte delta sync operation
+WHEN `acquire_dirty_range_lease` checks out a `DirtyBlockRange` buffer
+THEN the engine mutex is released before disk reads, Blake3 hashing, and network I/O begin
+AND the buffer is automatically returned to the pool upon lease drop
 
 [HAPPY] Decoupled archive pruning with depth limit 32
 GIVEN a deleted file operation
@@ -307,7 +337,7 @@ THEN operations are executed against the active resolved UNC share path
 |-------------------|-----------|---------|--------|
 | `SyncDaemon::start` | `(config: Config, app_dir: &Path, observer: Option<Arc<dyn SyncStatusObserver>>) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError::Db`, `SyncError::Validation` |
 | `SyncDaemon::start_with_factory` | `<F: SyncEngineFactory + 'static>(config: Config, app_dir: &Path, observer: Option<Arc<dyn SyncStatusObserver>>, factory: F) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError::Db`, `SyncError::Validation` |
-| `SyncDaemon::validate_target_loops` | `(config: &Config, resolver: &dyn NetworkResolver) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (detects mapped drive vs UNC loops) |
+| `SyncDaemon::validate_target_loops` | `(config: &Config, resolver: &dyn NetworkResolver) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (non-blocking loop detection using `try_resolve_unc_path`) |
 | `SyncDaemon::command_tx` | `(&self) -> Sender<SyncCommand>` | `Sender<SyncCommand>` | — |
 | `SyncDaemon::config` | `(&self) -> &Config` | `&Config` | — |
 | `SyncDaemon::shutdown` | `(mut self)` | `()` | — |
@@ -352,7 +382,7 @@ THEN operations are executed against the active resolved UNC share path
 | `SyncError::Watcher` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Directory watcher errors |
 | `SyncError::Tray` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | GUI / Tray notification errors |
 | `SyncError::Registry` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Windows registry errors |
-| `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps Win32 network error codes (53, 59, 64, 65, 67, 121, 1326) |
+| `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps 9 standard `ErrorKind` variants (TimedOut, ConnectionReset, ConnectionAborted, NotConnected, BrokenPipe, NetworkUnreachable, HostUnreachable, NetworkDown, ConnectionRefused) and 11 Win32 error codes (53, 59, 64, 65, 67, 121, 1326) |
 
 ---
  
@@ -422,10 +452,14 @@ Represents a file tracked in the signature database.
 - `last_modified`: i64
 
 ### DirtyBlockRange
-Coalesced contiguous dirty block range for batched delta writes.
+Coalesced contiguous dirty block range for batched delta writes with strongly typed non-zero block size.
 - `start_block`: u64 (private)
 - `block_count`: u64 (private)
+- `block_size`: std::num::NonZeroU64 (private)
 - `data`: Vec<u8> (private)
+
+### DirtyRangeLease<'a>
+RAII lease checked out from `LocalSyncEngine::dirty_range_pool` allowing mutable buffer access during large-file delta streaming without holding locks across disk or SMB network operations. Automatically clears and returns the buffer to the pool on `Drop`.
 
 ### EngineStatus
 Represents the aggregated presence state across source and destination targets.
@@ -541,12 +575,12 @@ User interface tray-icon utilizing `tray-icon` and `winit` with `TrayController`
 Integrates `StartupRegistry` under HKCU for automatic daemon launch on user login.
 
 ### 6. Automated Testing Frameworks
-197 automated test cases verifying engine behavior:
-- Unit test suite across all modules (153 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`).
-- Integration test suite (`tests/integration_tests.rs`: 10 tests).
+273 automated test cases verifying engine behavior:
+- Unit test suite across all modules (223 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`).
+- Integration test suite (`tests/integration_tests.rs`: 12 tests).
 - Generative property test suite (`tests/property_tests.rs`: 8 proptest suites verifying `is_metadata_up_to_date_raw` and `DirtyBlockRange` chunk coalescing).
-- Snapshot regression test suite (`tests/snapshot_tests.rs`: 18 insta golden snapshots).
-- Documentation tests (`cargo test --doc`: 5 doctests).
+- Snapshot regression test suite (`tests/snapshot_tests.rs`: 20 insta golden snapshots).
+- Documentation tests (`cargo test --doc`: 7 doctests).
 
 ### 7. Development & Release Automation Scripts (`scripts/`)
 - `scripts/check-quality.ps1`: Code quality pipeline executing formatting, linter, tests, and static analysis.

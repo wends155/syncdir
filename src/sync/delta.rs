@@ -26,13 +26,30 @@ impl DirtyBlockRange {
 
     /// Create an empty dirty block range with pinned block size.
     ///
+    /// # Arguments
+    ///
+    /// * `block_size` - Size in bytes of each discrete block.
+    ///
+    /// # Returns
+    ///
+    /// An empty [`DirtyBlockRange`].
+    ///
     /// # Panics
+    ///
     /// Panics if `block_size` is 0. For fallible creation, use [`try_new`](Self::try_new).
     pub fn new(block_size: u64) -> Self {
         Self::try_new(block_size).expect("block_size must be greater than zero")
     }
 
     /// Create an empty dirty block range from a validated non-zero block size.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_size` - A non-zero block size in bytes.
+    ///
+    /// # Returns
+    ///
+    /// An empty [`DirtyBlockRange`].
     pub fn new_nonzero(block_size: NonZeroU64) -> Self {
         Self {
             start_block: 0,
@@ -43,6 +60,18 @@ impl DirtyBlockRange {
     }
 
     /// Create an empty dirty block range, returning `SyncError::Validation` if `block_size` is 0.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_size` - Block size in bytes.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(DirtyBlockRange)` if `block_size > 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Validation`] if `block_size` is 0.
     pub fn try_new(block_size: u64) -> Result<Self, SyncError> {
         let non_zero = NonZeroU64::new(block_size).ok_or_else(|| {
             SyncError::validation("DirtyBlockRange block_size must be greater than zero")

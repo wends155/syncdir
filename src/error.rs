@@ -100,6 +100,18 @@ impl From<toml::de::Error> for SyncError {
 }
 
 /// Returns `true` if an `io::Error` represents an SMB/network connectivity loss.
+///
+/// Inspects both standard [`std::io::ErrorKind`] variants (such as `TimedOut`, `ConnectionReset`,
+/// `BrokenPipe`, `NetworkUnreachable`) and Win32 raw OS error codes (such as `ERROR_BAD_NETPATH`,
+/// `ERROR_NETNAME_DELETED`, `ERROR_NETWORK_UNREACHABLE`).
+///
+/// # Arguments
+///
+/// * `io_err` - Reference to the [`std::io::Error`] to inspect.
+///
+/// # Returns
+///
+/// `true` if the error indicates a transient or persistent network disconnect, `false` otherwise.
 pub fn is_network_offline_io(io_err: &std::io::Error) -> bool {
     matches!(
         io_err.kind(),

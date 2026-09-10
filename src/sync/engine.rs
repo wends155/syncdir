@@ -355,6 +355,10 @@ impl<S: HashStore> LocalSyncEngine<S> {
     ///
     /// The buffer is checked out without holding locks during file I/O and returned
     /// to the pool automatically on lease drop.
+    ///
+    /// # Returns
+    ///
+    /// A [`DirtyRangeLease`] handle providing mutable access to a pooled or newly allocated buffer.
     pub fn acquire_dirty_range_lease(&self) -> DirtyRangeLease<'_> {
         let mut pool = self
             .dirty_range_pool

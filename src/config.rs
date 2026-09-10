@@ -106,6 +106,10 @@ impl TargetSyncConfig {
     }
 
     /// Returns the configured block size as a `NonZeroU64`, defaulting to 64KB if zero.
+    ///
+    /// # Returns
+    ///
+    /// A [`std::num::NonZeroU64`] representing the block size in bytes.
     #[must_use]
     pub fn block_size_nonzero(&self) -> std::num::NonZeroU64 {
         std::num::NonZeroU64::new(self.block_size_bytes)
