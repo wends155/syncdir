@@ -479,6 +479,21 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Unchecked destination file size skip bug eliminated.
 >   - Reparse point cache stale substitution window eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Documentation sync for Qualitative Review Remediations (`/update-doc`)
+> * **Changes:**
+>   - Enriched rustdoc comments in `src/error.rs` for `SyncError::validation_security`, `validation_invariant`, and `is_permanent_validation_failure` with `# Arguments`, `# Returns`, and runnable doc-tests (11 total doc-tests passing).
+>   - Enriched rustdoc comments in `src/sync/engine.rs` for `SyncEngine::invalidate_verified_dirs` and `LocalSyncEngine::evict_verified_dir`.
+>   - Enriched rustdoc comments in `src/sync/worker.rs` for `WorkerTickOutcome` and `SyncWorkerRunner` methods (`new`, `handle_command`, `tick`).
+>   - Synchronized `spec.md` baseline hash to commit `7316ffc`, added Sync, Monitor, and Error module APIs and behavioral scenarios, and updated test metrics to 289 automated tests.
+> * **New Constraints:**
+>   - All error classification helpers and worker state machine methods must maintain runnable doc-tests with zero warnings on `cargo doc --no-deps`.
+> * **Pruned:**
+>   - Outdated test suite counts and undocumented worker runner APIs eliminated.
+
+
 
 
 
