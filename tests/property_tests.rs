@@ -161,7 +161,7 @@ proptest! {
 
         let config = Config::test_default(source.clone(), dest.clone());
         let store =
-            SqliteHashStore::new(db_file.path(), StoreConfig::try_from(&config).unwrap()).unwrap();
+            SqliteHashStore::new(db_file.path(), StoreConfig::new(config.block_size_bytes(), config.block_sync_threshold_bytes()).unwrap()).unwrap();
         let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
         let engine = LocalSyncEngine::new(store, target_config);
 
@@ -198,7 +198,7 @@ proptest! {
             .build()
             .unwrap();
         let store =
-            SqliteHashStore::new(db_file.path(), StoreConfig::try_from(&config).unwrap()).unwrap();
+            SqliteHashStore::new(db_file.path(), StoreConfig::new(config.block_size_bytes(), config.block_sync_threshold_bytes()).unwrap()).unwrap();
         let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
         let engine = LocalSyncEngine::new(store, target_config);
 

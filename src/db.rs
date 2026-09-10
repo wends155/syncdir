@@ -3,7 +3,6 @@
 //! Provides the `HashStore` trait and its `SqliteHashStore` implementation.
 //! Enforces foreign key cascades and validates configuration consistency.
 
-use crate::config::Config;
 use crate::error::SyncError;
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
@@ -106,28 +105,6 @@ impl StoreConfig {
     }
 }
 
-impl TryFrom<&Config> for StoreConfig {
-    type Error = SyncError;
-
-    /// Fallible conversion from [`Config`].
-    ///
-    /// Returns [`SyncError::Validation`] if `block_size_bytes` is zero.
-    fn try_from(cfg: &Config) -> Result<Self, Self::Error> {
-        Self::new(cfg.block_size_bytes(), cfg.block_sync_threshold_bytes())
-    }
-}
-
-impl TryFrom<&crate::config::TargetSyncConfig> for StoreConfig {
-    type Error = SyncError;
-
-    /// Fallible conversion from [`crate::config::TargetSyncConfig`].
-    ///
-    /// Returns [`SyncError::Validation`] if `block_size_bytes` is zero.
-    fn try_from(cfg: &crate::config::TargetSyncConfig) -> Result<Self, Self::Error> {
-        Self::new(cfg.block_size_bytes(), cfg.block_sync_threshold_bytes())
-    }
-}
-
 /// A Blake3 block hash: fixed 32-byte digest.
 pub type BlockHash = [u8; 32];
 
@@ -172,6 +149,40 @@ pub trait HashStore: Send + Sync {
             self.delete_file(path)?;
         }
         Ok(())
+    }
+}
+
+impl<S: HashStore + ?Sized> HashStore for std::sync::Arc<S> {
+    fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
+        (**self).get_file(path)
+    }
+
+    fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
+        (**self).save_file(record, hashes)
+    }
+
+    fn get_block_hashes(&self, path: &Path) -> Result<Vec<BlockHash>, SyncError> {
+        (**self).get_block_hashes(path)
+    }
+
+    fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
+        (**self).delete_file(path)
+    }
+
+    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+        (**self).list_files()
+    }
+
+    fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
+        (**self).list_all_records()
+    }
+
+    fn save_files_batch(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError> {
+        (**self).save_files_batch(records)
+    }
+
+    fn delete_files_batch(&self, paths: &[&Path]) -> Result<(), SyncError> {
+        (**self).delete_files_batch(paths)
     }
 }
 
@@ -754,21 +765,12 @@ impl HashStore for MockHashStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
     fn dummy_store_config(block_size: u64) -> StoreConfig {
         StoreConfig::new(block_size, block_size * 2).expect("test block_size must be > 0")
-    }
-
-    fn dummy_config(block_size: u64) -> Config {
-        Config::builder(PathBuf::from("."))
-            .dest_dir(PathBuf::from("."))
-            .block_sync_threshold_bytes(block_size * 2)
-            .block_size_bytes(block_size)
-            .build_unvalidated()
     }
 
     #[test]
@@ -985,22 +987,10 @@ mod tests {
         assert_eq!(sc.block_size_bytes(), 4096);
         assert_eq!(sc.block_sync_threshold_bytes(), 8192);
 
-        let cfg = dummy_config(2048);
-        let from_cfg = StoreConfig::try_from(&cfg).unwrap();
-        assert_eq!(from_cfg.block_size_bytes(), 2048);
-        assert_eq!(from_cfg.block_sync_threshold_bytes(), 4096);
-    }
-
-    #[test]
-    fn test_store_config_try_from_zero_block_size_returns_err() {
-        let cfg = Config::builder(PathBuf::from("."))
-            .dest_dir(PathBuf::from("."))
-            .block_size_bytes(0)
-            .build_unvalidated();
-        let res = StoreConfig::try_from(&cfg);
+        let sc_zero = StoreConfig::new(0, 8192);
         assert!(
-            res.is_err(),
-            "StoreConfig::try_from must return Err on block_size_bytes == 0"
+            sc_zero.is_err(),
+            "StoreConfig::new must return Err on block_size_bytes == 0"
         );
     }
 

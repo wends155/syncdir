@@ -36,8 +36,15 @@ fn test_integration_config_db_sync_commands() {
     assert_ne!(cmd, SyncCommand::TriggerFullScan);
 
     // Database round-trip
-    let store =
-        SqliteHashStore::new(db_file.path(), StoreConfig::try_from(&config).unwrap()).unwrap();
+    let store = SqliteHashStore::new(
+        db_file.path(),
+        StoreConfig::new(
+            config.block_size_bytes(),
+            config.block_sync_threshold_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let record = FileRecord::new(PathBuf::from("test_file.bin"), 4096, 99999);
     let hashes = vec![[9u8; 32]; 4];
 
@@ -71,7 +78,15 @@ fn test_watcher_and_sync_engine_flow() {
 
     let config = Config::test_default(source.clone(), dest.clone());
 
-    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let store = SqliteHashStore::new(
+        &db_path,
+        StoreConfig::new(
+            config.block_size_bytes(),
+            config.block_sync_threshold_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let (tx, rx) = channel();
 
     // Start watcher & sync worker BEFORE writing the file
@@ -155,7 +170,15 @@ fn test_propagate_deletions_false() {
         .unwrap();
     let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
 
-    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let store = SqliteHashStore::new(
+        &db_path,
+        StoreConfig::new(
+            config.block_size_bytes(),
+            config.block_sync_threshold_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let engine = LocalSyncEngine::new(store, target_cfg);
 
     let file_path = source.join("test.txt");
@@ -237,7 +260,15 @@ fn test_path_traversal_prevention() {
 
     let config = Config::test_default(source.clone(), dest.clone());
     let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
-    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let store = SqliteHashStore::new(
+        &db_path,
+        StoreConfig::new(
+            config.block_size_bytes(),
+            config.block_sync_threshold_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let engine = LocalSyncEngine::new(store, target_cfg);
 
     // Absolute path
@@ -267,7 +298,15 @@ fn test_subsecond_sync_precision() {
 
     let config = Config::test_default(source.clone(), dest.clone());
     let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
-    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let store = SqliteHashStore::new(
+        &db_path,
+        StoreConfig::new(
+            config.block_size_bytes(),
+            config.block_sync_threshold_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let engine = LocalSyncEngine::new(store, target_cfg);
 
     let file_path = source.join("fast.txt");
@@ -300,7 +339,15 @@ fn test_directory_rename_syncs_child_files() {
 
     let config = Config::test_default(source.clone(), dest.clone());
     let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
-    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let store = SqliteHashStore::new(
+        &db_path,
+        StoreConfig::new(
+            config.block_size_bytes(),
+            config.block_sync_threshold_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let engine = LocalSyncEngine::new(store, target_cfg);
 
     // Create a folder with child files
@@ -491,8 +538,15 @@ fn test_delta_sync_interrupted_write_invalidates_cache() {
             .build()
             .unwrap();
 
-        let store =
-            SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+        let store = SqliteHashStore::new(
+            &db_path,
+            StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         let rel_path = Path::new("large.bin");
         let src_file = src.join("large.bin");
@@ -508,8 +562,15 @@ fn test_delta_sync_interrupted_write_invalidates_cache() {
         // Initial sync populates SQLite cache
         engine.sync_file(rel_path).unwrap();
 
-        let verify_store_initial =
-            SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+        let verify_store_initial = SqliteHashStore::new(
+            &db_path,
+            StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(
             verify_store_initial.get_file(rel_path).unwrap().is_some(),
             "Record must be present in SQLite cache after initial sync"
@@ -541,8 +602,15 @@ fn test_delta_sync_interrupted_write_invalidates_cache() {
         drop(lock_file);
 
         // Because dirty blocks were written before the failure, SQLite cache record must be deleted
-        let verify_store_after =
-            SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+        let verify_store_after = SqliteHashStore::new(
+            &db_path,
+            StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(
             verify_store_after.get_file(rel_path).unwrap().is_none(),
             "SQLite cache record must be invalidated (deleted) after interrupted delta sync"

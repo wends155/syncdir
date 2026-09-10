@@ -846,9 +846,15 @@ mod tests {
             .block_size_bytes(4)
             .build()
             .unwrap();
-        let store =
-            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
-                .unwrap();
+        let store = SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::new(
+                config.block_size_bytes(),
+                config.block_sync_threshold_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(store, target_cfg);
 

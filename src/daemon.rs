@@ -153,7 +153,10 @@ impl SyncEngineFactory for SqliteEngineFactory {
             db_path = %db_path.display(),
             "Opening signature cache database for target",
         );
-        let store_cfg = StoreConfig::try_from(target_config)?;
+        let store_cfg = StoreConfig::new(
+            target_config.block_size_bytes(),
+            target_config.block_sync_threshold_bytes(),
+        )?;
         let store = SqliteHashStore::new(&db_path, store_cfg)?;
         Ok(LocalSyncEngine::new(store, target_config.clone()))
     }
