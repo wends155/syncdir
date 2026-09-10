@@ -102,6 +102,17 @@ impl From<toml::de::Error> for SyncError {
 /// Returns `true` if an `io::Error` represents an SMB/network connectivity loss.
 pub fn is_network_offline_io(io_err: &std::io::Error) -> bool {
     matches!(
+        io_err.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::ConnectionRefused
+    ) || matches!(
         io_err.raw_os_error(),
         Some(15) // ERROR_INVALID_DRIVE
         | Some(53) // ERROR_BAD_NETPATH
@@ -438,5 +449,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_is_network_offline_io_kinds() {
+        use std::io::{Error, ErrorKind};
+
+        let network_kinds = [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::ConnectionRefused,
+        ];
+
+        for kind in network_kinds {
+            let io_err = Error::new(kind, "network dropped");
+            assert!(
+                is_network_offline_io(&io_err),
+                "Expected is_network_offline_io to return true for {:?}",
+                kind
+            );
+        }
+
+        let non_network_kinds = [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::AlreadyExists,
+            ErrorKind::InvalidData,
+        ];
+
+        for kind in non_network_kinds {
+            let io_err = Error::new(kind, "filesystem error");
+            assert!(
+                !is_network_offline_io(&io_err),
+                "Expected is_network_offline_io to return false for {:?}",
+                kind
+            );
+        }
     }
 }
