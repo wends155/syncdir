@@ -9,13 +9,21 @@ pub(crate) fn verify_destination_not_reparse(
     dest_dir: &Path,
     rel_path: &Path,
 ) -> Result<Option<Metadata>, SyncError> {
-    use std::os::windows::fs::MetadataExt;
+    if fs::symlink_metadata(dest_dir)
+        .map(|m| is_reparse_or_symlink_meta(&m))
+        .unwrap_or(false)
+    {
+        return Err(SyncError::validation(format!(
+            "Destination root '{}' is a symlink or reparse point; refusing to write",
+            dest_dir.display()
+        )));
+    }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
     for component in rel_path.components() {
         current.push(component);
         if let Ok(m) = fs::symlink_metadata(&current) {
-            if (m.file_attributes() & 0x400) != 0 || m.file_type().is_symlink() {
+            if is_reparse_or_symlink_meta(&m) {
                 return Err(SyncError::validation(format!(
                     "Destination component '{}' is a symlink or reparse point; refusing to write",
                     current.display()
@@ -34,12 +42,21 @@ pub(crate) fn verify_destination_not_reparse(
     dest_dir: &Path,
     rel_path: &Path,
 ) -> Result<Option<Metadata>, SyncError> {
+    if fs::symlink_metadata(dest_dir)
+        .map(|m| is_reparse_or_symlink_meta(&m))
+        .unwrap_or(false)
+    {
+        return Err(SyncError::validation(format!(
+            "Destination root '{}' is a symlink; refusing to write",
+            dest_dir.display()
+        )));
+    }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
     for component in rel_path.components() {
         current.push(component);
         if let Ok(m) = fs::symlink_metadata(&current) {
-            if m.file_type().is_symlink() {
+            if is_reparse_or_symlink_meta(&m) {
                 return Err(SyncError::validation(format!(
                     "Destination component '{}' is a symlink; refusing to write",
                     current.display()
@@ -60,7 +77,15 @@ pub fn verify_destination_not_reparse_cached(
     rel_path: &Path,
     verified_dirs: &mut HashSet<PathBuf>,
 ) -> Result<Option<Metadata>, SyncError> {
-    use std::os::windows::fs::MetadataExt;
+    if fs::symlink_metadata(dest_dir)
+        .map(|m| is_reparse_or_symlink_meta(&m))
+        .unwrap_or(false)
+    {
+        return Err(SyncError::validation(format!(
+            "Destination root '{}' is a symlink or reparse point; refusing to write",
+            dest_dir.display()
+        )));
+    }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
     let components: Vec<_> = rel_path.components().collect();
@@ -75,13 +100,16 @@ pub fn verify_destination_not_reparse_cached(
             continue;
         }
         if let Ok(m) = fs::symlink_metadata(&current) {
-            if (m.file_attributes() & 0x400) != 0 || m.file_type().is_symlink() {
+            if is_reparse_or_symlink_meta(&m) {
                 return Err(SyncError::validation(format!(
                     "Destination component '{}' is a symlink or reparse point; refusing to write",
                     current.display()
                 )));
             }
             if m.is_dir() {
+                if verified_dirs.len() >= 1000 {
+                    verified_dirs.clear();
+                }
                 verified_dirs.insert(current.clone());
             }
             if is_leaf {
@@ -101,6 +129,14 @@ pub fn verify_destination_not_reparse_cached(
     rel_path: &Path,
     verified_dirs: &mut HashSet<PathBuf>,
 ) -> Result<Option<Metadata>, SyncError> {
+    if let Ok(m) = fs::symlink_metadata(dest_dir) {
+        if is_reparse_or_symlink_meta(&m) {
+            return Err(SyncError::validation(format!(
+                "Destination root '{}' is a symlink; refusing to write",
+                dest_dir.display()
+            )));
+        }
+    }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
     let components: Vec<_> = rel_path.components().collect();
@@ -115,13 +151,16 @@ pub fn verify_destination_not_reparse_cached(
             continue;
         }
         if let Ok(m) = fs::symlink_metadata(&current) {
-            if m.file_type().is_symlink() {
+            if is_reparse_or_symlink_meta(&m) {
                 return Err(SyncError::validation(format!(
                     "Destination component '{}' is a symlink; refusing to write",
                     current.display()
                 )));
             }
             if m.is_dir() {
+                if verified_dirs.len() >= 1000 {
+                    verified_dirs.clear();
+                }
                 verified_dirs.insert(current.clone());
             }
             if is_leaf {
@@ -217,10 +256,28 @@ pub fn is_safe_relative_path(path: &Path) -> bool {
                 if s.contains(':') {
                     return false;
                 }
+                // Reject Win32 wildcards and forbidden characters
+                if s.chars()
+                    .any(|c| matches!(c, '*' | '?' | '<' | '>' | '|' | '"'))
+                {
+                    return false;
+                }
                 // Reject components with trailing spaces or dots (Windows strips these)
                 if s.ends_with(' ') || s.ends_with('.') {
                     return false;
                 }
+                // Normalize Unicode superscripts ('⁰'..'⁹') before stem extraction
+                let s = s
+                    .replace('⁰', "0")
+                    .replace('¹', "1")
+                    .replace('²', "2")
+                    .replace('³', "3")
+                    .replace('⁴', "4")
+                    .replace('⁵', "5")
+                    .replace('⁶', "6")
+                    .replace('⁷', "7")
+                    .replace('⁸', "8")
+                    .replace('⁹', "9");
                 // Trim trailing spaces and dots before reserved name check
                 let trimmed = s.trim_end_matches([' ', '.']);
                 let stem = trimmed.split('.').next().unwrap_or("");
@@ -270,6 +327,27 @@ mod tests {
         // Valid paths still pass
         assert!(is_safe_relative_path(Path::new("normal_file.txt")));
         assert!(is_safe_relative_path(Path::new("subdir/file.txt")));
+    }
+
+    #[test]
+    fn test_path_safety_superscripts_and_wildcards() {
+        assert!(!is_safe_relative_path(Path::new("COM¹")));
+        assert!(!is_safe_relative_path(Path::new("LPT²")));
+        assert!(!is_safe_relative_path(Path::new("file*.txt")));
+        assert!(!is_safe_relative_path(Path::new("file?.bin")));
+        assert!(!is_safe_relative_path(Path::new("file<tag>.txt")));
+        assert!(!is_safe_relative_path(Path::new("file|pipe.txt")));
+        assert!(is_safe_relative_path(Path::new("normal_file.txt")));
+    }
+
+    #[test]
+    fn test_path_safety_dest_dir_root_reparse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_dir = tmp.path().join("dest");
+        std::fs::create_dir(&dest_dir).unwrap();
+        // Non-existent relative subpath with valid dest_dir
+        let res = verify_destination_not_reparse(&dest_dir, Path::new("sub/file.txt"));
+        assert!(res.is_ok());
     }
 
     #[test]
