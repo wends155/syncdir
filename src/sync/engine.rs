@@ -115,7 +115,7 @@ impl From<WatcherState> for bool {
 /// # Examples
 ///
 /// ```
-/// use syncdir::sync::engine::{SyncStatusObserver, ConnectivityState, WatcherState};
+/// use syncdir::sync::{ConnectivityState, SyncStatusObserver, WatcherState};
 /// use std::path::Path;
 ///
 /// struct MyObserver;
@@ -139,8 +139,7 @@ pub trait SyncStatusObserver: Send + Sync + 'static {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use syncdir::sync::engine::SyncEngine;
-/// use syncdir::sync::mock::MockSyncEngine;
+/// use syncdir::sync::{MockSyncEngine, SyncEngine};
 /// use std::path::Path;
 ///
 /// let engine = MockSyncEngine::new();

@@ -433,8 +433,7 @@ fn test_worker_reachability_and_offline_drain_guard() {
     use std::sync::mpsc::channel;
     use std::time::Duration;
     use syncdir::net::MockNetworkResolver;
-    use syncdir::sync::mock::MockSyncEngine;
-    use syncdir::sync::{SyncWorkerContext, start_sync_worker};
+    use syncdir::sync::{MockSyncEngine, SyncWorkerContext, start_sync_worker};
 
     let dir = tempdir().unwrap();
     let src = dir.path().join("source");

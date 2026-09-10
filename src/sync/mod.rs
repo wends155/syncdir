@@ -3,14 +3,14 @@
 //! Provides the core traits, file scanning, small-file copy, block-level delta
 //! transfer, archive management, path traversal safety checks, and background worker loop.
 
-pub mod archive;
-pub mod delta;
-pub mod engine;
-pub mod mock;
-pub mod path_safety;
-pub mod scanner;
-pub mod small_file;
-pub mod worker;
+pub(crate) mod archive;
+pub(crate) mod delta;
+pub(crate) mod engine;
+pub(crate) mod mock;
+pub(crate) mod path_safety;
+pub(crate) mod scanner;
+pub(crate) mod small_file;
+pub(crate) mod worker;
 
 pub use delta::DirtyBlockRange;
 pub use engine::{
