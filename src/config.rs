@@ -148,20 +148,18 @@ impl TargetSyncConfig {
         self.verify_writes = mode != VerificationMode::Disabled;
         self
     }
-}
 
-#[doc(hidden)]
-impl From<&Config> for TargetSyncConfig {
-    fn from(cfg: &Config) -> Self {
-        let dest = cfg.dest_dir().map(Path::to_path_buf).unwrap_or_default();
-        Self::from_config(cfg, dest)
+    /// Explicit fallible conversion from `&Config` that returns an error if no destinations are configured.
+    pub fn try_from_config(cfg: &Config) -> Result<Self, SyncError> {
+        let dest = cfg.dest_dir().ok_or_else(|| {
+            SyncError::validation("Config has no destination directories configured")
+        })?;
+        Ok(Self::from_config(cfg, dest))
     }
-}
 
-#[doc(hidden)]
-impl From<Config> for TargetSyncConfig {
-    fn from(cfg: Config) -> Self {
-        Self::from(&cfg)
+    /// Explicit fallible conversion from owned `Config`.
+    pub fn try_from_config_owned(cfg: Config) -> Result<Self, SyncError> {
+        Self::try_from_config(&cfg)
     }
 }
 
@@ -256,8 +254,8 @@ impl TargetSyncConfigBuilder {
             ));
         }
         let src_target = TargetDir::new(&self.source_dir);
-        src_target.validate("source")?;
-        self.dest_dir.validate("destination")?;
+        src_target.validate(TargetRole::Source)?;
+        self.dest_dir.validate(TargetRole::Destination)?;
         let verification_mode = self
             .verification_mode
             .unwrap_or_else(|| VerificationMode::from_legacy_flag(self.verify_writes));
@@ -275,6 +273,29 @@ impl TargetSyncConfigBuilder {
     }
 }
 
+/// Role of a synchronized target directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TargetRole {
+    Source,
+    Destination,
+}
+
+impl TargetRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Destination => "destination",
+        }
+    }
+}
+
+impl std::fmt::Display for TargetRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Strongly-typed, normalized synchronization root directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "PathBuf", into = "PathBuf")]
@@ -287,9 +308,9 @@ impl TargetDir {
         Self(normalize_path(path.into()))
     }
 
-    /// Validates path syntax for a given role ("source" or "destination").
+    /// Validates path syntax for a given role (`TargetRole::Source` or `TargetRole::Destination`).
     /// Accepts Windows drive letters (C:\), UNC prefixes (\\), and Unix absolute paths (/).
-    pub fn validate(&self, role: &str) -> Result<(), SyncError> {
+    pub fn validate(&self, role: TargetRole) -> Result<(), SyncError> {
         let is_valid_drive_path = |path_str: &str| -> bool {
             if path_str.len() < 3 {
                 return false;
@@ -312,10 +333,9 @@ impl TargetDir {
         }
 
         if !is_unc && !is_drive && !is_unix_abs {
-            let example_drive = if role == "source" {
-                "C:\\, R:\\"
-            } else {
-                "C:\\, X:\\"
+            let example_drive = match role {
+                TargetRole::Source => "C:\\, R:\\",
+                TargetRole::Destination => "C:\\, X:\\",
             };
             return Err(SyncError::Validation(format!(
                 "Invalid {role} path '{s}': must start with a drive letter (e.g. {example_drive}) or UNC network prefix (e.g. \\\\server\\share)"
@@ -861,7 +881,7 @@ impl Config {
     /// # Errors
     /// Returns `SyncError::Validation` if parameters are invalid.
     pub fn validate(&self) -> Result<(), SyncError> {
-        self.source_dir.validate("source")?;
+        self.source_dir.validate(TargetRole::Source)?;
 
         if !self.source_dir.exists() {
             tracing::warn!(
@@ -882,7 +902,7 @@ impl Config {
         }
 
         for dest in self.destinations.iter() {
-            dest.validate("destination")?;
+            dest.validate(TargetRole::Destination)?;
             if is_same_or_descendant(self.source_dir.as_path(), dest.as_path())
                 || is_same_or_descendant(dest.as_path(), self.source_dir.as_path())
             {
@@ -891,6 +911,22 @@ impl Config {
                     dest.display(),
                     self.source_dir.display()
                 )));
+            }
+        }
+
+        // Validate that no two destination directories overlap or nest within each other
+        let dests: Vec<&Path> = self.destinations.iter().map(|d| d.as_path()).collect();
+        for i in 0..dests.len() {
+            for j in (i + 1)..dests.len() {
+                if is_same_or_descendant(dests[i], dests[j])
+                    || is_same_or_descendant(dests[j], dests[i])
+                {
+                    return Err(SyncError::Validation(format!(
+                        "Destination directories '{}' and '{}' are identical or nested within each other",
+                        dests[i].display(),
+                        dests[j].display()
+                    )));
+                }
             }
         }
 
@@ -1574,7 +1610,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_preprocess_dest_dirs_mixed_quotes_and_commas() {
         let input = r#"
             source_dir = "C:/source"
@@ -1704,23 +1739,23 @@ mod tests {
     fn test_target_dir_normalization_and_validation() {
         let t1 = TargetDir::new("X:/folder/subfolder/");
         assert_eq!(t1.as_path().to_string_lossy(), r"X:\folder\subfolder");
-        assert!(t1.validate("source").is_ok());
+        assert!(t1.validate(TargetRole::Source).is_ok());
 
         let t2 = TargetDir::new("\"Z:\\data\\files\\\"");
         assert_eq!(t2.as_path().to_string_lossy(), r"Z:\data\files");
-        assert!(t2.validate("destination").is_ok());
+        assert!(t2.validate(TargetRole::Destination).is_ok());
 
         let t3 = TargetDir::new(r"\172.16.0.193\share\");
         assert_eq!(t3.as_path().to_string_lossy(), r"\\172.16.0.193\share");
-        assert!(t3.validate("source").is_ok());
+        assert!(t3.validate(TargetRole::Source).is_ok());
 
         let t4 = TargetDir::new("R:");
         assert_eq!(t4.as_path().to_string_lossy(), r"R:\");
-        assert!(t4.validate("destination").is_ok());
+        assert!(t4.validate(TargetRole::Destination).is_ok());
 
         let rel = TargetDir::new("relative/source");
-        assert!(rel.validate("source").is_err());
-        let err_msg = rel.validate("source").unwrap_err().to_string();
+        assert!(rel.validate(TargetRole::Source).is_err());
+        let err_msg = rel.validate(TargetRole::Source).unwrap_err().to_string();
         assert!(err_msg.contains("Invalid source path"));
     }
 
@@ -1880,5 +1915,41 @@ mod tests {
             target_builder.verification_mode(),
             VerificationMode::Sampled
         );
+    }
+
+    #[test]
+    fn test_mutual_destination_overlap_rejected() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dest1 = temp.path().join("dest1");
+        let dest2 = dest1.join("nested");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest2).unwrap();
+
+        let config = Config::builder(&src).dest_dirs(vec![dest1, dest2]).build();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("nested within each other"));
+    }
+
+    #[test]
+    fn test_target_sync_config_try_from() {
+        let config_no_dest = Config::builder(r"C:\source").build();
+        let res = TargetSyncConfig::try_from_config(&config_no_dest);
+        assert!(res.is_err());
+
+        let config_with_dest = Config::builder(r"C:\source").dest_dir(r"D:\dest").build();
+        let res = TargetSyncConfig::try_from_config(&config_with_dest);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_target_sync_config_requires_explicit_construction() {
+        // `From<&Config>` and `From<Config>` for TargetSyncConfig were intentionally removed
+        // because they silently drop secondary destinations or fabricate empty targets.
+        // Callers must use Config::target_configs() or TargetSyncConfig::try_from_config().
+        let cfg = Config::test_default(r"C:\source", r"D:\dest");
+        let targets = cfg.target_configs();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].dest_dir().to_string_lossy(), r"D:\dest");
     }
 }

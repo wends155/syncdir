@@ -156,6 +156,7 @@ impl SyncEngine for MockSyncEngine {
 
     fn run_cancellable_full_scan(
         &self,
+        _dest_dir: &Path,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ScanOutcome, SyncError> {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -216,7 +217,7 @@ mod tests {
         );
 
         assert_eq!(mock.full_scans_count(), 0);
-        let outcome = mock.run_full_scan().unwrap();
+        let outcome = mock.run_full_scan(d1).unwrap();
         assert_eq!(outcome, ScanOutcome::Success { synced: 0 });
         assert_eq!(mock.full_scans_count(), 1);
     }

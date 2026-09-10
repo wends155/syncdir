@@ -40,9 +40,16 @@ pub(crate) fn prune_archive(
         }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
-            if is_reparse_or_symlink(&entry) {
-                tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in archive");
-                continue;
+            match is_reparse_or_symlink(&entry) {
+                Ok(true) => {
+                    tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in archive");
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(path = %entry.path().display(), error = %e, "Failed checking reparse point; skipping");
+                    continue;
+                }
             }
             let ft = entry.file_type()?;
             let path = entry.path();
@@ -52,9 +59,15 @@ pub(crate) fn prune_archive(
                 && let Ok(meta) = entry.metadata()
             {
                 let len = meta.len();
-                let mod_time = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                // Use archive creation time, not payload mtime.
+                // std::fs::rename preserves mtime; created() reflects when the entry
+                // arrived in the archive directory, which is the correct retention anchor.
+                let archive_time = meta
+                    .created()
+                    .or_else(|_| meta.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
                 *total_bytes += len;
-                files.push((path, len, mod_time));
+                files.push((path, len, archive_time));
             }
         }
         Ok(())
@@ -62,9 +75,9 @@ pub(crate) fn prune_archive(
 
     let _ = collect_files(archive_dir, &mut files, &mut total_bytes, 0);
 
-    // Evict files older than max_age_days
-    files.retain(|(path, len, mod_time)| {
-        if let Ok(age) = now.duration_since(*mod_time)
+    // Evict files older than max_age_days based on archive entry time
+    files.retain(|(path, len, archive_time)| {
+        if let Ok(age) = now.duration_since(*archive_time)
             && age > max_age
             && fs::remove_file(path).is_ok()
         {
@@ -112,8 +125,12 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
     }
 
-    /// Handle deletion of a file on a specific destination directory.
-    pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
+    /// Archive or remove a file on destination filesystem without updating the database.
+    pub(crate) fn archive_dest_file_only(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+    ) -> Result<(), SyncError> {
         if !is_safe_relative_path(rel_path) {
             return Err(SyncError::validation(format!(
                 "Unsafe path traversal detected: {}",
@@ -159,15 +176,19 @@ impl<S: HashStore> LocalSyncEngine<S> {
                     }
                     fs::rename(&dest_path, &archive_path)?;
                 }
-                self.db.delete_file(rel_path)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.db.delete_file(rel_path)?;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 return Err(SyncError::Io(e));
             }
         }
+        Ok(())
+    }
+
+    /// Handle deletion of a file on a specific destination directory.
+    pub fn delete_file_from_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
+        self.archive_dest_file_only(rel_path, dest_dir)?;
+        self.db.delete_file(rel_path)?;
         Ok(())
     }
 
@@ -227,8 +248,11 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store =
+            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
+                .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // Sync a file first
         fs::write(source.join("doomed.txt"), b"bye").unwrap();
@@ -272,8 +296,11 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let config = Config::test_default(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store =
+            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
+                .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // Sync a nested file
         fs::write(source.join("subdir").join("deep.txt"), b"nested content").unwrap();
@@ -513,5 +540,30 @@ mod tests {
         assert!(res.is_ok());
         assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_none());
         assert!(unprop_file.exists());
+    }
+
+    #[test]
+    fn test_prune_archive_retains_newly_archived_old_file() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempdir().unwrap();
+        let archive_dir = dir.path().join(".syncdir_archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let file_path = archive_dir.join("old_content_file.txt");
+        std::fs::write(&file_path, b"important backup").unwrap();
+
+        // Set mtime to 60 days ago
+        let sixty_days_ago = SystemTime::now() - Duration::from_secs(60 * 24 * 3600);
+        if let Ok(file) = std::fs::File::options().write(true).open(&file_path) {
+            let times = std::fs::FileTimes::new().set_modified(sixty_days_ago);
+            let _ = file.set_times(times);
+        }
+
+        // Newly archived file (created now) must be retained even though mtime is 60 days old
+        prune_archive(&archive_dir, 30, u64::MAX).unwrap();
+        assert!(
+            file_path.exists(),
+            "newly archived file must be retained regardless of payload mtime"
+        );
     }
 }

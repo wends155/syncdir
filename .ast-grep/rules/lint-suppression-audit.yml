@@ -9,18 +9,34 @@ note: >-
 severity: hint
 language: rust
 rule:
-  any:
-    - kind: attribute_item
-      has:
-        kind: attribute
-        has:
-          kind: identifier
-          regex: "^(allow|expect)$"
-    - kind: inner_attribute_item
-      has:
-        kind: attribute
-        has:
-          kind: identifier
-          regex: "^(allow|expect)$"
+  all:
+    - any:
+        - kind: attribute_item
+          has:
+            kind: attribute
+            has:
+              kind: identifier
+              regex: "^(allow|expect)$"
+        - kind: inner_attribute_item
+          has:
+            kind: attribute
+            has:
+              kind: identifier
+              regex: "^(allow|expect)$"
+    - not:
+        any:
+          - inside:
+              kind: mod_item
+              has:
+                kind: identifier
+                regex: "^tests?$"
+              stopBy: end
+          - inside:
+              kind: function_item
+              has:
+                kind: identifier
+                regex: "^test_"
+              stopBy: end
 ignores:
   - "tests/**"
+

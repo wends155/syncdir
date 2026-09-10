@@ -10,7 +10,7 @@ use syncdir::config::Config;
 use syncdir::daemon::{DaemonTrayHandler, SyncDaemon};
 use syncdir::error::SyncError;
 use syncdir::sync::{ConnectivityState, SyncStatusObserver, WatcherState};
-use syncdir::tray::{DestinationState, TrayExitReason, run_tray};
+use syncdir::tray::{DestinationState, TrayEventLoop, TrayExitReason};
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -102,19 +102,13 @@ retry_interval_seconds = 10
     }
 
     // Initialize winit event loop on main thread before creating threads
-    let event_loop =
-        winit::event_loop::EventLoopBuilder::<syncdir::tray::UserEvent>::with_user_event()
-            .build()
-            .map_err(|e| SyncError::tray_with_source("Failed to create event loop", e))?;
-    let event_proxy = event_loop.create_proxy();
+    let tray_loop = TrayEventLoop::new()?;
+    let event_proxy = tray_loop.create_proxy();
 
     let destinations: Vec<DestinationState> = config
         .resolved_dest_dirs()
         .into_iter()
-        .map(|d| {
-            let is_online = std::fs::metadata(&d).map(|m| m.is_dir()).unwrap_or(false);
-            DestinationState::new(d, is_online)
-        })
+        .map(|d| DestinationState::new(d, ConnectivityState::Offline))
         .collect();
 
     let observer: Arc<dyn SyncStatusObserver> =
@@ -132,7 +126,7 @@ retry_interval_seconds = 10
 
     // Run tray UI (blocks the main thread)
     tracing::info!("Starting system tray UI loop.");
-    let exit_reason = run_tray(event_loop, destinations, handler)?;
+    let exit_reason = tray_loop.run(destinations, handler)?;
 
     daemon.shutdown();
 

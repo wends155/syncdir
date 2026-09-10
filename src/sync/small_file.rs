@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::config::VerificationMode;
@@ -27,11 +27,6 @@ impl TempFileGuard {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub(crate) fn disarm(&mut self) {
         self.disarmed = true;
     }
@@ -46,35 +41,7 @@ impl Drop for TempFileGuard {
 }
 
 /// Global atomic counter for unique temporary staging file generation across threads.
-static TEMP_FILE_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-#[allow(dead_code)]
-pub(crate) fn hash_file_streamed(path: &Path) -> Result<blake3::Hash, SyncError> {
-    let mut file = File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                hasher.update(&buf[..n]);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(SyncError::Io(e)),
-        }
-    }
-    Ok(hasher.finalize())
-}
-
-#[allow(dead_code)]
-pub(crate) fn verify_small_file_write(src: &Path, dest: &Path) -> Result<(), SyncError> {
-    let src_hash = hash_file_streamed(src)?;
-    let dest_hash = hash_file_streamed(dest)?;
-    if src_hash != dest_hash {
-        return Err(SyncError::write_verification_failed(dest.to_path_buf()));
-    }
-    Ok(())
-}
+static TEMP_FILE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl<S: HashStore> LocalSyncEngine<S> {
     pub(crate) fn sync_small_file_core(
@@ -86,13 +53,32 @@ impl<S: HashStore> LocalSyncEngine<S> {
             fs::create_dir_all(parent)?;
         }
 
-        let nonce = TEMP_FILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10_000;
+        let mut nonce_hasher = blake3::Hasher::new();
+        nonce_hasher.update(&std::process::id().to_le_bytes());
+        nonce_hasher.update(
+            &SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_le_bytes(),
+        );
+        nonce_hasher.update(
+            &TEMP_FILE_NONCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_le_bytes(),
+        );
+        let random_nonce = u64::from_le_bytes(
+            nonce_hasher.finalize().as_bytes()[..8]
+                .try_into()
+                .unwrap_or_default(),
+        );
+
         let file_stem = task
             .dest_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        let temp_name = format!("{file_stem}.{nonce:04x}.syncdir_tmp");
+        let temp_name = format!("{file_stem}.{random_nonce:016x}.syncdir_tmp");
         let temp_path = match task.dest_path.parent() {
             Some(parent) => parent.join(temp_name),
             None => PathBuf::from(temp_name),
@@ -103,8 +89,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let mut temp_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&temp_path)?;
 
         let mut hasher = blake3::Hasher::new();
@@ -146,6 +131,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             ));
         }
 
+        // Flush and verify write based on VerificationMode
         match self.config.verification_mode() {
             VerificationMode::Disabled => {}
             VerificationMode::MetadataAndFlush => {
@@ -158,24 +144,23 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 temp_file.sync_all()?;
             }
             VerificationMode::Sampled | VerificationMode::Full => {
-                let src_hash = hasher.finalize();
+                temp_file.sync_all()?;
                 temp_file.seek(SeekFrom::Start(0))?;
-                let mut dest_hasher = blake3::Hasher::new();
+                let mut written_hasher = blake3::Hasher::new();
+                let mut verify_buf = [0u8; 64 * 1024];
                 loop {
-                    let n = match temp_file.read(buf) {
+                    match temp_file.read(&mut verify_buf) {
                         Ok(0) => break,
-                        Ok(n) => n,
+                        Ok(n) => written_hasher.update(&verify_buf[..n]),
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(e) => return Err(SyncError::Io(e)),
                     };
-                    dest_hasher.update(&buf[..n]);
                 }
-                if src_hash != dest_hasher.finalize() {
+                if written_hasher.finalize() != hasher.finalize() {
                     return Err(SyncError::write_verification_failed(
                         task.dest_path.to_path_buf(),
                     ));
                 }
-                temp_file.sync_all()?;
             }
         }
 
@@ -184,9 +169,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 .set_modified(SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(task.src_mod)),
         )?;
 
-        // Close file handle explicitly on Windows before rename
         drop(temp_file);
-
         fs::rename(&temp_path, task.dest_path)?;
         temp_guard.disarm();
 
@@ -205,7 +188,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         Ok((record, Vec::new()))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn sync_small_file(&self, task: &FileSyncTask<'_>) -> Result<(), SyncError> {
         let mut stack_scratch = [0u8; 64 * 1024];
         let (record, _) = self.sync_small_file_core(task, &mut stack_scratch)?;
@@ -220,6 +203,7 @@ mod tests {
     use crate::config::{Config, TargetSyncConfig};
     use crate::db::{MockHashStore, SqliteHashStore};
     use crate::sync::SyncEngine;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn test_config(source: std::path::PathBuf, dest: std::path::PathBuf) -> Config {
@@ -243,8 +227,11 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store =
+            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
+                .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // Write a small file (< 10 bytes threshold)
         fs::write(source.join("tiny.txt"), b"hi").unwrap();
@@ -267,8 +254,11 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store =
+            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
+                .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // 0-byte file
         fs::write(source.join("empty.txt"), b"").unwrap();
@@ -299,8 +289,11 @@ mod tests {
             .block_sync_threshold_bytes(1024)
             .block_size_bytes(256)
             .build();
-        let store = SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store =
+            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
+                .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         fs::write(source.join("small.txt"), b"under threshold").unwrap();
         engine.sync_file(Path::new("small.txt")).unwrap();
@@ -379,20 +372,6 @@ mod tests {
             record.file_size, 500,
             "Saved record must use actual bytes copied (500), not stale task.src_size (1000)"
         );
-    }
-
-    #[test]
-    fn test_verify_small_file_write_corruption() {
-        let temp = tempdir().unwrap();
-        let src = temp.path().join("src.txt");
-        let dst = temp.path().join("dst.txt");
-        std::fs::write(&src, b"good data").unwrap();
-        std::fs::write(&dst, b"bad data").unwrap();
-        match verify_small_file_write(&src, &dst) {
-            Err(SyncError::WriteVerificationFailed { path, .. }) => assert_eq!(path, dst),
-            other => panic!("Expected WriteVerificationFailed, got {other:?}"),
-        }
-        assert!(verify_small_file_write(&src, &src).is_ok());
     }
 
     #[test]

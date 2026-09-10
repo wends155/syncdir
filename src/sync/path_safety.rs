@@ -63,13 +63,14 @@ pub fn verify_destination_not_reparse_cached(
     use std::os::windows::fs::MetadataExt;
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
-    for component in rel_path.components() {
+    let components: Vec<_> = rel_path.components().collect();
+    let total = components.len();
+    for (i, component) in components.into_iter().enumerate() {
+        let is_leaf = i + 1 == total;
         current.push(component);
         if verified_dirs.contains(&current) {
-            if let Ok(m) = fs::symlink_metadata(&current) {
-                leaf_meta = Some(m);
-            } else {
-                leaf_meta = None;
+            if is_leaf {
+                leaf_meta = fs::symlink_metadata(&current).ok();
             }
             continue;
         }
@@ -83,8 +84,10 @@ pub fn verify_destination_not_reparse_cached(
             if m.is_dir() {
                 verified_dirs.insert(current.clone());
             }
-            leaf_meta = Some(m);
-        } else {
+            if is_leaf {
+                leaf_meta = Some(m);
+            }
+        } else if is_leaf {
             leaf_meta = None;
         }
     }
@@ -100,13 +103,14 @@ pub fn verify_destination_not_reparse_cached(
 ) -> Result<Option<Metadata>, SyncError> {
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
-    for component in rel_path.components() {
+    let components: Vec<_> = rel_path.components().collect();
+    let total = components.len();
+    for (i, component) in components.into_iter().enumerate() {
+        let is_leaf = i + 1 == total;
         current.push(component);
         if verified_dirs.contains(&current) {
-            if let Ok(m) = fs::symlink_metadata(&current) {
-                leaf_meta = Some(m);
-            } else {
-                leaf_meta = None;
+            if is_leaf {
+                leaf_meta = fs::symlink_metadata(&current).ok();
             }
             continue;
         }
@@ -120,8 +124,10 @@ pub fn verify_destination_not_reparse_cached(
             if m.is_dir() {
                 verified_dirs.insert(current.clone());
             }
-            leaf_meta = Some(m);
-        } else {
+            if is_leaf {
+                leaf_meta = Some(m);
+            }
+        } else if is_leaf {
             leaf_meta = None;
         }
     }
@@ -180,17 +186,15 @@ pub(crate) fn is_reparse_or_symlink_meta(meta: &Metadata) -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> bool {
+pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> Result<bool, std::io::Error> {
     use std::os::windows::fs::MetadataExt;
-    match fs::symlink_metadata(entry.path()) {
-        Ok(meta) => (meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink(),
-        Err(_) => true,
-    }
+    let meta = std::fs::symlink_metadata(entry.path())?;
+    Ok((meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink())
 }
 
 #[cfg(not(windows))]
-pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> bool {
-    entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true)
+pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> Result<bool, std::io::Error> {
+    Ok(entry.file_type()?.is_symlink())
 }
 
 #[doc(hidden)]
@@ -305,5 +309,106 @@ mod tests {
                 .unwrap();
         assert!(meta2.is_some());
         assert_eq!(cache.len(), count_before);
+    }
+
+    #[test]
+    fn test_verify_destination_not_reparse_cached_no_io_on_cached_ancestors() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("dest");
+        let deep = dest.join("cached_ancestor");
+        fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("leaf.txt");
+        fs::write(&file, b"content").unwrap();
+
+        let mut cache = HashSet::new();
+        // Pre-insert deep into cache
+        cache.insert(deep.clone());
+
+        let meta = verify_destination_not_reparse_cached(
+            &dest,
+            Path::new("cached_ancestor/leaf.txt"),
+            &mut cache,
+        )
+        .unwrap();
+
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert!(
+            meta.is_file(),
+            "leaf metadata must be for the leaf file, not an ancestor"
+        );
+    }
+
+    #[test]
+    fn test_verify_destination_not_reparse_cached_leaf_in_cache_returns_metadata() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("dest");
+        let dir = dest.join("cached_dir");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut cache = HashSet::new();
+        cache.insert(dir.clone());
+
+        let meta =
+            verify_destination_not_reparse_cached(&dest, Path::new("cached_dir"), &mut cache)
+                .unwrap();
+
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert!(
+            meta.is_dir(),
+            "cached leaf directory must return directory metadata"
+        );
+    }
+
+    #[test]
+    fn test_is_reparse_or_symlink_regular_dir_is_false() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let result = is_reparse_or_symlink(&entry).unwrap();
+            assert!(
+                !result,
+                "regular directory must not be flagged as reparse point"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_reparse_or_symlink_detects_junction_or_symlink() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::create_dir(&target).unwrap();
+
+        // Try creating symlink or junction
+        let created = if std::os::windows::fs::symlink_dir(&target, &link).is_ok() {
+            true
+        } else {
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        link.display(),
+                        target.display()
+                    ),
+                ])
+                .status();
+            status.map(|s| s.success()).unwrap_or(false)
+        };
+
+        if created {
+            for entry in fs::read_dir(dir.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.path() == link {
+                    let result = is_reparse_or_symlink(&entry).unwrap();
+                    assert!(result, "junction/symlink must be detected as reparse point");
+                }
+            }
+        }
     }
 }

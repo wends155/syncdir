@@ -4,7 +4,7 @@
 //! reconnect scan triggers, and RAII shutdown.
 
 use crate::config::Config;
-use crate::db::SqliteHashStore;
+use crate::db::{SqliteHashStore, StoreConfig};
 use crate::error::SyncError;
 use crate::startup::RegistryBackend;
 use crate::sync::{
@@ -131,7 +131,8 @@ impl SyncEngineFactory for SqliteEngineFactory {
             db_path = %db_path.display(),
             "Opening signature cache database for target",
         );
-        let store = SqliteHashStore::new(&db_path, target_config)?;
+        let store_cfg = StoreConfig::try_from(target_config)?;
+        let store = SqliteHashStore::new(&db_path, store_cfg)?;
         Ok(LocalSyncEngine::new(store, target_config.clone()))
     }
 }
@@ -157,16 +158,32 @@ impl SyncDaemon {
     ) -> Result<(), SyncError> {
         let src_orig = config.source_dir();
         let src_resolved = resolver.try_resolve_alternate_path(src_orig);
+        let src_unc = resolver.try_resolve_unc_path(src_orig);
 
-        for dest in config.resolved_dest_dirs() {
-            let dest_resolved = resolver.try_resolve_alternate_path(&dest);
+        let dests: Vec<_> = config
+            .resolved_dest_dirs()
+            .into_iter()
+            .map(|dest| {
+                let dest_resolved = resolver.try_resolve_alternate_path(&dest);
+                let dest_unc = resolver.try_resolve_unc_path(&dest);
+                (dest, dest_resolved, dest_unc)
+            })
+            .collect();
 
-            let is_loop = crate::config::is_same_or_descendant(&src_resolved, &dest_resolved)
-                || crate::config::is_same_or_descendant(&dest_resolved, &src_resolved)
-                || crate::config::is_same_or_descendant(src_orig, &dest_resolved)
-                || crate::config::is_same_or_descendant(&dest_resolved, src_orig)
-                || crate::config::is_same_or_descendant(&src_resolved, &dest)
-                || crate::config::is_same_or_descendant(&dest, &src_resolved);
+        // 1. Check source vs destination loops
+        for (dest, dest_resolved, dest_unc) in &dests {
+            let is_loop = crate::config::is_same_or_descendant(&src_resolved, dest_resolved)
+                || crate::config::is_same_or_descendant(dest_resolved, &src_resolved)
+                || crate::config::is_same_or_descendant(src_orig, dest_resolved)
+                || crate::config::is_same_or_descendant(dest_resolved, src_orig)
+                || crate::config::is_same_or_descendant(&src_resolved, dest)
+                || crate::config::is_same_or_descendant(dest, &src_resolved)
+                || crate::config::is_same_or_descendant(&src_unc, dest_unc)
+                || crate::config::is_same_or_descendant(dest_unc, &src_unc)
+                || crate::config::is_same_or_descendant(src_orig, dest_unc)
+                || crate::config::is_same_or_descendant(dest_unc, src_orig)
+                || crate::config::is_same_or_descendant(&src_unc, dest)
+                || crate::config::is_same_or_descendant(dest, &src_unc);
 
             if is_loop {
                 return Err(SyncError::validation(format!(
@@ -178,6 +195,36 @@ impl SyncDaemon {
                 )));
             }
         }
+
+        // 2. Check destination vs destination overlaps (pairwise O(N^2))
+        for i in 0..dests.len() {
+            for j in (i + 1)..dests.len() {
+                let (d1, d1_res, d1_unc) = &dests[i];
+                let (d2, d2_res, d2_unc) = &dests[j];
+
+                let is_dest_dest_overlap = crate::config::is_same_or_descendant(d1_res, d2_res)
+                    || crate::config::is_same_or_descendant(d2_res, d1_res)
+                    || crate::config::is_same_or_descendant(d1, d2_res)
+                    || crate::config::is_same_or_descendant(d2_res, d1)
+                    || crate::config::is_same_or_descendant(d1_res, d2)
+                    || crate::config::is_same_or_descendant(d2, d1_res)
+                    || crate::config::is_same_or_descendant(d1_unc, d2_unc)
+                    || crate::config::is_same_or_descendant(d2_unc, d1_unc)
+                    || crate::config::is_same_or_descendant(d1, d2_unc)
+                    || crate::config::is_same_or_descendant(d2_unc, d1)
+                    || crate::config::is_same_or_descendant(d1_unc, d2)
+                    || crate::config::is_same_or_descendant(d2, d1_unc);
+
+                if is_dest_dest_overlap {
+                    return Err(SyncError::validation(format!(
+                        "Destination directory '{}' conflicts with destination directory '{}' (nested or overlapping destination paths)",
+                        d1.display(),
+                        d2.display()
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -344,8 +391,21 @@ impl SyncDaemon {
         app_dir: &Path,
         observer: Option<Arc<dyn SyncStatusObserver>>,
     ) -> Result<Self, SyncError> {
-        let resolver = crate::net::Win32NetworkResolver;
-        Self::validate_target_loops(&config, &resolver)?;
+        let resolver = Arc::new(crate::net::Win32NetworkResolver);
+        Self::start_with_factory_and_resolver(factory, config, app_dir, observer, resolver)
+    }
+
+    /// Starts all sync workers using the provided engine factory and network resolver.
+    #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
+    pub fn start_with_factory_and_resolver<F: SyncEngineFactory>(
+        factory: F,
+        config: Config,
+        app_dir: &Path,
+        observer: Option<Arc<dyn SyncStatusObserver>>,
+        resolver: Arc<dyn crate::net::NetworkResolver>,
+    ) -> Result<Self, SyncError> {
+        config.validate()?;
+        Self::validate_target_loops(&config, resolver.as_ref())?;
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -375,6 +435,7 @@ impl SyncDaemon {
                 observer.clone(),
                 source_connectivity.clone(),
             )
+            .with_resolver(resolver.clone())
             .with_cancellation(cancellation.clone());
             let worker_handle = start_sync_worker(worker_ctx)?;
             worker_handles.push(worker_handle);
@@ -591,5 +652,74 @@ dest_dir = "C:\\dummy_dest"
 
         let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_target_loops_detects_dest_dest_unc_overlap() {
+        let mock_resolver = crate::net::MockNetworkResolver::new();
+        mock_resolver.set_alternate_path("Y:\\backup", "\\\\server\\share\\backup");
+
+        let config = Config::builder("C:\\source")
+            .dest_dirs(vec!["Y:\\backup", "\\\\server\\share\\backup\\sub"])
+            .build();
+
+        let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("conflicts with destination directory")
+                || err_msg.contains("recursive sync loop")
+                || err_msg.contains("overlapping destination"),
+            "unexpected error message: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_target_loops_allows_disjoint_unc_targets() {
+        let mock_resolver = crate::net::MockNetworkResolver::new();
+        mock_resolver.set_alternate_path("Y:\\backup1", "\\\\server\\share\\b1");
+        mock_resolver.set_alternate_path("Z:\\backup2", "\\\\server\\share\\b2");
+
+        let config = Config::builder("C:\\source")
+            .dest_dirs(vec!["Y:\\backup1", "Z:\\backup2"])
+            .build();
+
+        let result = SyncDaemon::validate_target_loops(&config, &mock_resolver);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sync_daemon_rejects_unvalidated_config() {
+        let dir = tempdir().unwrap();
+        // Config with zero destinations fails config.validate()
+        let invalid_config = Config::builder(dir.path()).build();
+        let result =
+            SyncDaemon::start_with_factory(MockEngineFactory, invalid_config, dir.path(), None);
+        match result {
+            Err(e) => assert!(e.to_string().contains("destination")),
+            Ok(_) => panic!("Expected error for config without destinations"),
+        }
+    }
+
+    #[test]
+    fn test_sync_daemon_start_with_custom_resolver() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let config = Config::builder(src).dest_dir(dst).build();
+        let mock_resolver = Arc::new(crate::net::MockNetworkResolver::new());
+        let daemon = SyncDaemon::start_with_factory_and_resolver(
+            MockEngineFactory,
+            config,
+            dir.path(),
+            None,
+            mock_resolver,
+        )
+        .unwrap();
+        assert_eq!(daemon.worker_handles.len(), 1);
+        daemon.shutdown();
     }
 }

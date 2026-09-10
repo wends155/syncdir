@@ -52,7 +52,8 @@ impl From<bool> for SourceConnectivityTracker {
 pub struct DebounceQueue {
     pending_syncs: HashMap<PathBuf, Instant>,
     pending_deletes: HashMap<PathBuf, Instant>,
-    heap: std::collections::BinaryHeap<std::cmp::Reverse<(Instant, PathBuf)>>,
+    sync_heap: std::collections::BinaryHeap<std::cmp::Reverse<(Instant, PathBuf)>>,
+    delete_heap: std::collections::BinaryHeap<std::cmp::Reverse<(Instant, PathBuf)>>,
     max_capacity: usize,
 }
 
@@ -62,7 +63,8 @@ impl DebounceQueue {
         Self {
             pending_syncs: HashMap::new(),
             pending_deletes: HashMap::new(),
-            heap: std::collections::BinaryHeap::new(),
+            sync_heap: std::collections::BinaryHeap::new(),
+            delete_heap: std::collections::BinaryHeap::new(),
             max_capacity,
         }
     }
@@ -79,7 +81,7 @@ impl DebounceQueue {
         self.pending_deletes.remove(&path);
         let dl = Instant::now() + debounce;
         self.pending_syncs.insert(path.clone(), dl);
-        self.heap.push(std::cmp::Reverse((dl, path)));
+        self.sync_heap.push(std::cmp::Reverse((dl, path)));
         true
     }
 
@@ -95,35 +97,39 @@ impl DebounceQueue {
         self.pending_syncs.remove(&path);
         let dl = Instant::now() + debounce;
         self.pending_deletes.insert(path.clone(), dl);
-        self.heap.push(std::cmp::Reverse((dl, path)));
+        self.delete_heap.push(std::cmp::Reverse((dl, path)));
         true
     }
 
     /// Drain and return all sync paths whose debounce deadlines are <= `now`.
     pub fn drain_ready_syncs(&mut self, now: Instant) -> Vec<PathBuf> {
         let mut ready = Vec::new();
-        self.pending_syncs.retain(|path, deadline| {
-            if *deadline <= now {
-                ready.push(path.clone());
-                false
-            } else {
-                true
+        while let Some(std::cmp::Reverse((deadline, _path))) = self.sync_heap.peek() {
+            if *deadline > now {
+                break;
             }
-        });
+            let std::cmp::Reverse((deadline, path)) = self.sync_heap.pop().unwrap();
+            if self.pending_syncs.get(&path) == Some(&deadline) {
+                self.pending_syncs.remove(&path);
+                ready.push(path);
+            }
+        }
         ready
     }
 
     /// Drain and return all delete paths whose debounce deadlines are <= `now`.
     pub fn drain_ready_deletes(&mut self, now: Instant) -> Vec<PathBuf> {
         let mut ready = Vec::new();
-        self.pending_deletes.retain(|path, deadline| {
-            if *deadline <= now {
-                ready.push(path.clone());
-                false
-            } else {
-                true
+        while let Some(std::cmp::Reverse((deadline, _path))) = self.delete_heap.peek() {
+            if *deadline > now {
+                break;
             }
-        });
+            let std::cmp::Reverse((deadline, path)) = self.delete_heap.pop().unwrap();
+            if self.pending_deletes.get(&path) == Some(&deadline) {
+                self.pending_deletes.remove(&path);
+                ready.push(path);
+            }
+        }
         ready
     }
 
@@ -131,14 +137,14 @@ impl DebounceQueue {
     pub fn requeue_sync_retry(&mut self, path: PathBuf, delay: std::time::Duration) {
         let dl = Instant::now() + delay;
         self.pending_syncs.insert(path.clone(), dl);
-        self.heap.push(std::cmp::Reverse((dl, path)));
+        self.sync_heap.push(std::cmp::Reverse((dl, path)));
     }
 
     /// Re-enqueue a failed delete path for retry with a backoff delay.
     pub fn requeue_delete_retry(&mut self, path: PathBuf, delay: std::time::Duration) {
         let dl = Instant::now() + delay;
         self.pending_deletes.insert(path.clone(), dl);
-        self.heap.push(std::cmp::Reverse((dl, path)));
+        self.delete_heap.push(std::cmp::Reverse((dl, path)));
     }
 
     /// Calculate earliest deadline across all pending syncs and deletes.
@@ -146,19 +152,36 @@ impl DebounceQueue {
     /// Uses min-heap top with lazy eviction of stale entries (whose deadline
     /// was updated or path was drained).
     pub fn earliest_deadline(&mut self) -> Option<Instant> {
-        while let Some(std::cmp::Reverse((deadline, path))) = self.heap.peek() {
-            let actual_deadline = self
-                .pending_syncs
-                .get(path)
-                .or_else(|| self.pending_deletes.get(path));
-            match actual_deadline {
-                Some(&d) if d == *deadline => return Some(*deadline),
-                _ => {
-                    self.heap.pop();
+        let sync_earliest = loop {
+            match self.sync_heap.peek() {
+                Some(std::cmp::Reverse((deadline, path))) => {
+                    if self.pending_syncs.get(path) == Some(deadline) {
+                        break Some(*deadline);
+                    } else {
+                        self.sync_heap.pop();
+                    }
                 }
+                None => break None,
             }
+        };
+        let delete_earliest = loop {
+            match self.delete_heap.peek() {
+                Some(std::cmp::Reverse((deadline, path))) => {
+                    if self.pending_deletes.get(path) == Some(deadline) {
+                        break Some(*deadline);
+                    } else {
+                        self.delete_heap.pop();
+                    }
+                }
+                None => break None,
+            }
+        };
+        match (sync_earliest, delete_earliest) {
+            (Some(s), Some(d)) => Some(std::cmp::min(s, d)),
+            (Some(s), None) => Some(s),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
         }
-        None
     }
 
     /// Return true if both pending sync and delete queues are empty.
@@ -305,11 +328,11 @@ impl ReachabilityMonitor {
 }
 
 /// State container for the sync worker execution loop.
-pub struct SyncWorkerState {
-    pub scratch: Vec<u8>,
-    pub failure_tracker: HashMap<PathBuf, u32>,
-    pub hourly_prune_interval: std::time::Duration,
-    pub last_archive_prune: Instant,
+pub(crate) struct SyncWorkerState {
+    pub(crate) scratch: Vec<u8>,
+    pub(crate) failure_tracker: HashMap<PathBuf, u32>,
+    pub(crate) hourly_prune_interval: std::time::Duration,
+    pub(crate) last_archive_prune: Instant,
 }
 
 impl SyncWorkerState {
@@ -493,7 +516,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                                 target_index = target_index + 1,
                                 "Triggering catch-up full scan following destination reconnect."
                             );
-                            match engine.run_cancellable_full_scan(&cancellation) {
+                            match engine.run_cancellable_full_scan(reachability.active_dest(), &cancellation) {
                                 Ok(ScanOutcome::DestinationUnreachable) => {
                                     tracing::warn!(
                                         "Catch-up scan determined destination is unreachable"
@@ -528,6 +551,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                 while let Some(cmd) = cmd_opt {
                     match cmd {
                         SyncCommand::FileModified(path) => {
+                            state.reset_failure(&path);
                             if !queue.enqueue_sync(path.clone(), debounce_dur) {
                                 tracing::error!(
                                     path = %path.display(),
@@ -538,6 +562,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                             }
                         }
                         SyncCommand::FileDeleted(path) => {
+                            state.reset_failure(&path);
                             if !queue.enqueue_delete(path.clone(), debounce_dur) {
                                 tracing::error!(
                                     path = %path.display(),
@@ -549,7 +574,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                         }
                         SyncCommand::TriggerFullScan => {
                             if source_connectivity.is_online() {
-                                match engine.run_cancellable_full_scan(&cancellation) {
+                                match engine.run_cancellable_full_scan(reachability.active_dest(), &cancellation) {
                                     Ok(ScanOutcome::Success { synced }) => {
                                         tracing::info!(synced, "Full scan completed successfully");
                                         reachability.mark_online(observer.as_ref());
@@ -769,7 +794,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
                         target_index = target_index + 1,
                         "Triggering catch-up full scan following queue overflow recovery"
                     );
-                    match engine.run_cancellable_full_scan(&cancellation) {
+                    match engine.run_cancellable_full_scan(reachability.active_dest(), &cancellation) {
                         Ok(ScanOutcome::Success { .. })
                         | Ok(ScanOutcome::PartialFailure { .. }) => {
                             needs_catchup_scan = false;
@@ -793,7 +818,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, TargetSyncConfig};
     use crate::db::MockHashStore;
     use crate::sync::engine::LocalSyncEngine;
     use crate::sync::mock::MockSyncEngine;
@@ -838,6 +863,7 @@ mod tests {
         }
         fn run_cancellable_full_scan(
             &self,
+            _dest_dir: &Path,
             _cancel: &std::sync::atomic::AtomicBool,
         ) -> Result<ScanOutcome, SyncError> {
             Ok(ScanOutcome::Success { synced: 0 })
@@ -859,8 +885,9 @@ mod tests {
         // Write initial source file
         fs::write(source.join("storm.txt"), b"initial").unwrap();
 
-        let engine = LocalSyncEngine::new(store, config.clone());
-        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_config.clone());
+        let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
         let _handle = start_sync_worker(context).unwrap();
 
         // Allow initial scan to complete
@@ -902,11 +929,12 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let config = Config::test_default(source, dest.clone());
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let engine = LocalSyncEngine::new(store, config.clone());
-        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let engine = LocalSyncEngine::new(store, target_config.clone());
+        let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
         let _handle = start_sync_worker(context).unwrap();
 
         tx.send(SyncCommand::TriggerFullScan).unwrap();
@@ -939,11 +967,12 @@ mod tests {
             .retry_interval_seconds(1)
             .propagate_deletions(true)
             .build();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let engine = LocalSyncEngine::new(store, config.clone());
-        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let engine = LocalSyncEngine::new(store, target_config.clone());
+        let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
         let _handle = start_sync_worker(context).unwrap();
 
         tx.send(SyncCommand::FileDeleted(PathBuf::from("keep_me.txt")))
@@ -966,11 +995,12 @@ mod tests {
             .debounce_seconds(0)
             .retry_interval_seconds(1)
             .build();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let engine = LocalSyncEngine::new(store, config.clone());
-        let context = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let engine = LocalSyncEngine::new(store, target_config.clone());
+        let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
         let _handle = start_sync_worker(context).unwrap();
 
         fs::write(source.join("file1.txt"), b"hello").unwrap();
@@ -998,8 +1028,9 @@ mod tests {
             .debounce_seconds(0)
             .retry_interval_seconds(1)
             .build();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let ctx = SyncWorkerContext::new(0, config, engine, rx, None, source_online);
+        let ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
         let handle = start_sync_worker(ctx).unwrap();
         tx.send(SyncCommand::FileModified(PathBuf::from(
             "unsafe/../file.txt",
@@ -1201,7 +1232,8 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let ctx = SyncWorkerContext::new(0, config, engine.clone(), rx, None, source_online);
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
         let handle = start_sync_worker(ctx).unwrap();
 
         tx.send(SyncCommand::FileModified(PathBuf::from("data.txt")))
@@ -1240,10 +1272,11 @@ mod tests {
             .retry_interval_seconds(0)
             .build();
 
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = MockSyncEngine::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let ctx = SyncWorkerContext::new(0, config, engine.clone(), rx, None, source_online)
+        let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online)
             .with_max_pending_queue(5);
         let handle = start_sync_worker(ctx).unwrap();
 
@@ -1302,11 +1335,12 @@ mod tests {
         let resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
         resolver.set_alternate_path(fake_dest, real_unc_dest.clone());
 
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = MockSyncEngine::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        let ctx = SyncWorkerContext::new(0, config, engine.clone(), rx, None, source_online)
+        let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online)
             .with_resolver(resolver);
         let handle = start_sync_worker(ctx).unwrap();
 

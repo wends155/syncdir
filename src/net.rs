@@ -12,6 +12,9 @@ pub trait NetworkResolver: Send + Sync {
     /// Attempts to resolve an alternate path (e.g. drive letter to UNC path or vice versa).
     fn try_resolve_alternate_path(&self, path: &Path) -> PathBuf;
 
+    /// Attempts to resolve a mapped drive path to its underlying UNC path.
+    fn try_resolve_unc_path(&self, path: &Path) -> PathBuf;
+
     /// Attempts to establish an SMB connection to a UNC network share.
     ///
     /// # Errors
@@ -28,17 +31,26 @@ impl NetworkResolver for Win32NetworkResolver {
         try_resolve_alternate_path(path)
     }
 
+    fn try_resolve_unc_path(&self, path: &Path) -> PathBuf {
+        try_resolve_unc_path(path)
+    }
+
     fn establish_smb_connection(&self, unc_path: &Path) -> Result<(), SyncError> {
         establish_smb_connection(unc_path)
     }
 }
 
+#[derive(Debug, Default)]
+struct MockNetworkInner {
+    alternate_paths: std::collections::HashMap<PathBuf, PathBuf>,
+    recorded_calls: Vec<PathBuf>,
+    smb_failures: std::collections::HashMap<PathBuf, String>,
+}
+
 /// In-memory mock network resolver for testing without network dependencies.
 #[derive(Debug, Default, Clone)]
 pub struct MockNetworkResolver {
-    alternate_paths: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
-    recorded_calls: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
-    smb_failures: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, String>>>,
+    inner: std::sync::Arc<std::sync::Mutex<MockNetworkInner>>,
 }
 
 impl MockNetworkResolver {
@@ -49,25 +61,22 @@ impl MockNetworkResolver {
 
     /// Set an alternate path mapping from `from` to `to`.
     pub fn set_alternate_path(&self, from: impl Into<PathBuf>, to: impl Into<PathBuf>) {
-        self.alternate_paths
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(from.into(), to.into());
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.alternate_paths.insert(from.into(), to.into());
     }
 
     /// Configure an SMB connection failure for `unc`.
     pub fn set_smb_failure(&self, unc: impl Into<PathBuf>, err_msg: impl Into<String>) {
-        self.smb_failures
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(unc.into(), err_msg.into());
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.smb_failures.insert(unc.into(), err_msg.into());
     }
 
     /// Returns recorded paths queried via `try_resolve_alternate_path`.
     pub fn recorded_resolutions(&self) -> Vec<PathBuf> {
-        self.recorded_calls
+        self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .recorded_calls
             .clone()
     }
 }
@@ -75,34 +84,64 @@ impl MockNetworkResolver {
 impl NetworkResolver for MockNetworkResolver {
     fn try_resolve_alternate_path(&self, path: &Path) -> PathBuf {
         let p = path.to_path_buf();
-        self.recorded_calls
-            .lock()
-            .unwrap_or_else(|l| l.into_inner())
-            .push(p.clone());
-        if let Some(target) = self
-            .alternate_paths
-            .lock()
-            .unwrap_or_else(|l| l.into_inner())
-            .get(&p)
-        {
+        let mut inner = self.inner.lock().unwrap_or_else(|l| l.into_inner());
+        inner.recorded_calls.push(p.clone());
+        if let Some(target) = inner.alternate_paths.get(&p) {
             target.clone()
         } else {
             normalize_path(path)
         }
     }
 
+    fn try_resolve_unc_path(&self, path: &Path) -> PathBuf {
+        self.try_resolve_alternate_path(path)
+    }
+
     fn establish_smb_connection(&self, unc_path: &Path) -> Result<(), SyncError> {
         let p = unc_path.to_path_buf();
-        if let Some(err_msg) = self
-            .smb_failures
-            .lock()
-            .unwrap_or_else(|l| l.into_inner())
-            .get(&p)
-        {
+        let inner = self.inner.lock().unwrap_or_else(|l| l.into_inner());
+        if let Some(err_msg) = inner.smb_failures.get(&p) {
             Err(SyncError::validation(err_msg.clone()))
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod ffi {
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
+    #[repr(C)]
+    pub struct NETRESOURCEW {
+        pub dwScope: u32,
+        pub dwType: u32,
+        pub dwDisplayType: u32,
+        pub dwUsage: u32,
+        pub lpLocalName: *const u16,
+        pub lpRemoteName: *const u16,
+        pub lpComment: *const u16,
+        pub lpProvider: *const u16,
+    }
+
+    #[link(name = "mpr")]
+    unsafe extern "system" {
+        pub fn WNetGetConnectionW(
+            lpLocalName: *const u16,
+            lpRemoteName: *mut u16,
+            lpnLength: *mut u32,
+        ) -> u32;
+
+        pub fn WNetAddConnection2W(
+            lpNetResource: *const NETRESOURCEW,
+            lpPassword: *const u16,
+            lpUserName: *const u16,
+            dwFlags: u32,
+        ) -> u32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetLogicalDrives() -> u32;
     }
 }
 
@@ -119,19 +158,10 @@ pub fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
     let mut buf = [0u16; 512];
     let mut len = buf.len() as u32;
 
-    #[link(name = "mpr")]
-    unsafe extern "system" {
-        fn WNetGetConnectionW(
-            lpLocalName: *const u16,
-            lpRemoteName: *mut u16,
-            lpnLength: *mut u32,
-        ) -> u32;
-    }
-
     // SAFETY: `local_name` is a null-terminated UTF-16 wide string pointing to a valid drive prefix.
     // `buf` is a fixed-size stack array with 512 `u16` elements and `len` accurately reflects its capacity.
     // `WNetGetConnectionW` reads from `local_name` up to its null terminator and writes at most `len` elements to `buf`.
-    let ret = unsafe { WNetGetConnectionW(local_name.as_ptr(), buf.as_mut_ptr(), &mut len) };
+    let ret = unsafe { ffi::WNetGetConnectionW(local_name.as_ptr(), buf.as_mut_ptr(), &mut len) };
     if ret == 0 {
         let valid_len = (len as usize).min(buf.len());
         let unc_str = String::from_utf16_lossy(&buf[..valid_len])
@@ -196,31 +226,7 @@ pub fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncEr
         .chain(std::iter::once(0))
         .collect();
 
-    // Win32 FFI: field names and struct name must match the Windows API naming convention (NETRESOURCEW).
-    #[allow(non_snake_case, clippy::upper_case_acronyms)]
-    #[repr(C)]
-    struct NETRESOURCEW {
-        dwScope: u32,
-        dwType: u32,
-        dwDisplayType: u32,
-        dwUsage: u32,
-        lpLocalName: *const u16,
-        lpRemoteName: *const u16,
-        lpComment: *const u16,
-        lpProvider: *const u16,
-    }
-
-    #[link(name = "mpr")]
-    unsafe extern "system" {
-        fn WNetAddConnection2W(
-            lpNetResource: *const NETRESOURCEW,
-            lpPassword: *const u16,
-            lpUserName: *const u16,
-            dwFlags: u32,
-        ) -> u32;
-    }
-
-    let nr = NETRESOURCEW {
+    let nr = ffi::NETRESOURCEW {
         dwScope: 0,
         dwType: 1, // RESOURCETYPE_DISK
         dwDisplayType: 0,
@@ -235,7 +241,7 @@ pub fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncEr
     // that remains valid for the duration of this call. All other pointer fields in NETRESOURCEW
     // and the function arguments are null pointers, which is permitted by WNetAddConnection2W
     // when using default/cached credentials and establishing an unmapped connection.
-    let ret = unsafe { WNetAddConnection2W(&nr, std::ptr::null(), std::ptr::null(), 0) };
+    let ret = unsafe { ffi::WNetAddConnection2W(&nr, std::ptr::null(), std::ptr::null(), 0) };
 
     // 0 = NO_ERROR, 85 = ERROR_ALREADY_ASSIGNED, 1219 = ERROR_SESSION_CREDENTIAL_CONFLICT
     if ret == 0 || ret == 85 || ret == 1219 {
@@ -257,12 +263,6 @@ pub fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncEr
     Err(SyncError::Validation(
         "SMB connection is only supported on Windows".into(),
     ))
-}
-
-#[cfg(target_os = "windows")]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn GetLogicalDrives() -> u32;
 }
 
 /// Find the byte boundary in `original` where the lowercase representation matches `lower_prefix`.
@@ -303,18 +303,24 @@ pub fn find_mapped_drive_for_unc(unc_path: impl AsRef<Path>) -> Option<PathBuf> 
     }
 
     #[cfg(target_os = "windows")]
-    let drive_mask = unsafe { GetLogicalDrives() };
+    let drive_mask = unsafe { ffi::GetLogicalDrives() };
     #[cfg(not(target_os = "windows"))]
     let drive_mask = 0u32;
+
+    let mut drive_buf = [0u8; 2];
+    drive_buf[1] = b':';
 
     for i in 0..26 {
         #[cfg(target_os = "windows")]
         if (drive_mask & (1 << i)) == 0 {
             continue;
         }
-        let letter = (b'A' + i as u8) as char;
-        let drive_prefix = format!("{}:", letter);
-        if let Some(mapped_unc) = resolve_mapped_drive_unc(&drive_prefix) {
+        drive_buf[0] = b'A' + i as u8;
+        let drive_prefix = match std::str::from_utf8(&drive_buf) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Some(mapped_unc) = resolve_mapped_drive_unc(drive_prefix) {
             let mapped_lower = mapped_unc.trim_end_matches('\\').to_lowercase();
             if !mapped_lower.is_empty() && unc_str_lower.starts_with(&mapped_lower) {
                 let rest = match find_prefix_byte_boundary(&original_str, &mapped_lower) {

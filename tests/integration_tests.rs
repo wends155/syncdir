@@ -1,7 +1,7 @@
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
-use syncdir::config::Config;
-use syncdir::db::{FileRecord, HashStore, SqliteHashStore};
+use syncdir::config::{Config, TargetSyncConfig};
+use syncdir::db::{FileRecord, HashStore, SqliteHashStore, StoreConfig};
 use syncdir::sync::SyncCommand;
 use tempfile::{NamedTempFile, tempdir};
 
@@ -25,13 +25,18 @@ fn test_integration_config_db_sync_commands() {
 
     assert!(config.validate().is_ok());
 
-    // SyncCommand type-checks and equality
+    let (tx, rx) = std::sync::mpsc::channel();
     let cmd = SyncCommand::FileModified(PathBuf::from("test.txt"));
+    tx.send(cmd.clone()).unwrap();
+
+    let received = rx.recv().unwrap();
+    assert_eq!(received, cmd);
     assert_eq!(cmd, SyncCommand::FileModified(PathBuf::from("test.txt")));
     assert_ne!(cmd, SyncCommand::TriggerFullScan);
 
     // Database round-trip
-    let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
+    let store =
+        SqliteHashStore::new(db_file.path(), StoreConfig::try_from(&config).unwrap()).unwrap();
     let record = FileRecord::new(PathBuf::from("test_file.bin"), 4096, 99999);
     let hashes = vec![[9u8; 32]; 4];
 
@@ -65,7 +70,7 @@ fn test_watcher_and_sync_engine_flow() {
 
     let config = Config::test_default(source.clone(), dest.clone());
 
-    let store = SqliteHashStore::new(&db_path, &config).unwrap();
+    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
     let (tx, rx) = channel();
 
     // Start watcher & sync worker BEFORE writing the file
@@ -102,8 +107,13 @@ fn test_watcher_and_sync_engine_flow() {
     );
 }
 
+type TrayRunner<H> = fn(
+    winit::event_loop::EventLoop<syncdir::tray::UserEvent>,
+    std::vec::Vec<syncdir::tray::DestinationState>,
+    std::sync::Arc<H>,
+) -> Result<syncdir::tray::TrayExitReason, syncdir::error::SyncError>;
+
 #[test]
-#[allow(clippy::type_complexity)]
 fn test_tray_module_compiles() {
     // Since run_tray blocks the thread, we only smoke-test compiling it and verifying exports.
     // This is a static analysis verification.
@@ -123,12 +133,7 @@ fn test_tray_module_compiles() {
         }
     }
 
-    let _func: fn(
-        winit::event_loop::EventLoop<syncdir::tray::UserEvent>,
-        std::vec::Vec<syncdir::tray::DestinationState>,
-        std::sync::Arc<DummyHandler>,
-    ) -> Result<syncdir::tray::TrayExitReason, syncdir::error::SyncError> =
-        syncdir::tray::run_tray::<DummyHandler>;
+    let _func: TrayRunner<DummyHandler> = syncdir::tray::run_tray::<DummyHandler>;
 }
 
 #[test]
@@ -146,9 +151,10 @@ fn test_propagate_deletions_false() {
         .dest_dir(dest.clone())
         .propagate_deletions(false)
         .build();
+    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
 
-    let store = SqliteHashStore::new(&db_path, &config).unwrap();
-    let engine = LocalSyncEngine::new(store, config);
+    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let engine = LocalSyncEngine::new(store, target_cfg);
 
     let file_path = source.join("test.txt");
     std::fs::write(&file_path, b"hello").unwrap();
@@ -228,8 +234,9 @@ fn test_path_traversal_prevention() {
     std::fs::create_dir(&dest).unwrap();
 
     let config = Config::test_default(source.clone(), dest.clone());
-    let store = SqliteHashStore::new(&db_path, &config).unwrap();
-    let engine = LocalSyncEngine::new(store, config);
+    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
+    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let engine = LocalSyncEngine::new(store, target_cfg);
 
     // Absolute path
     let res1 = engine.sync_file(std::path::Path::new("/etc/passwd"));
@@ -257,8 +264,9 @@ fn test_subsecond_sync_precision() {
     std::fs::create_dir(&dest).unwrap();
 
     let config = Config::test_default(source.clone(), dest.clone());
-    let store = SqliteHashStore::new(&db_path, &config).unwrap();
-    let engine = LocalSyncEngine::new(store, config);
+    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
+    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let engine = LocalSyncEngine::new(store, target_cfg);
 
     let file_path = source.join("fast.txt");
     std::fs::write(&file_path, b"initial").unwrap();
@@ -289,8 +297,9 @@ fn test_directory_rename_syncs_child_files() {
     std::fs::create_dir(&dest).unwrap();
 
     let config = Config::test_default(source.clone(), dest.clone());
-    let store = SqliteHashStore::new(&db_path, &config).unwrap();
-    let engine = LocalSyncEngine::new(store, config);
+    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone());
+    let store = SqliteHashStore::new(&db_path, StoreConfig::try_from(&config).unwrap()).unwrap();
+    let engine = LocalSyncEngine::new(store, target_cfg);
 
     // Create a folder with child files
     let sub = source.join("folder");

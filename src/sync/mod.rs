@@ -23,5 +23,5 @@ pub use path_safety::is_safe_relative_path;
 pub use path_safety::verify_destination_not_reparse_cached;
 pub use worker::{
     DebounceQueue, ReachabilityMonitor, SourceConnectivityTracker, SyncWorkerContext,
-    SyncWorkerState, calculate_exponential_backoff, start_sync_worker,
+    calculate_exponential_backoff, start_sync_worker,
 };

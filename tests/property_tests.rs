@@ -2,7 +2,7 @@ use proptest::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 use syncdir::config::Config;
-use syncdir::db::SqliteHashStore;
+use syncdir::db::{SqliteHashStore, StoreConfig};
 use syncdir::sync::{LocalSyncEngine, SyncEngine};
 use tempfile::{NamedTempFile, tempdir};
 
@@ -159,7 +159,8 @@ proptest! {
         fs::create_dir_all(&dest).unwrap();
 
         let config = Config::test_default(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
+        let store =
+            SqliteHashStore::new(db_file.path(), StoreConfig::try_from(&config).unwrap()).unwrap();
         let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
         let engine = LocalSyncEngine::new(store, target_config);
 
@@ -194,7 +195,8 @@ proptest! {
             .block_size_bytes(1024)
             .block_sync_threshold_bytes(1024)
             .build();
-        let store = SqliteHashStore::new(db_file.path(), &config).unwrap();
+        let store =
+            SqliteHashStore::new(db_file.path(), StoreConfig::try_from(&config).unwrap()).unwrap();
         let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
         let engine = LocalSyncEngine::new(store, target_config);
 

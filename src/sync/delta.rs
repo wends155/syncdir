@@ -192,6 +192,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             block_idx += 1;
         }
         range.flush(&mut dest_file)?;
+        drop(range_guard);
 
         // Post-stream metadata re-verification (TOCTOU protection)
         let post_meta = src_file.metadata()?;
@@ -232,7 +233,10 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 dest_file.sync_all()?;
                 Vec::new()
             }
-            VerificationMode::Full => modified_block_indices.iter().collect(),
+            VerificationMode::Full => {
+                dest_file.sync_all()?;
+                modified_block_indices.iter().collect()
+            }
             VerificationMode::Sampled => {
                 dest_file.sync_all()?;
                 let n = modified_block_indices.len();
@@ -253,13 +257,16 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         for &(b_idx, bytes_len, expected_hash) in indices_to_verify {
             dest_file.seek(SeekFrom::Start(b_idx * block_size))?;
-            if dest_file.read_exact(&mut buffer[..bytes_len]).is_err() {
-                return Err(SyncError::write_verification_failed_block(
-                    task.dest_path.to_path_buf(),
-                    b_idx,
-                    expected_hash,
-                    [0u8; 32],
-                ));
+            if let Err(e) = dest_file.read_exact(&mut buffer[..bytes_len]) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Err(SyncError::write_verification_failed_block(
+                        task.dest_path.to_path_buf(),
+                        b_idx,
+                        expected_hash,
+                        [0u8; 32],
+                    ));
+                }
+                return Err(SyncError::Io(e));
             }
             let actual_hash = *blake3::hash(&buffer[..bytes_len]).as_bytes();
             if actual_hash != expected_hash {
@@ -281,7 +288,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 path = %task.rel_path.display(),
                 dest_len_final,
                 total_bytes_read,
-                "Destination length mismatch after set_len"
+                "Destination file length does not match total bytes read after set_len"
             );
             return Err(SyncError::write_verification_failed(
                 task.dest_path.to_path_buf(),
@@ -308,7 +315,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         Ok((record, new_hashes))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn sync_delta_large_file(
         &self,
         task: &FileSyncTask<'_>,
@@ -427,8 +434,9 @@ mod tests {
             .block_sync_threshold_bytes(4)
             .block_size_bytes(4)
             .build();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, config);
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // 8 bytes payload = exactly 2 blocks of 4 bytes
         fs::write(source.join("exact.bin"), b"12345678").unwrap();
@@ -449,8 +457,11 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let config = test_config(source.clone(), dest.clone());
-        let store = SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store =
+            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
+                .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // 12 bytes > 10 byte threshold -> delta sync path (3 blocks of 4)
         fs::write(source.join("big.bin"), b"AAAABBBBcccc").unwrap();

@@ -37,6 +37,11 @@ impl FileRecord {
         self
     }
 
+    /// Returns the database surrogate ID if persisted.
+    pub fn id(&self) -> Option<i64> {
+        self.id
+    }
+
     /// Returns `true` if this file record has been persisted to the database.
     pub fn is_tracked(&self) -> bool {
         self.id.is_some()
@@ -100,17 +105,25 @@ impl StoreConfig {
     }
 }
 
-impl From<&Config> for StoreConfig {
-    fn from(cfg: &Config) -> Self {
+impl TryFrom<&Config> for StoreConfig {
+    type Error = SyncError;
+
+    /// Fallible conversion from [`Config`].
+    ///
+    /// Returns [`SyncError::Validation`] if `block_size_bytes` is zero.
+    fn try_from(cfg: &Config) -> Result<Self, Self::Error> {
         Self::new(cfg.block_size_bytes(), cfg.block_sync_threshold_bytes())
-            .expect("Config guarantees non-zero block_size_bytes")
     }
 }
 
-impl From<&crate::config::TargetSyncConfig> for StoreConfig {
-    fn from(cfg: &crate::config::TargetSyncConfig) -> Self {
+impl TryFrom<&crate::config::TargetSyncConfig> for StoreConfig {
+    type Error = SyncError;
+
+    /// Fallible conversion from [`TargetSyncConfig`].
+    ///
+    /// Returns [`SyncError::Validation`] if `block_size_bytes` is zero.
+    fn try_from(cfg: &crate::config::TargetSyncConfig) -> Result<Self, Self::Error> {
         Self::new(cfg.block_size_bytes(), cfg.block_sync_threshold_bytes())
-            .expect("TargetSyncConfig guarantees non-zero block_size_bytes")
     }
 }
 
@@ -145,6 +158,20 @@ pub trait HashStore: Send + Sync {
     ///
     /// Returns `SyncError::Db` if any database operation fails.
     fn save_files_batch(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError>;
+
+    /// Delete multiple file records and cascade removal of all their block hashes in a single transaction.
+    ///
+    /// Default implementation calls `delete_file` sequentially.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Db` if any database operation fails.
+    fn delete_files_batch(&self, paths: &[&Path]) -> Result<(), SyncError> {
+        for path in paths {
+            self.delete_file(path)?;
+        }
+        Ok(())
+    }
 }
 
 /// SQLite implementation of `HashStore`.
@@ -161,8 +188,8 @@ impl SqliteHashStore {
     ///
     /// # Errors
     /// Returns `SyncError::Db` on any SQLite failure.
-    pub fn new(db_path: &Path, config: impl Into<StoreConfig>) -> Result<Self, SyncError> {
-        let store_cfg = config.into();
+    pub fn new(db_path: &Path, config: StoreConfig) -> Result<Self, SyncError> {
+        let store_cfg = config;
         let conn = Connection::open(db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -189,7 +216,7 @@ impl SqliteHashStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS file_metadata (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                relative_path TEXT NOT NULL UNIQUE,
+                relative_path TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 file_size INTEGER NOT NULL,
                 last_modified INTEGER NOT NULL
             );
@@ -217,7 +244,7 @@ impl SqliteHashStore {
 
         let current_block_size = config.block_size_bytes().to_string();
         let current_threshold = config.block_sync_threshold_bytes().to_string();
-        let current_version = "4";
+        let current_version = "5";
 
         // Treat any missing key or mismatch as requiring a full purge
         let needs_purge = match (cached_block_size, cached_threshold, cached_version) {
@@ -230,8 +257,12 @@ impl SqliteHashStore {
 
         if needs_purge {
             let conn = self.conn()?;
-            conn.execute("DELETE FROM file_metadata", [])?;
-            // block_hashes cleaned by CASCADE
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS block_hashes;
+                 DROP TABLE IF EXISTS file_metadata;",
+            )?;
+            drop(conn);
+            self.init_schema()?;
         }
 
         self.set_meta_value("block_size_bytes", &current_block_size)?;
@@ -400,6 +431,30 @@ impl HashStore for SqliteHashStore {
             "DELETE FROM file_metadata WHERE relative_path >= ?1 AND relative_path < ?2",
         )?
         .execute(params![prefix_start, prefix_end])?;
+        Ok(())
+    }
+
+    fn delete_files_batch(&self, paths: &[&Path]) -> Result<(), SyncError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt_exact =
+                tx.prepare_cached("DELETE FROM file_metadata WHERE relative_path = ?1")?;
+            let mut stmt_prefix = tx.prepare_cached(
+                "DELETE FROM file_metadata WHERE relative_path >= ?1 AND relative_path < ?2",
+            )?;
+            for path in paths {
+                let key = path_to_sqlite_key(path)?;
+                stmt_exact.execute(params![key])?;
+                let prefix_start = format!("{}/", key);
+                let prefix_end = format!("{}0", key);
+                stmt_prefix.execute(params![prefix_start, prefix_end])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -574,6 +629,10 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
+    fn dummy_store_config(block_size: u64) -> StoreConfig {
+        StoreConfig::new(block_size, block_size * 2).expect("test block_size must be > 0")
+    }
+
     fn dummy_config(block_size: u64) -> Config {
         Config::builder(PathBuf::from("."))
             .dest_dir(PathBuf::from("."))
@@ -585,8 +644,7 @@ mod tests {
     #[test]
     fn test_save_get_delete_with_cascade() {
         let temp = NamedTempFile::new().unwrap();
-        let config = dummy_config(1024);
-        let store = SqliteHashStore::new(temp.path(), &config).unwrap();
+        let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
 
         let record = FileRecord {
             id: None,
@@ -634,8 +692,7 @@ mod tests {
     #[test]
     fn test_upsert_preserves_rowid() {
         let temp = NamedTempFile::new().unwrap();
-        let config = dummy_config(1024);
-        let store = SqliteHashStore::new(temp.path(), &config).unwrap();
+        let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
 
         let record = FileRecord {
             id: None,
@@ -672,9 +729,8 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
 
         // Open with config A and save a file
-        let config_a = dummy_config(1024);
         {
-            let store = SqliteHashStore::new(temp.path(), &config_a).unwrap();
+            let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
             let record = FileRecord {
                 id: None,
                 relative_path: PathBuf::from("test.bin"),
@@ -686,9 +742,8 @@ mod tests {
         }
 
         // Open with config B (different block size) — cache should be purged
-        let config_b = dummy_config(512);
         {
-            let store = SqliteHashStore::new(temp.path(), &config_b).unwrap();
+            let store = SqliteHashStore::new(temp.path(), dummy_store_config(512)).unwrap();
             assert!(store.get_file(Path::new("test.bin")).unwrap().is_none());
         }
     }
@@ -696,8 +751,7 @@ mod tests {
     #[test]
     fn test_list_files() {
         let temp = NamedTempFile::new().unwrap();
-        let config = dummy_config(1024);
-        let store = SqliteHashStore::new(temp.path(), &config).unwrap();
+        let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
 
         // Empty database
         assert!(store.list_files().unwrap().is_empty());
@@ -802,15 +856,28 @@ mod tests {
         assert_eq!(sc.block_sync_threshold_bytes(), 8192);
 
         let cfg = dummy_config(2048);
-        let from_cfg = StoreConfig::from(&cfg);
+        let from_cfg = StoreConfig::try_from(&cfg).unwrap();
         assert_eq!(from_cfg.block_size_bytes(), 2048);
         assert_eq!(from_cfg.block_sync_threshold_bytes(), 4096);
     }
 
     #[test]
+    fn test_store_config_try_from_zero_block_size_returns_err() {
+        let cfg = Config::builder(PathBuf::from("."))
+            .dest_dir(PathBuf::from("."))
+            .block_size_bytes(0)
+            .build();
+        let res = StoreConfig::try_from(&cfg);
+        assert!(
+            res.is_err(),
+            "StoreConfig::try_from must return Err on block_size_bytes == 0"
+        );
+    }
+
+    #[test]
     fn test_get_block_hashes_by_path_known_and_unknown() {
         let temp = NamedTempFile::new().unwrap();
-        let store = SqliteHashStore::new(temp.path(), &dummy_config(1024)).unwrap();
+        let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
         let rec = FileRecord {
             id: None,
             relative_path: PathBuf::from("data/sample.bin"),
@@ -855,7 +922,7 @@ mod tests {
     #[test]
     fn test_save_file_upsert_single_block_update() {
         let temp = NamedTempFile::new().unwrap();
-        let store = SqliteHashStore::new(temp.path(), &dummy_config(1024)).unwrap();
+        let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
         let rec = FileRecord {
             id: None,
             relative_path: PathBuf::from("delta.bin"),
@@ -897,7 +964,7 @@ mod tests {
     #[test]
     fn test_delete_directory_cascades_child_records() {
         let temp = NamedTempFile::new().unwrap();
-        let store = SqliteHashStore::new(temp.path(), &dummy_config(1024)).unwrap();
+        let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
         let r1 = FileRecord {
             id: None,
             relative_path: PathBuf::from("dir/sub/file1.txt"),
@@ -943,7 +1010,7 @@ mod tests {
     #[test]
     fn test_delete_file_escapes_like_wildcards() {
         let temp = NamedTempFile::new().unwrap();
-        let store = SqliteHashStore::new(temp.path(), &dummy_config(1024)).unwrap();
+        let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
 
         let r1 = FileRecord {
             id: None,
@@ -1069,5 +1136,53 @@ mod tests {
         let cfg = valid.unwrap();
         assert_eq!(cfg.block_size_bytes(), 1_048_576);
         assert_eq!(cfg.block_sync_threshold_bytes(), 10_485_760);
+    }
+
+    #[test]
+    fn test_delete_files_batch_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteHashStore::new(
+            &dir.path().join("test.db"),
+            StoreConfig::new(1_048_576, 10_485_760).unwrap(),
+        )
+        .unwrap();
+        for i in 0..10 {
+            let record = FileRecord::new(format!("file_{}.txt", i), i * 100, i * 1000);
+            store.save_file(&record, &[]).unwrap();
+        }
+        assert_eq!(store.list_files().unwrap().len(), 10);
+
+        let to_delete = [
+            Path::new("file_1.txt"),
+            Path::new("file_3.txt"),
+            Path::new("file_5.txt"),
+        ];
+        store.delete_files_batch(&to_delete).unwrap();
+
+        let remaining = store.list_files().unwrap();
+        assert_eq!(remaining.len(), 7);
+        assert!(store.get_file(Path::new("file_1.txt")).unwrap().is_none());
+        assert!(store.get_file(Path::new("file_2.txt")).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_collate_nocase_lookup_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteHashStore::new(
+            &dir.path().join("test.db"),
+            StoreConfig::new(1_048_576, 10_485_760).unwrap(),
+        )
+        .unwrap();
+        let record = FileRecord::new("MyFile.TXT", 500, 1000);
+        store.save_file(&record, &[]).unwrap();
+
+        // Lookup with different case should find it
+        let found = store.get_file(Path::new("myfile.txt")).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id().is_some(), true);
+
+        // Delete with different case should remove it
+        store.delete_file(Path::new("MYFILE.TXT")).unwrap();
+        assert!(store.get_file(Path::new("MyFile.TXT")).unwrap().is_none());
     }
 }

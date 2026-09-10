@@ -48,9 +48,17 @@ pub(crate) fn scan_dir_cancellable(
             }
             Err(e) => return Err(SyncError::Io(e)),
         };
-        if is_reparse_or_symlink(&entry) {
-            tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in scan");
-            continue;
+        match is_reparse_or_symlink(&entry) {
+            Ok(true) => {
+                tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in scan");
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(path = %entry.path().display(), error = %e, "Failed checking reparse point; skipping entry and marking scan incomplete");
+                *scan_complete = false;
+                continue;
+            }
         }
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
@@ -116,6 +124,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
     /// Full scan implementation with cooperative cancellation support.
     pub(crate) fn run_cancellable_full_scan_impl(
         &self,
+        dest_dir: &Path,
         cancel: &AtomicBool,
     ) -> Result<ScanOutcome, SyncError> {
         if cancel.load(Ordering::Relaxed) {
@@ -127,35 +136,19 @@ impl<S: HashStore> LocalSyncEngine<S> {
             return Err(SyncError::validation("Source directory does not exist"));
         }
 
-        let dest = self.config.dest_dir();
-        let dest_reachable = dest.exists() && dest.is_dir();
-        let (active_dest, is_reachable) = if let Some(ref pre_resolved) = self.resolved_dest {
+        let active_dest = if let Some(ref pre_resolved) = self.resolved_dest {
             if pre_resolved.exists() && pre_resolved.is_dir() {
-                (pre_resolved.clone(), true)
+                pre_resolved.clone()
             } else {
-                (dest.to_path_buf(), false)
-            }
-        } else if !dest_reachable {
-            let alt_path = crate::net::try_resolve_alternate_path(dest);
-            if alt_path.exists() && alt_path.is_dir() {
-                if alt_path != *dest {
-                    tracing::info!(
-                        target = %dest.display(),
-                        resolved_path = %alt_path.display(),
-                        "Target destination resolved alternate mapped drive/UNC SMB path for full scan."
-                    );
-                }
-                (alt_path, true)
-            } else {
-                (dest.to_path_buf(), false)
+                dest_dir.to_path_buf()
             }
         } else {
-            (dest.to_path_buf(), true)
+            dest_dir.to_path_buf()
         };
 
-        if !is_reachable {
+        if !active_dest.exists() || !active_dest.is_dir() {
             tracing::warn!(
-                target = %dest.display(),
+                target = %active_dest.display(),
                 "Target destination directory does not exist or is unreachable. Skipping full scan."
             );
             return Ok(ScanOutcome::DestinationUnreachable);
@@ -266,6 +259,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                     .map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase())
                     .collect();
 
+                let mut missing_to_delete: Vec<&Path> = Vec::new();
                 for tracked_path in cached_records.keys() {
                     if cancel.load(Ordering::Relaxed) {
                         return Err(SyncError::Cancelled);
@@ -280,22 +274,27 @@ impl<S: HashStore> LocalSyncEngine<S> {
                     #[cfg(not(windows))]
                     let is_present = source_files.contains(tracked_path);
 
-                    if !is_present
-                        && let Err(e) = self.delete_file_from_dest(tracked_path, &active_dest)
-                    {
-                        let os_code = match &e {
-                            SyncError::Io(io_err) => io_err.raw_os_error(),
-                            _ => None,
-                        };
-                        tracing::warn!(
-                            path = %tracked_path.display(),
-                            target = %active_dest.display(),
-                            error = %e,
-                            os_error = ?os_code,
-                            "Skipped deletion during full scan"
-                        );
-                        delete_skip_count += 1;
+                    if !is_present {
+                        if let Err(e) = self.archive_dest_file_only(tracked_path, &active_dest) {
+                            let os_code = match &e {
+                                SyncError::Io(io_err) => io_err.raw_os_error(),
+                                _ => None,
+                            };
+                            tracing::warn!(
+                                path = %tracked_path.display(),
+                                target = %active_dest.display(),
+                                error = %e,
+                                os_error = ?os_code,
+                                "Skipped deletion during full scan"
+                            );
+                            delete_skip_count += 1;
+                        } else {
+                            missing_to_delete.push(tracked_path.as_path());
+                        }
                     }
+                }
+                if !missing_to_delete.is_empty() {
+                    self.db.delete_files_batch(&missing_to_delete)?;
                 }
                 if delete_skip_count > 0 {
                     tracing::warn!(
@@ -443,8 +442,9 @@ mod tests {
         fs::write(dest.join("bad"), b"blocking file").unwrap();
 
         let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, config);
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         assert!(matches!(
             engine.run_full_scan().unwrap(),
@@ -477,8 +477,9 @@ mod tests {
         fs::write(dest.join("bad"), b"blocking file").unwrap();
 
         let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, config);
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         assert_eq!(
             engine.run_full_scan().unwrap(),
@@ -495,8 +496,9 @@ mod tests {
         fs::write(source.join("file1.txt"), b"content").unwrap();
 
         let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, config);
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         assert_eq!(
             engine.run_full_scan().unwrap(),
@@ -520,11 +522,12 @@ mod tests {
             .unwrap();
         }
 
-        let config = Config::test_default(src, dst);
-        let engine = LocalSyncEngine::new(MockHashStore::new(), config);
+        let config = Config::test_default(src, dst.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let cancel_token = AtomicBool::new(true);
-        let result = engine.run_cancellable_full_scan(&cancel_token);
+        let result = engine.run_cancellable_full_scan(&dst, &cancel_token);
 
         assert!(
             result.is_err(),
@@ -553,8 +556,13 @@ mod tests {
             .block_sync_threshold_bytes(10)
             .block_size_bytes(4)
             .build();
-        let store = crate::db::SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store = crate::db::SqliteHashStore::new(
+            &db_path,
+            crate::db::StoreConfig::try_from(&config).unwrap(),
+        )
+        .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         fs::write(source.join("important.txt"), b"save me").unwrap();
         engine.run_full_scan().unwrap();
@@ -580,7 +588,8 @@ mod tests {
 
         let store = BatchTrackingStore::new();
         let config = Config::builder(src).dest_dir(dst).build();
-        let engine = LocalSyncEngine::new(store.clone(), config);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
         let outcome = engine.run_full_scan().unwrap();
         assert!(matches!(outcome, ScanOutcome::Success { synced: 5 }));
@@ -679,7 +688,8 @@ mod tests {
         .with_id(1);
         store.save_file(&rec, &[]).unwrap();
 
-        let engine = LocalSyncEngine::new(store, config);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
         let outcome = engine.run_full_scan().unwrap();
         assert_eq!(outcome, ScanOutcome::Success { synced: 1 });
         assert!(dst.join("nested").join("file.txt").exists());
@@ -704,7 +714,8 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::create_dir_all(&dst).unwrap();
         let config = Config::test_default(src, dst);
-        let engine = LocalSyncEngine::new(FailingHashStore, config);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(FailingHashStore, target_cfg);
         let result = engine.run_full_scan();
         assert!(matches!(result, Err(SyncError::Db(..))));
     }
@@ -720,8 +731,9 @@ mod tests {
         fs::write(src.join("hello.txt"), b"test pre-resolved dest").unwrap();
 
         let config = Config::test_default(src, unreachable_dst);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine =
-            LocalSyncEngine::new(MockHashStore::new(), config).with_resolved_dest(&alt_dst);
+            LocalSyncEngine::new(MockHashStore::new(), target_cfg).with_resolved_dest(&alt_dst);
         assert_eq!(engine.resolved_dest(), Some(alt_dst.as_path()));
 
         let outcome = engine.run_full_scan().unwrap();

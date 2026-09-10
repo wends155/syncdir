@@ -62,9 +62,55 @@ impl DirectoryWatcher {
         Ok(DirectoryWatcher { _watcher: watcher })
     }
 
+    fn handle_rename_pair(
+        from_path: &Path,
+        to_path: &Path,
+        source_root: &Path,
+        send: &mut impl FnMut(SyncCommand) -> bool,
+    ) -> bool {
+        let from_res = from_path.strip_prefix(source_root);
+        let to_res = to_path.strip_prefix(source_root);
+
+        #[cfg(windows)]
+        let is_case_only_rename = match (&from_res, &to_res) {
+            (Ok(from), Ok(to)) => {
+                from != to
+                    && from
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&to.to_string_lossy())
+            }
+            _ => false,
+        };
+        #[cfg(not(windows))]
+        let is_case_only_rename = false;
+
+        if is_case_only_rename {
+            if let Ok(to_rel) = to_res
+                && !to_rel.as_os_str().is_empty()
+            {
+                return send(SyncCommand::FileModified(to_rel.to_path_buf()));
+            }
+            return true;
+        }
+
+        if let Ok(from_rel) = from_res
+            && !from_rel.as_os_str().is_empty()
+            && !send(SyncCommand::FileDeleted(from_rel.to_path_buf()))
+        {
+            return false;
+        }
+        if let Ok(to_rel) = to_res
+            && !to_rel.as_os_str().is_empty()
+            && !send(SyncCommand::FileModified(to_rel.to_path_buf()))
+        {
+            return false;
+        }
+        true
+    }
+
     /// Dispatches a filesystem notification event, translating paths relative to `source_root`.
     pub(crate) fn dispatch_event(event: Event, source_root: &Path, tx: &Sender<SyncCommand>) {
-        let send = |cmd: SyncCommand| -> bool {
+        let mut send = |cmd: SyncCommand| -> bool {
             if let Err(e) = tx.send(cmd) {
                 tracing::error!(
                     error = %e,
@@ -106,17 +152,12 @@ impl DirectoryWatcher {
             EventKind::Modify(notify::event::ModifyKind::Name(rename_mode)) => match rename_mode {
                 notify::event::RenameMode::Both => {
                     if event.paths.len() == 2 {
-                        if let Ok(from_rel) = event.paths[0].strip_prefix(source_root)
-                            && !from_rel.as_os_str().is_empty()
-                            && !send(SyncCommand::FileDeleted(from_rel.to_path_buf()))
-                        {
-                            return;
-                        }
-                        if let Ok(to_rel) = event.paths[1].strip_prefix(source_root)
-                            && !to_rel.as_os_str().is_empty()
-                        {
-                            send(SyncCommand::FileModified(to_rel.to_path_buf()));
-                        }
+                        let _ = Self::handle_rename_pair(
+                            &event.paths[0],
+                            &event.paths[1],
+                            source_root,
+                            &mut send,
+                        );
                     } else {
                         for path in event.paths {
                             if let Ok(rel_path) = path.strip_prefix(source_root) {
@@ -156,17 +197,12 @@ impl DirectoryWatcher {
                 }
                 _ => {
                     if event.paths.len() == 2 {
-                        if let Ok(from_rel) = event.paths[0].strip_prefix(source_root)
-                            && !from_rel.as_os_str().is_empty()
-                            && !send(SyncCommand::FileDeleted(from_rel.to_path_buf()))
-                        {
-                            return;
-                        }
-                        if let Ok(to_rel) = event.paths[1].strip_prefix(source_root)
-                            && !to_rel.as_os_str().is_empty()
-                        {
-                            send(SyncCommand::FileModified(to_rel.to_path_buf()));
-                        }
+                        let _ = Self::handle_rename_pair(
+                            &event.paths[0],
+                            &event.paths[1],
+                            source_root,
+                            &mut send,
+                        );
                     } else {
                         for path in event.paths {
                             if let Ok(rel_path) = path.strip_prefix(source_root) {
@@ -232,5 +268,38 @@ mod tests {
             rx.try_recv().is_err(),
             "Events targeting the source root itself must not forward empty relative path to sync worker"
         );
+    }
+
+    #[test]
+    fn test_case_only_rename_windows_dispatches_file_modified() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = PathBuf::from(r"C:\test\source");
+
+        let event = notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            paths: vec![root.join("file.txt"), root.join("File.txt")],
+            attrs: notify::event::EventAttributes::default(),
+        };
+
+        DirectoryWatcher::dispatch_event(event, &root, &tx);
+
+        #[cfg(windows)]
+        {
+            let cmd = rx.try_recv().expect("Should have received a command");
+            assert_eq!(cmd, SyncCommand::FileModified(PathBuf::from("File.txt")));
+            assert!(
+                rx.try_recv().is_err(),
+                "Should only dispatch one FileModified command"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let cmd1 = rx.try_recv().expect("Should have received first command");
+            assert_eq!(cmd1, SyncCommand::FileDeleted(PathBuf::from("file.txt")));
+            let cmd2 = rx.try_recv().expect("Should have received second command");
+            assert_eq!(cmd2, SyncCommand::FileModified(PathBuf::from("File.txt")));
+        }
     }
 }

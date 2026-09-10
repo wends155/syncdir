@@ -53,7 +53,7 @@ It enforces the Planning Gate and Think Phase of the TARS protocol.
 ## Phases
 
 > [!NOTE]
-> **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode), the Architect executes Phases 1, 2.5, and 4 inline — performing reconnaissance, specialist domain planning, and plan review tasks directly rather than delegating to subagents. The phase structure remains the same; only the executor changes.
+> **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode), the Architect executes Phases 1, 3, and 5 inline — performing reconnaissance, specialist domain planning, and plan review tasks directly rather than delegating to subagents. The phase structure remains the same; only the executor changes.
 
 ### 0. Scope Triage
 
@@ -109,17 +109,17 @@ Read the Reconnaissance Report (and Idiom/Library/History Reports if spawned).
      - **security-planner**: Trust boundaries, auth model, input surfaces, upstream security findings.
      - **perf-planner**: Hot paths, algorithmic choices, caching opportunities, upstream performance findings.
 
-     Record these as a `Distilled Sub-Planner Context` block in memory before proceeding to Phase 2.5.
+     Record these as a `Distilled Sub-Planner Context` block in memory before proceeding to Phase 3.
 
 > [!CAUTION]
 > If blast radius analysis reveals cross-package impact, the **Deprecation Protocol** defined in `ipr.md` applies. The plan MUST include a Deprecation Schedule section.
 
-### 2.5 Domain Specialist Planning *(M/L tier — conditional)*
+### 3. Domain Specialist Planning *(M/L tier — conditional)*
 
 > [!NOTE]
 > **Graceful Fallback**: When `invoke_subagent` is unavailable (single-agent mode),
 > skip this phase. The Architect covers all design domains inline during Phase 2
-> Structured Reasoning and Phase 3 drafting.
+> Structured Reasoning and Phase 4 drafting.
 
 **Gate:** Skip for S-tier plans. For M/L tier, activate sub-planners based on Phase 2 assessment.
 
@@ -149,9 +149,12 @@ For each activated domain:
 **🛑 Turn Boundary Fence:** Invoking the final sub-planner MUST be the last tool call of this turn.
 Stop calling tools. The system will deliver all specialist reports via reactive wakeup.
 
-**Wait:** Do NOT proceed to Phase 3 until ALL spawned sub-planner reports are received.
+**Wait:** Do NOT proceed to Phase 4 until ALL spawned sub-planner reports are received.
 
-### 3. Draft the Plan
+### 4. Draft the Plan
+
+> 🛑 **Conversational Chat Output Fence:**
+> During Phases 4, 5, and 6, the implementation plan is held STRICTLY in memory. Do NOT dump or print the draft plan markdown, sections, or steps into the conversational chat response. Chat output during these phases is strictly restricted to subagent model declarations (per `GEMINI.md §10`) and concise one-line status updates. The complete plan is written to disk and linked to the user only in Phase 7.
 
 > 📋 **Consolidate Specialist Fragments First:** Before drafting, incorporate the
 > sub-planner reports directly into their target plan sections. Do NOT re-derive
@@ -161,24 +164,40 @@ Stop calling tools. The system will deliver all specialist reports via reactive 
 > 📘 **Skill:** [`scaffold-plan`](../../.gemini/skills/scaffold-plan/SKILL.md) — load to extract the exact markdown template scaffolding.
 
 Draft the implementation plan adhering strictly to the extracted template from `scaffold-plan`:
-- **S-Tier Plans:** Write the plan directly to `<artifacts>/implementation_plan.md` using `write_to_file` (`IsArtifact: true`, `RequestFeedback: true`). Proceed directly to Phase 6.
+- **S-Tier Plans:** Write the plan directly to `<artifacts>/implementation_plan.md` using `write_to_file` (`IsArtifact: true`, `RequestFeedback: true`). Proceed directly to Phase 7.
 - **M/L-Tier Plans (In-Memory Draft):** Prepare the complete implementation plan markdown text in memory. **Do NOT call `write_to_file` to write `implementation_plan.md` to disk yet.** Holding the plan in memory prevents premature artifact feedback notifications and ensures unreviewed plans are not exposed to the user or Builder before architectural review.
 
 Incorporate the subagent reports' findings, Blast Radius Table, and recommended idioms directly into the drafted plan.
 
-### 4. Subagent Plan Review *(M/L tier — conditional)*
+### 5. Subagent Plan Review *(M/L tier — conditional)*
+
+> 🛑 **Conversational Chat Output Fence:**
+> During Phases 4, 5, and 6, the implementation plan is held STRICTLY in memory. Do NOT dump or print the draft plan markdown, sections, or steps into the conversational chat response. Chat output during these phases is strictly restricted to subagent model declarations (per `GEMINI.md §10`) and concise one-line status updates. The complete plan is written to disk and linked to the user only in Phase 7.
 
 **Gate:** Skip for S-tier plans (trivial scope, low blast radius). Always run for M/L tier.
 
-When running M/L-tier plans, submit the draft plan to the `plan-reviewer` subagent:
+**Path A: Multi-Agent Subagent Review (Standard)**
+When running M/L-tier plans in multi-agent mode, submit the draft plan to the `plan-reviewer` subagent:
 1. Load and follow the `plan-reviewer` skill (`global/skills/plan-reviewer/SKILL.md`).
 2. Call `define_subagent` if `plan_reviewer` is not yet defined.
 3. Call `invoke_subagent` adhering to the mandatory prompt contract:
-   - Pass the **complete draft plan markdown content** directly in the `Prompt` parameter.
-   - Include the target crate/module scope and specific review priorities.
-   - Include `Repository Workspace: <path>` (explicit workspace root path).
-   - Include boundary reminder: `"Confine all searches strictly to the repository workspace; never search parent or user directories."`
-   - Include report formatting reminder: `"Format findings strictly following the report template provided in your system prompt."`
+   - Format the `Prompt` using the canonical schema from `plan-reviewer §2`:
+     ```text
+     Repository Workspace: <path>
+     Target Scope: <crate/module path>
+     Review Cycle: <N> of 3
+     Review Priorities: <DRY, module cohesiveness, architectural harmony, API design>
+     Revision Notes: <"Initial Draft" (Cycle 1) | "Summary of adjustments addressing prior reviewer findings" (Cycle 2+)>
+
+     Negative Boundary Reminder:
+     Confine all searches strictly to the repository workspace; never search parent or user directories.
+
+     Report Formatting Reminder:
+     Format findings strictly following the report template provided in your system prompt.
+
+     Draft Plan Content:
+     <complete draft markdown text>
+     ```
    - Announce the model per `GEMINI.md §10` (`flash`).
 4. 🛑 **Turn Boundary Fence:** Calling `invoke_subagent` **MUST be the final tool call of this turn**.
    - Do NOT call `write_to_file` for `implementation_plan.md` or `task.md`.
@@ -186,22 +205,34 @@ When running M/L-tier plans, submit the draft plan to the `plan-reviewer` subage
    - Do NOT output "Think Phase Complete".
    - **Stop calling tools immediately** and yield the turn. The system will deliver the subagent's review report via reactive wakeup.
 
-### 5. Architect Assessment & Plan Revision
+**Path B: Single-Agent Inline Review (Graceful Fallback)**
+When `invoke_subagent` is unavailable, the Architect evaluates the in-memory draft directly against the 4 core design principles:
+1. **DRY & Domain Duplication:** Grep workspace to ensure proposed types, helpers, and algorithms do not duplicate existing code.
+2. **Module Cohesiveness:** Verify new files, structs, and functions are placed in appropriate domain boundaries.
+3. **Architectural Harmony:** Verify adherence to `coding-standard.md`, tracing conventions, and error types.
+4. **API Design Ergonomics:** Verify minimal public exposure, appropriate borrow semantics (`&str`), and complete error contracts.
+Record the evaluation in the plan's `### Review History & Verdict` table (`Reviewer: inline`, `Verdict: ✅ Approved`). If issues are found, revise the draft before proceeding to Phase 7.
 
-Maintain a **Revision Cycle Counter** (mental state) starting at 1. Upon receiving the reactive wakeup containing the Design Review Report, evaluate the review verdict:
+### 6. Architect Assessment & Plan Revision
 
-- **✅ Approved** (at any cycle) → Adopt the draft plan as final. Proceed to Phase 6.
+> 🛑 **Conversational Chat Output Fence:**
+> During Phases 4, 5, and 6, the implementation plan is held STRICTLY in memory. Do NOT dump or print the draft plan markdown, sections, or steps into the conversational chat response. Chat output during these phases is strictly restricted to subagent model declarations (per `GEMINI.md §10`) and concise one-line status updates. The complete plan is written to disk and linked to the user only in Phase 7.
+
+Track the current cycle using the `Review Cycle: [N] of 3` metadata present in the subagent invocation prompt, the report header, and the plan's `### Review History & Verdict` table. Upon receiving the reactive wakeup containing the `# Implementation Plan Design Review Report: <Plan Title>`, evaluate the review verdict:
+
+- **✅ Approved** (at any cycle) → Record verdict in `### Review History & Verdict`. Adopt the draft plan as final. Proceed to Phase 7.
 - **⚠️ Revisions Recommended** AND **cycle < 3**:
   1. Revise the in-memory draft plan addressing the report's Required Plan Adjustments.
-  2. Increment your Revision Cycle Counter.
-  3. Re-spawn `plan-reviewer` passing the full revised draft text and prepending "Revision Cycle [N] of 3" to the `Prompt`.
-  4. Apply the Turn Boundary Fence (Phase 4, step 4) and await the next wakeup.
+  2. Record adjustments in the plan's `### Review History & Verdict` table.
+  3. Re-spawn `plan-reviewer` passing the full revised draft text with `Review Cycle: [N+1] of 3` and revision notes in the canonical prompt schema.
+  4. Apply the Turn Boundary Fence (Phase 5, step 4) and await the next wakeup.
 - **⚠️ Revisions Recommended** AND **cycle = 3** (cap exhausted):
-  1. Append a `## ⚠️ Reviewer Findings (Unresolved)` section to the bottom of the drafted plan, listing the Required Plan Adjustments from the final report.
-  2. Adopt this annotated draft as final. Proceed to Phase 6.
+  1. Record final cycle in `### Review History & Verdict`.
+  2. Append a `## ⚠️ Reviewer Findings (Unresolved)` section to the bottom of the drafted plan, listing the Required Plan Adjustments from the final report for explicit user sign-off.
+  3. Adopt this annotated draft as final. Proceed to Phase 7.
 - **🛑 Major Rethink Required** (at any cycle) → Immediately stop the loop. Inform the user of the reviewer's structural concerns and recommend scope adjustment before proceeding.
 
-### 6. Finalize Plan, Sync & Pre-Flight Gate
+### 7. Finalize Plan, Sync & Pre-Flight Gate
 
 1. **Persist Implementation Plan:**
    - Write the finalized implementation plan to `<artifacts>/implementation_plan.md` using `write_to_file` (`IsArtifact: true`, `RequestFeedback: true`).
@@ -210,7 +241,7 @@ Maintain a **Revision Cycle Counter** (mental state) starting at 1. Upon receivi
 2. **Generate `task.md` from the plan:**
    - Read the plan file with `view_file`.
    - Extract the `### Plan Objectives` table rows from the plan (ID, Objective, Success Criteria, Steps columns).
-   - Extract all headings matching `### ComponentName` and `#### [NEW|MODIFY|DELETE|TEST] filename`.
+   - Extract all entries matching `Step N: [ACTION] filepath — [+|~|-] symbol (L##-##)`.
    - Write `task.md` to the same directory as the plan:
 
    ```markdown
@@ -247,13 +278,17 @@ Before requesting approval, verify these 8 critical fail-path checks:
    4. If mismatches → report and STOP.
 6. **🤖 Topological sort** — Global Execution Order is topologically sorted (Narrowing = bottom-up; Widening = top-down).
 7. **🧠 Plan Objectives check** — Verify that `### Plan Objectives` table is present, contains at least one data row, and each row maps to `task.md`.
-8. **🧠 Review Verdict** — The plan-reviewer subagent (Phase 4) returned ✅ Approved (or ⚠️ Revisions Recommended and revisions were applied).
+8. **🧠 Review Verdict** — Review verification passed under one of these valid terminal states:
+   - **S-Tier:** N/A (review skipped per tier gate).
+   - **Multi-Agent Approved:** `plan-reviewer` subagent returned `✅ Approved`.
+   - **Single-Agent Approved:** Inline review checklist verified and passed.
+   - **Cycle Cap Exhausted:** Reviewer returned `⚠️ Revisions Recommended` on Cycle 3, and all remaining items are explicitly documented in `## ⚠️ Reviewer Findings (Unresolved)` for user sign-off.
 
 > [!CAUTION]
 > All 8 checks MUST pass before requesting approval. If any fails, fix and re-check.
 
 > [!NOTE]
-> **Post-Approval:** Once approved, follow **GEMINI.md §6 Handoff Protocol** for the full Act cycle. After `/audit` passes, run `/update-doc` scoped to affected files, then summarize in `context.md`.
+> **Post-Approval:** Once approved, follow **GEMINI.md §5 Handoff Protocol** for the full Act cycle. After `/audit` passes, run `/update-doc` scoped to affected files, then summarize in `context.md`.
 
 End with:
 
@@ -262,3 +297,10 @@ End with:
 Do NOT proceed to implementation until the user explicitly approves.
 
 ## Rules
+
+1. **Planning Mode Gate:** No source code files may be created or edited during this workflow.
+2. **Subagent Reconnaissance Mandate:** Never plan M/L-tier changes without running `codebase-recon` to map blast radius and dependencies.
+3. **Intent-Based Sub-Planners:** Activate specialist sub-planners only when their specific technical domain is impacted.
+4. **In-Memory Draft Discipline:** M/L-tier plans MUST remain in memory throughout the review cycle. Never write unapproved drafts to disk.
+5. **Conversational Chat Output Fence:** Never output draft plan contents into the chat conversation. Chat output is restricted to model announcements and brief status updates.
+6. **Leak-Proof Review Verification:** Pre-Flight Check 8 must verify one of the 4 valid terminal states. Single-turn bypass is strictly prohibited.

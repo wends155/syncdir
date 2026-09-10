@@ -104,9 +104,9 @@ pub enum TrayExitReason {
 /// Initial state of a destination target for the system tray interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestinationState {
-    pub path: PathBuf,
-    pub is_online: ConnectivityState,
-    pub resolved_unc: Option<PathBuf>,
+    path: PathBuf,
+    is_online: ConnectivityState,
+    resolved_unc: Option<PathBuf>,
     display_label: String,
 }
 
@@ -131,6 +131,24 @@ impl DestinationState {
             None => self.path.display().to_string(),
         };
         self
+    }
+
+    /// Retrieve the destination path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Retrieve the online connectivity status.
+    #[must_use]
+    pub fn is_online(&self) -> ConnectivityState {
+        self.is_online
+    }
+
+    /// Retrieve the resolved alternate UNC path, if any.
+    #[must_use]
+    pub fn resolved_unc(&self) -> Option<&Path> {
+        self.resolved_unc.as_deref()
     }
 
     /// Retrieve the precomputed user-facing display label for the destination.
@@ -246,19 +264,6 @@ impl TrayState {
         changed
     }
 
-    /// Legacy boolean updater for backward compatibility.
-    #[deprecated(
-        since = "0.1.14",
-        note = "use update_watcher_status with ConnectivityState and WatcherState"
-    )]
-    pub fn update_watcher_status_bool(
-        &mut self,
-        source_online: bool,
-        watcher_active: bool,
-    ) -> bool {
-        self.update_watcher_status(source_online.into(), watcher_active.into())
-    }
-
     /// Set an optional scan notice (e.g. "Partial Scan (N skipped)").
     pub fn set_scan_notice(&mut self, notice: Option<String>) -> bool {
         let changed = self.scan_notice != notice;
@@ -329,35 +334,39 @@ impl TrayState {
 /// Display a native Windows About modal dialog box containing version, description, copyright, and URL.
 #[cfg(target_os = "windows")]
 fn show_about_dialog() {
-    use std::os::windows::ffi::OsStrExt;
-    let title: Vec<u16> = std::ffi::OsStr::new("About syncdir\0")
-        .encode_wide()
-        .collect();
-    let msg_text = format!(
-        "syncdir v{} — Windows background folder synchronization daemon\n{}\n{}\0",
-        env!("CARGO_PKG_VERSION"),
-        crate::COPYRIGHT,
-        env!("CARGO_PKG_REPOSITORY")
-    );
-    let text: Vec<u16> = std::ffi::OsStr::new(&msg_text).encode_wide().collect();
-    // SAFETY: MessageBoxW is a standard Win32 API function. Passing null hwnd and valid
-    // null-terminated wide character array pointers is safe and opens a native modal dialog.
-    unsafe {
-        unsafe extern "system" {
-            fn MessageBoxW(
-                hwnd: *mut std::ffi::c_void,
-                text: *const u16,
-                caption: *const u16,
-                utype: u32,
-            ) -> i32;
-        }
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            0x00000040,
-        ); // MB_OK | MB_ICONINFORMATION
-    }
+    let _ = std::thread::Builder::new()
+        .name("about-dialog".to_string())
+        .spawn(|| {
+            use std::os::windows::ffi::OsStrExt;
+            let title: Vec<u16> = std::ffi::OsStr::new("About syncdir\0")
+                .encode_wide()
+                .collect();
+            let msg_text = format!(
+                "syncdir v{} — Windows background folder synchronization daemon\n{}\n{}\0",
+                env!("CARGO_PKG_VERSION"),
+                crate::COPYRIGHT,
+                env!("CARGO_PKG_REPOSITORY")
+            );
+            let text: Vec<u16> = std::ffi::OsStr::new(&msg_text).encode_wide().collect();
+            // SAFETY: MessageBoxW is a standard Win32 API function. Passing null hwnd and valid
+            // null-terminated wide character array pointers is safe and opens a native modal dialog.
+            unsafe {
+                unsafe extern "system" {
+                    fn MessageBoxW(
+                        hwnd: *mut std::ffi::c_void,
+                        text: *const u16,
+                        caption: *const u16,
+                        utype: u32,
+                    ) -> i32;
+                }
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    text.as_ptr(),
+                    title.as_ptr(),
+                    0x00000040,
+                ); // MB_OK | MB_ICONINFORMATION
+            }
+        });
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -366,30 +375,36 @@ fn show_about_dialog() {}
 /// Display a native Windows Error modal dialog box.
 #[cfg(target_os = "windows")]
 fn show_error_dialog(title_str: &str, msg_str: &str) {
-    use std::os::windows::ffi::OsStrExt;
-    let title_wide: Vec<u16> = std::ffi::OsStr::new(&format!("{}\0", title_str))
-        .encode_wide()
-        .collect();
-    let msg_wide: Vec<u16> = std::ffi::OsStr::new(&format!("{}\0", msg_str))
-        .encode_wide()
-        .collect();
-    // SAFETY: MessageBoxW is a standard Win32 API function.
-    unsafe {
-        unsafe extern "system" {
-            fn MessageBoxW(
-                hwnd: *mut std::ffi::c_void,
-                text: *const u16,
-                caption: *const u16,
-                utype: u32,
-            ) -> i32;
-        }
-        MessageBoxW(
-            std::ptr::null_mut(),
-            msg_wide.as_ptr(),
-            title_wide.as_ptr(),
-            0x00000010,
-        ); // MB_OK | MB_ICONERROR
-    }
+    let title_owned = title_str.to_string();
+    let msg_owned = msg_str.to_string();
+    let _ = std::thread::Builder::new()
+        .name("error-dialog".to_string())
+        .spawn(move || {
+            use std::os::windows::ffi::OsStrExt;
+            let title_wide: Vec<u16> = std::ffi::OsStr::new(&format!("{}\0", title_owned))
+                .encode_wide()
+                .collect();
+            let msg_wide: Vec<u16> = std::ffi::OsStr::new(&format!("{}\0", msg_owned))
+                .encode_wide()
+                .collect();
+            // SAFETY: MessageBoxW is a standard Win32 API function.
+            unsafe {
+                unsafe extern "system" {
+                    fn MessageBoxW(
+                        hwnd: *mut std::ffi::c_void,
+                        text: *const u16,
+                        caption: *const u16,
+                        utype: u32,
+                    ) -> i32;
+                }
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    msg_wide.as_ptr(),
+                    title_wide.as_ptr(),
+                    0x00000010,
+                ); // MB_OK | MB_ICONERROR
+            }
+        });
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -608,13 +623,24 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
                 let handler_clone = self.handler.clone();
                 let proxy_clone = self.reload_proxy.clone();
                 let reloading_flag = self.is_reloading.clone();
-                let _ = std::thread::Builder::new()
+                match std::thread::Builder::new()
                     .name("config-reload".to_string())
                     .spawn(move || {
                         let res = handler_clone.on_reload_config();
                         reloading_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                         let _ = proxy_clone.send_event(UserEvent::ConfigReloadResult(res));
-                    });
+                    }) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.is_reloading
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        tracing::error!(error = %e, "Failed to spawn config-reload background thread");
+                        show_error_dialog(
+                            "Reload Error",
+                            &format!("Failed to spawn reload thread:\n\n{e}"),
+                        );
+                    }
+                }
             } else {
                 tracing::warn!(
                     "Configuration reload already in progress; ignoring duplicate request."
@@ -714,7 +740,8 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
             tracing::warn!(error = %e, "Failed to update tray tooltip");
         }
 
-        if self.last_icon_status != Some(status) {
+        let icon_changed = self.last_icon_status != Some(status);
+        if icon_changed {
             match get_cached_icon(status) {
                 Ok(new_icon) => match self.tray_icon.set_icon(Some(new_icon)) {
                     Ok(()) => self.last_icon_status = Some(status),
@@ -730,11 +757,19 @@ impl<H: TrayActionHandler + ?Sized> TrayController<H> {
             }
         }
 
-        tracing::info!(
-            status = ?status,
-            online_count = self.state.online_dest_count(),
-            "Tray status updated"
-        );
+        if icon_changed {
+            tracing::info!(
+                status = ?status,
+                online_count = self.state.online_dest_count(),
+                "Tray status updated"
+            );
+        } else {
+            tracing::trace!(
+                status = ?status,
+                online_count = self.state.online_dest_count(),
+                "Tray status unchanged"
+            );
+        }
     }
 
     /// Retrieve the current exit reason.
@@ -803,6 +838,35 @@ pub fn run_tray<H: TrayActionHandler + ?Sized>(
         .map_err(|e| SyncError::tray_with_source("Event loop error", e))?;
 
     Ok(exit_reason.get())
+}
+
+/// Wrapper around the native UI event loop to encapsulate windowing dependencies.
+pub struct TrayEventLoop {
+    inner: winit::event_loop::EventLoop<UserEvent>,
+}
+
+impl TrayEventLoop {
+    /// Create a new tray event loop.
+    pub fn new() -> Result<Self, SyncError> {
+        let inner = winit::event_loop::EventLoopBuilder::<UserEvent>::with_user_event()
+            .build()
+            .map_err(|e| SyncError::tray_with_source("Failed to create event loop", e))?;
+        Ok(Self { inner })
+    }
+
+    /// Create an event proxy for dispatching events from background threads.
+    pub fn create_proxy(&self) -> winit::event_loop::EventLoopProxy<UserEvent> {
+        self.inner.create_proxy()
+    }
+
+    /// Run the tray event loop, blocking the main thread.
+    pub fn run<H: TrayActionHandler + ?Sized>(
+        self,
+        destinations: Vec<DestinationState>,
+        handler: Arc<H>,
+    ) -> Result<TrayExitReason, SyncError> {
+        run_tray(self.inner, destinations, handler)
+    }
 }
 
 #[cfg(test)]
@@ -906,15 +970,6 @@ mod tests {
             state.tooltip_text(),
             "syncdir — Src: Online | Dests: 0/0 Online"
         );
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_tray_state_update_watcher_status_bool_shim() {
-        let mut state = TrayState::new(vec![true]);
-        assert!(state.update_watcher_status_bool(true, true));
-        assert_eq!(state.source_connectivity(), ConnectivityState::Online);
-        assert_eq!(state.watcher_state(), WatcherState::Active);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::error::SyncError;
 
 use super::delta::DirtyBlockRange;
 use super::path_safety::{
-    is_reparse_or_symlink_meta, is_safe_relative_path, verify_destination_not_reparse,
+    is_reparse_or_symlink_meta, is_safe_relative_path, verify_destination_not_reparse_cached,
     verify_source_not_reparse,
 };
 use super::scanner::scan_dir;
@@ -118,12 +118,15 @@ pub trait SyncStatusObserver: Send + Sync + 'static {
 
 /// Core sync execution contract. Implemented by the delta sync engine.
 pub trait SyncEngine: Send + Sync {
-    /// Synchronize a single file from source to destination.
-    fn sync_file(&self, path: &Path) -> Result<(), SyncError>;
     /// Synchronize a single file with a reusable scratch buffer.
-    fn sync_file_buffered(&self, path: &Path, _scratch: &mut [u8]) -> Result<(), SyncError> {
-        self.sync_file(path)
+    fn sync_file_buffered(&self, path: &Path, scratch: &mut [u8]) -> Result<(), SyncError>;
+
+    /// Synchronize a single file from source to destination.
+    fn sync_file(&self, path: &Path) -> Result<(), SyncError> {
+        let mut scratch = vec![0u8; 64 * 1024];
+        self.sync_file_buffered(path, &mut scratch)
     }
+
     /// Synchronize a file to a specific destination directory with a reusable scratch buffer.
     ///
     /// Required method: implementors must handle the `dest_dir` parameter.
@@ -143,30 +146,28 @@ pub trait SyncEngine: Send + Sync {
     fn prune_archive(&self, _dest_dir: &Path) -> Result<(), SyncError> {
         Ok(())
     }
-    /// Perform a full directory scan and sync all changed files cooperatively cancellable.
+    /// Run a full scan and sync cycle that can be interrupted by the `cancel` signal.
     fn run_cancellable_full_scan(
         &self,
-        cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ScanOutcome, SyncError>;
+        dest_dir: &Path,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ScanOutcome, SyncError> {
+        let _ = dest_dir;
+        Ok(ScanOutcome::Success { synced: 0 })
+    }
 
-    /// Perform a full directory scan and sync all changed files.
-    ///
-    /// Backward-compatible default delegates to static never-cancelled token.
-    fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+    /// Perform a full directory scan on `dest_dir` and sync all changed files.
+    fn run_full_scan(&self, dest_dir: &Path) -> Result<ScanOutcome, SyncError> {
         static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        self.run_cancellable_full_scan(&NEVER_CANCELLED)
+        self.run_cancellable_full_scan(dest_dir, &NEVER_CANCELLED)
     }
 }
 
-/// Structured metadata snapshot for type-safe file comparison.
-///
-/// Prevents parameter transposition bugs in metadata comparisons.
+/// Snapshot of a file's size and modification timestamp for drift detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileMetadataSnapshot {
-    /// File size in bytes.
     pub size: i64,
-    /// Last modified time as milliseconds since UNIX epoch.
     pub modified_epoch_millis: i64,
 }
 
@@ -177,6 +178,14 @@ impl FileMetadataSnapshot {
             size,
             modified_epoch_millis,
         }
+    }
+
+    /// Compute snapshot from `std::fs::Metadata`
+    pub fn from_metadata(meta: &std::fs::Metadata) -> Result<Self, SyncError> {
+        Ok(Self {
+            size: meta.len() as i64,
+            modified_epoch_millis: safe_modified_millis(meta)?,
+        })
     }
 }
 
@@ -191,7 +200,10 @@ pub fn is_metadata_up_to_date_raw(
         && record.file_size == src.size
         && record.last_modified == src.modified_epoch_millis
         && dest.size == src.size
-        && (dest.modified_epoch_millis - src.modified_epoch_millis).abs() <= 2000
+        && dest
+            .modified_epoch_millis
+            .abs_diff(src.modified_epoch_millis)
+            <= 2000
     {
         return true;
     }
@@ -204,6 +216,7 @@ pub struct LocalSyncEngine<S: HashStore> {
     pub(crate) config: TargetSyncConfig,
     pub(crate) resolved_dest: Option<PathBuf>,
     pub(crate) dirty_range: std::sync::Mutex<DirtyBlockRange>,
+    pub(crate) verified_dirs: std::sync::Mutex<HashSet<PathBuf>>,
 }
 
 #[derive(Debug)]
@@ -212,7 +225,6 @@ pub(crate) struct FileSyncTask<'a> {
     pub src_path: &'a Path,
     pub dest_path: &'a Path,
     pub dest_dir: &'a Path,
-    #[allow(dead_code)]
     pub src_size: i64,
     pub src_mod: i64,
     pub cached_id: Option<i64>,
@@ -228,6 +240,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             config,
             resolved_dest: None,
             dirty_range: std::sync::Mutex::new(DirtyBlockRange::new(block_size)),
+            verified_dirs: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -240,6 +253,17 @@ impl<S: HashStore> LocalSyncEngine<S> {
     /// Get the pre-resolved destination path if configured.
     pub fn resolved_dest(&self) -> Option<&Path> {
         self.resolved_dest.as_deref()
+    }
+
+    /// Perform a full directory scan on default or pre-resolved destination.
+    pub fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+        static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let dest = self
+            .resolved_dest
+            .as_deref()
+            .unwrap_or_else(|| self.config.dest_dir());
+        self.run_cancellable_full_scan_impl(dest, &NEVER_CANCELLED)
     }
 
     /// Synchronize a file or directory tree to a specific destination directory (primary or alternate).
@@ -303,7 +327,13 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
         verify_source_not_reparse(self.config.source_dir(), rel_path)?;
         if sym_meta.is_dir() {
-            let _ = verify_destination_not_reparse(dest_dir, rel_path)?;
+            let _ = {
+                let mut cache = self
+                    .verified_dirs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                verify_destination_not_reparse_cached(dest_dir, rel_path, &mut cache)?
+            };
             fs::create_dir_all(&dest_path)?;
             let mut dir_files = HashSet::new();
             let mut scan_complete = true;
@@ -320,7 +350,13 @@ impl<S: HashStore> LocalSyncEngine<S> {
             return Ok(None);
         }
 
-        let dest_meta = verify_destination_not_reparse(dest_dir, rel_path)?;
+        let dest_meta = {
+            let mut cache = self
+                .verified_dirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            verify_destination_not_reparse_cached(dest_dir, rel_path, &mut cache)?
+        };
 
         let src_size = sym_meta.len() as i64;
         let src_mod = safe_modified_millis(&sym_meta)?;
@@ -409,16 +445,17 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 
     fn run_cancellable_full_scan(
         &self,
+        dest_dir: &Path,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ScanOutcome, SyncError> {
-        self.run_cancellable_full_scan_impl(cancel)
+        self.run_cancellable_full_scan_impl(dest_dir, cancel)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, TargetSyncConfig};
     use crate::db::{MockHashStore, SqliteHashStore};
     use pretty_assertions::assert_eq;
     use std::fs::OpenOptions;
@@ -505,8 +542,9 @@ mod tests {
         fs::write(source.join(file_name), b"test content").unwrap();
 
         let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, config);
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // First sync
         engine.sync_file(Path::new(file_name)).unwrap();
@@ -537,8 +575,9 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let config = Config::test_default(source.clone(), dest.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let store = MockHashStore::new();
-        let engine = LocalSyncEngine::new(store, config);
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // sync_file on a directory path should create the folder on dest and return Ok(())
         engine.sync_file(Path::new("new_folder")).unwrap();
@@ -559,8 +598,11 @@ mod tests {
             .block_sync_threshold_bytes(4)
             .block_size_bytes(4)
             .build();
-        let store = SqliteHashStore::new(&db_path, &config).unwrap();
-        let engine = LocalSyncEngine::new(store, config);
+        let store =
+            SqliteHashStore::new(&db_path, crate::db::StoreConfig::try_from(&config).unwrap())
+                .unwrap();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(store, target_cfg);
 
         // 12 bytes = 3 blocks of 4 bytes
         fs::write(source.join("file.bin"), b"AAAABBBBCCCC").unwrap();
@@ -606,7 +648,8 @@ mod tests {
             .block_size_bytes(512)
             .block_sync_threshold_bytes(1024)
             .build();
-        let engine = LocalSyncEngine::new(MockHashStore::new(), config);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         std::fs::write(src.join("file.bin"), vec![0xEEu8; 2048]).unwrap();
         let mut scratch = vec![0u8; 512];
@@ -646,7 +689,8 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
         let config = Config::test_default(src.clone(), dst.clone());
-        let engine = LocalSyncEngine::new(MockHashStore::new(), config);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
         std::fs::write(src.join("target.txt"), b"content").unwrap();
         let link_target = temp.path().join("link_target");
         std::fs::create_dir_all(&link_target).unwrap();
@@ -671,8 +715,9 @@ mod tests {
         fs::write(src.join("hello.txt"), b"test pre-resolved dest").unwrap();
 
         let config = Config::test_default(src, unreachable_dst);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine =
-            LocalSyncEngine::new(MockHashStore::new(), config).with_resolved_dest(&alt_dst);
+            LocalSyncEngine::new(MockHashStore::new(), target_cfg).with_resolved_dest(&alt_dst);
         assert_eq!(engine.resolved_dest(), Some(alt_dst.as_path()));
 
         let outcome = engine.run_full_scan().unwrap();
