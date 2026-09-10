@@ -44,6 +44,29 @@ impl ValidationKind {
     }
 }
 
+/// Subsystem error type for directory watching and filesystem notification failures.
+#[derive(Debug, thiserror::Error)]
+pub enum WatcherError {
+    /// Failure originated from the underlying `notify` watcher.
+    #[error(transparent)]
+    Notify(#[from] notify::Error),
+
+    /// The watched path does not exist.
+    #[error("Watched path not found: {0}")]
+    PathNotFound(std::path::PathBuf),
+
+    /// Watcher event notification channel disconnected.
+    #[error("Watcher channel disconnected: {0}")]
+    ChannelDisconnected(String),
+
+    /// Generic watcher error with optional underlying cause.
+    #[error("Watcher error: {0}")]
+    Other(
+        String,
+        #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
+    ),
+}
+
 /// All fallible operations in syncdir return this error type.
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -96,11 +119,8 @@ pub enum SyncError {
     ),
 
     /// File watcher failure.
-    #[error("Watcher error: {0}")]
-    Watcher(
-        String,
-        #[source] Option<Box<dyn std::error::Error + Send + Sync>>,
-    ),
+    #[error(transparent)]
+    Watcher(#[from] WatcherError),
 
     /// System tray creation or event loop failure.
     #[error("Tray error: {0}")]
@@ -129,7 +149,7 @@ impl From<rusqlite::Error> for SyncError {
 
 impl From<notify::Error> for SyncError {
     fn from(err: notify::Error) -> Self {
-        SyncError::Watcher(err.to_string(), Some(Box::new(err)))
+        SyncError::Watcher(WatcherError::Notify(err))
     }
 }
 
@@ -364,7 +384,7 @@ impl SyncError {
 
     /// Create a `SyncError::Watcher` without a source cause.
     pub fn watcher(msg: impl Into<String>) -> Self {
-        SyncError::Watcher(msg.into(), None)
+        SyncError::Watcher(WatcherError::Other(msg.into(), None))
     }
 
     /// Create a `SyncError::Watcher` with an underlying source error cause.
@@ -372,7 +392,7 @@ impl SyncError {
         msg: impl Into<String>,
         source: E,
     ) -> Self {
-        SyncError::Watcher(msg.into(), Some(Box::new(source)))
+        SyncError::Watcher(WatcherError::Other(msg.into(), Some(Box::new(source))))
     }
 
     /// Create a `SyncError::Tray` without a source cause.
@@ -517,7 +537,31 @@ mod tests {
     fn test_from_notify_error() {
         let notify_err = notify::Error::generic("watch error");
         let sync_err: SyncError = notify_err.into();
-        assert!(matches!(sync_err, SyncError::Watcher(_, Some(_))));
+        assert!(matches!(
+            sync_err,
+            SyncError::Watcher(WatcherError::Notify(_))
+        ));
+    }
+
+    #[test]
+    fn test_from_watcher_error_for_sync_error_causal_chain() {
+        use crate::error::{SyncError, WatcherError};
+        use std::error::Error;
+
+        let path = std::path::PathBuf::from("C:\\missing\\path");
+        let w_err = WatcherError::PathNotFound(path.clone());
+        let sync_err: SyncError = w_err.into();
+
+        assert!(matches!(
+            sync_err,
+            SyncError::Watcher(WatcherError::PathNotFound(_))
+        ));
+        assert!(sync_err.to_string().contains("Watched path not found"));
+
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let sync_err2 = SyncError::watcher_with_source("IO failure during watch", io_err);
+        assert!(sync_err2.source().is_some());
+        assert!(sync_err2.to_string().contains("IO failure during watch"));
     }
 
     #[test]

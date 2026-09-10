@@ -4,6 +4,7 @@
 //! to watch the source directory and feed `SyncCommand`s to the sync worker.
 
 use crate::error::SyncError;
+pub use crate::error::WatcherError;
 use crate::sync::SyncCommand;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
