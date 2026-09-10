@@ -105,6 +105,13 @@ impl TargetSyncConfig {
         self.block_size_bytes
     }
 
+    /// Returns the configured block size as a `NonZeroU64`, defaulting to 64KB if zero.
+    #[must_use]
+    pub fn block_size_nonzero(&self) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(self.block_size_bytes)
+            .unwrap_or_else(|| std::num::NonZeroU64::new(64 * 1024).expect("64KB is non-zero"))
+    }
+
     /// Block sync threshold in bytes getter.
     pub fn block_sync_threshold_bytes(&self) -> u64 {
         self.block_sync_threshold_bytes
@@ -1081,6 +1088,39 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_target_sync_config_block_size_nonzero() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dest = temp.path().join("dest");
+
+        let target_zero = TargetSyncConfig {
+            source_dir: src.clone(),
+            dest_dir: TargetDir::from(dest.clone()),
+            block_size_bytes: 0,
+            block_sync_threshold_bytes: 1024,
+            verify_writes: true,
+            verification_mode: VerificationMode::Full,
+            debounce_seconds: 3,
+            retry_interval_seconds: 10,
+            propagate_deletions: true,
+        };
+        assert_eq!(target_zero.block_size_nonzero().get(), 64 * 1024);
+
+        let target_custom = TargetSyncConfig {
+            source_dir: src,
+            dest_dir: TargetDir::from(dest),
+            block_size_bytes: 128 * 1024,
+            block_sync_threshold_bytes: 1024,
+            verify_writes: true,
+            verification_mode: VerificationMode::Full,
+            debounce_seconds: 3,
+            retry_interval_seconds: 10,
+            propagate_deletions: true,
+        };
+        assert_eq!(target_custom.block_size_nonzero().get(), 128 * 1024);
+    }
 
     #[test]
     fn test_config_validation_valid() {
