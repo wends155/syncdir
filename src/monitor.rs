@@ -240,6 +240,43 @@ impl DirectoryWatcher {
     }
 }
 
+/// Abstraction for filesystem watchers that observe directory changes.
+pub trait FileWatcher: Send + 'static {
+    /// Returns true if the watcher is actively monitoring filesystem events.
+    fn is_watching(&self) -> bool;
+}
+
+impl FileWatcher for DirectoryWatcher {
+    fn is_watching(&self) -> bool {
+        true
+    }
+}
+
+/// Factory trait for creating filesystem watchers.
+pub trait WatcherFactory: Send + Sync + 'static {
+    /// Creates a new filesystem watcher monitoring `source_dir` and sending commands to `tx`.
+    fn create_watcher(
+        &self,
+        source_dir: &Path,
+        tx: Sender<SyncCommand>,
+    ) -> Result<Box<dyn FileWatcher>, SyncError>;
+}
+
+/// Default factory creating a `DirectoryWatcher` backed by notify.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecommendedWatcherFactory;
+
+impl WatcherFactory for RecommendedWatcherFactory {
+    fn create_watcher(
+        &self,
+        source_dir: &Path,
+        tx: Sender<SyncCommand>,
+    ) -> Result<Box<dyn FileWatcher>, SyncError> {
+        let watcher = DirectoryWatcher::start(source_dir, tx)?;
+        Ok(Box::new(watcher))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +368,50 @@ mod tests {
 
         let cmd = rx.try_recv().expect("Should have received a SyncCommand");
         assert_eq!(cmd, SyncCommand::TriggerFullScan);
+    }
+
+    #[test]
+    fn test_file_watcher_trait_mockability() {
+        use crate::error::SyncError;
+        use crate::monitor::{FileWatcher, WatcherFactory};
+        use crate::sync::SyncCommand;
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::Sender;
+
+        struct MockWatcher {
+            active: Arc<AtomicBool>,
+        }
+        impl FileWatcher for MockWatcher {
+            fn is_watching(&self) -> bool {
+                self.active.load(Ordering::SeqCst)
+            }
+        }
+
+        struct MockWatcherFactory {
+            active: Arc<AtomicBool>,
+        }
+        impl WatcherFactory for MockWatcherFactory {
+            fn create_watcher(
+                &self,
+                _source_dir: &Path,
+                _tx: Sender<SyncCommand>,
+            ) -> Result<Box<dyn FileWatcher>, SyncError> {
+                Ok(Box::new(MockWatcher {
+                    active: self.active.clone(),
+                }))
+            }
+        }
+
+        let active = Arc::new(AtomicBool::new(true));
+        let factory = MockWatcherFactory {
+            active: active.clone(),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let watcher = factory
+            .create_watcher(Path::new("C:\\test"), tx)
+            .expect("mock watcher");
+        assert!(watcher.is_watching());
     }
 }

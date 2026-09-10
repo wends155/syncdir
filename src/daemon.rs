@@ -86,6 +86,23 @@ impl SyncEngineFactory for SqliteEngineFactory {
     }
 }
 
+fn join_thread_and_log_panic(handle: std::thread::JoinHandle<()>, thread_name: &str) {
+    if let Err(panic_payload) = handle.join() {
+        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "unknown panic payload"
+        };
+        tracing::error!(
+            panic = %msg,
+            thread = %thread_name,
+            "Thread terminated unexpectedly with panic"
+        );
+    }
+}
+
 /// Orchestrator for syncdir background sync workers, file watcher, and central command broadcaster.
 #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
 pub struct SyncDaemon {
@@ -96,6 +113,7 @@ pub struct SyncDaemon {
     shutdown_flag: Arc<AtomicBool>,
     cancellation: Arc<AtomicBool>,
     command_tx: Sender<SyncCommand>,
+    watcher_active: Arc<AtomicBool>,
 }
 
 impl SyncDaemon {
@@ -170,81 +188,98 @@ impl SyncDaemon {
         source_connectivity: crate::sync::SourceConnectivityTracker,
         shutdown_flag: Arc<AtomicBool>,
         observer: Option<Arc<dyn SyncStatusObserver>>,
+        watcher_factory: Arc<dyn crate::monitor::WatcherFactory>,
+        watcher_active: Arc<AtomicBool>,
     ) -> Result<JoinHandle<()>, SyncError> {
+        let initial_online = config.source_dir().exists() && config.source_dir().is_dir();
+        source_connectivity.set_online(initial_online);
+
+        let (initial_watcher, is_initially_active) = if initial_online {
+            match watcher_factory.create_watcher(config.source_dir(), command_tx.clone()) {
+                Ok(w) => {
+                    let active = w.is_watching();
+                    let _ = command_tx.send(SyncCommand::TriggerFullScan);
+                    (Some(w), active)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start directory watcher: {e}");
+                    (None, false)
+                }
+            }
+        } else {
+            (None, false)
+        };
+
+        watcher_active.store(is_initially_active, Ordering::SeqCst);
+        if let Some(ref obs) = observer {
+            obs.on_watcher_status_change(initial_online.into(), is_initially_active.into());
+        }
+
         std::thread::Builder::new()
             .name("watcher-coordinator".to_string())
             .spawn(move || {
-                let mut watcher: Option<crate::monitor::DirectoryWatcher> = None;
+                let mut watcher: Option<Box<dyn crate::monitor::FileWatcher>> = initial_watcher;
                 let retry_interval =
                     std::time::Duration::from_secs(config.retry_interval_seconds());
-                let mut last_status_check: Option<std::time::Instant> = None;
-
-                let mut last_sent_online = None;
-                let mut last_sent_active = None;
+                let mut last_sent_online = Some(initial_online);
+                let mut last_sent_active = Some(is_initially_active);
 
                 while !shutdown_flag.load(Ordering::Relaxed) {
-                    let now = std::time::Instant::now();
-                    let should_check = match last_status_check {
-                        None => true,
-                        Some(last) => now.duration_since(last) >= retry_interval,
-                    };
-
-                    if should_check {
-                        last_status_check = Some(now);
-                        let current_source = config.source_dir();
-                        let is_online = current_source.exists() && current_source.is_dir();
-                        source_connectivity.set_online(is_online);
-
-                        let mut watcher_active = false;
-                        if is_online {
-                            if watcher.is_none() {
-                                tracing::info!(
-                                    "Source directory online. Starting directory watcher..."
-                                );
-                                match crate::monitor::DirectoryWatcher::start(
-                                    config.source_dir(),
-                                    command_tx.clone(),
-                                ) {
-                                    Ok(w) => {
-                                        watcher = Some(w);
-                                        watcher_active = true;
-                                        // Trigger catch-up full scan on source reconnection/startup
-                                        tracing::info!(
-                                            "Triggering full scan after source directory came online."
-                                        );
-                                        let _ = command_tx.send(SyncCommand::TriggerFullScan);
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to start directory watcher: {e}");
-                                        watcher_active = false;
-                                    }
-                                }
-                            } else {
-                                watcher_active = true;
-                            }
-                        } else if watcher.is_some() {
-                            tracing::warn!(
-                                "Source directory went offline. Dropping directory watcher."
-                            );
-                            watcher = None;
+                    let check_interval = std::time::Duration::from_millis(100);
+                    let mut elapsed = std::time::Duration::ZERO;
+                    while elapsed < retry_interval {
+                        if shutdown_flag.load(Ordering::Relaxed) {
+                            return;
                         }
-
-                        if last_sent_online != Some(is_online)
-                            || last_sent_active != Some(watcher_active)
-                        {
-                            last_sent_online = Some(is_online);
-                            last_sent_active = Some(watcher_active);
-                            if let Some(ref obs) = observer {
-                                obs.on_watcher_status_change(is_online.into(), watcher_active.into());
-                            }
-                        }
+                        std::thread::sleep(check_interval);
+                        elapsed += check_interval;
                     }
 
-                    for _ in 0..10 {
-                        if shutdown_flag.load(Ordering::Relaxed) {
-                            break;
+                    let current_source = config.source_dir();
+                    let is_online = current_source.exists() && current_source.is_dir();
+                    source_connectivity.set_online(is_online);
+
+                    let mut active = false;
+                    if is_online {
+                        if watcher.is_none() {
+                            tracing::info!(
+                                "Source directory online. Starting directory watcher..."
+                            );
+                            match watcher_factory
+                                .create_watcher(config.source_dir(), command_tx.clone())
+                            {
+                                Ok(w) => {
+                                    active = w.is_watching();
+                                    watcher = Some(w);
+                                    // Trigger catch-up full scan on source reconnection
+                                    tracing::info!(
+                                        "Triggering full scan after source directory came online."
+                                    );
+                                    let _ = command_tx.send(SyncCommand::TriggerFullScan);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to start directory watcher: {e}");
+                                    active = false;
+                                }
+                            }
+                        } else {
+                            active = watcher.as_ref().map(|w| w.is_watching()).unwrap_or(true);
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    } else if watcher.is_some() {
+                        tracing::warn!(
+                            "Source directory went offline. Dropping directory watcher."
+                        );
+                        watcher = None;
+                    }
+
+                    watcher_active.store(active, Ordering::SeqCst);
+
+                    if last_sent_online != Some(is_online) || last_sent_active != Some(active) {
+                        last_sent_online = Some(is_online);
+                        last_sent_active = Some(active);
+                        if let Some(ref obs) = observer {
+                            obs.on_watcher_status_change(is_online.into(), active.into());
+                        }
                     }
                 }
             })
@@ -339,11 +374,51 @@ impl SyncDaemon {
         observer: Option<Arc<dyn SyncStatusObserver>>,
         resolver: Arc<dyn crate::net::NetworkResolver>,
     ) -> Result<Self, SyncError> {
+        Self::start_with_all_services(
+            factory,
+            config,
+            app_dir,
+            observer,
+            resolver,
+            Arc::new(crate::monitor::RecommendedWatcherFactory),
+        )
+    }
+
+    /// Starts all sync workers using standard SqliteEngineFactory and custom resolver and watcher factory.
+    #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
+    pub fn start_with_services(
+        config: Config,
+        app_dir: &Path,
+        observer: Option<Arc<dyn SyncStatusObserver>>,
+        resolver: Arc<dyn crate::net::NetworkResolver>,
+        watcher_factory: Arc<dyn crate::monitor::WatcherFactory>,
+    ) -> Result<Self, SyncError> {
+        Self::start_with_all_services(
+            SqliteEngineFactory,
+            config,
+            app_dir,
+            observer,
+            resolver,
+            watcher_factory,
+        )
+    }
+
+    /// Starts all sync workers using custom engine factory, resolver, and watcher factory.
+    #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
+    pub fn start_with_all_services<F: SyncEngineFactory>(
+        factory: F,
+        config: Config,
+        app_dir: &Path,
+        observer: Option<Arc<dyn SyncStatusObserver>>,
+        resolver: Arc<dyn crate::net::NetworkResolver>,
+        watcher_factory: Arc<dyn crate::monitor::WatcherFactory>,
+    ) -> Result<Self, SyncError> {
         config.validate()?;
         Self::validate_target_loops(&config, resolver.as_ref())?;
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::new(AtomicBool::new(false));
+        let watcher_active = Arc::new(AtomicBool::new(false));
         let mut worker_handles = Vec::new();
 
         let source_connectivity = crate::sync::SourceConnectivityTracker::new(false);
@@ -386,6 +461,8 @@ impl SyncDaemon {
             source_connectivity,
             shutdown_flag.clone(),
             observer,
+            watcher_factory,
+            watcher_active.clone(),
         )?;
 
         // Spawn central broadcaster thread
@@ -400,6 +477,7 @@ impl SyncDaemon {
             shutdown_flag,
             cancellation,
             command_tx: tx,
+            watcher_active,
         })
     }
 
@@ -413,9 +491,9 @@ impl SyncDaemon {
         self.handle().trigger_full_scan()
     }
 
-    /// Access the command sender for broadcasting commands into the daemon.
-    pub fn command_tx(&self) -> Sender<SyncCommand> {
-        self.command_tx.clone()
+    /// Returns true if the directory watcher is currently active.
+    pub fn watcher_running(&self) -> bool {
+        self.watcher_active.load(Ordering::SeqCst)
     }
 
     /// Access the underlying daemon configuration.
@@ -435,15 +513,16 @@ impl SyncDaemon {
             self.cancellation.store(true, Ordering::Relaxed);
             // Step 1: Join watcher thread first so no new events are generated
             if let Some(handle) = self.watcher_handle.take() {
-                let _ = handle.join();
+                join_thread_and_log_panic(handle, "watcher-coordinator");
             }
             // Step 2: Join broadcaster thread so in-flight commands are distributed
             if let Some(handle) = self.broadcaster_handle.take() {
-                let _ = handle.join();
+                join_thread_and_log_panic(handle, "command-broadcaster");
             }
             // Step 3: Join all worker threads
-            for handle in self.worker_handles.drain(..) {
-                let _ = handle.join();
+            for (idx, handle) in self.worker_handles.drain(..).enumerate() {
+                let name = format!("sync-worker-{}", idx + 1);
+                join_thread_and_log_panic(handle, &name);
             }
             tracing::info!("SyncDaemon shutdown complete.");
         }
@@ -681,5 +760,88 @@ mod tests {
             resolver.alt_calls.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[test]
+    fn test_daemon_perform_shutdown_logs_worker_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&dst).expect("dst");
+
+        let config = crate::config::Config::builder(src)
+            .dest_dir(dst)
+            .build()
+            .expect("config");
+        let mut daemon =
+            crate::daemon::SyncDaemon::start(config, dir.path(), None).expect("daemon start");
+
+        // Push a worker thread that deliberately panics
+        daemon.worker_handles.push(
+            std::thread::Builder::new()
+                .name("panicking-worker".to_string())
+                .spawn(|| panic!("simulated worker panic payload"))
+                .expect("spawn"),
+        );
+
+        // perform_shutdown must safely intercept, join, and log the panic without panicking itself
+        daemon.perform_shutdown();
+        assert!(daemon.worker_handles.is_empty());
+    }
+
+    #[test]
+    fn test_sync_daemon_coordinates_with_mock_watcher() {
+        use crate::daemon::SyncDaemon;
+        use crate::error::SyncError;
+        use crate::monitor::{FileWatcher, WatcherFactory};
+        use crate::sync::SyncCommand;
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::Sender;
+
+        struct DummyWatcher(Arc<AtomicBool>);
+        impl FileWatcher for DummyWatcher {
+            fn is_watching(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+
+        struct DummyFactory(Arc<AtomicBool>);
+        impl WatcherFactory for DummyFactory {
+            fn create_watcher(
+                &self,
+                _source_dir: &Path,
+                _tx: Sender<SyncCommand>,
+            ) -> Result<Box<dyn FileWatcher>, SyncError> {
+                Ok(Box::new(DummyWatcher(self.0.clone())))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&dst).expect("dst");
+
+        let config = crate::config::Config::builder(src)
+            .dest_dir(dst)
+            .build()
+            .expect("config");
+        let flag = Arc::new(AtomicBool::new(true));
+        let factory = Arc::new(DummyFactory(flag.clone()));
+
+        let daemon = SyncDaemon::start_with_services(
+            config,
+            dir.path(),
+            None,
+            Arc::new(crate::net::MockNetworkResolver::new()),
+            factory,
+        )
+        .expect("daemon start");
+
+        assert!(daemon.watcher_running());
+        daemon.shutdown();
     }
 }
