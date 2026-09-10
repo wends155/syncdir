@@ -395,3 +395,18 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Validation asymmetry between `Config::validate()` and `TargetSyncConfigBuilder::build()` permanently eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Documentation sync for `TargetSyncConfig` / `TargetSyncConfigBuilder` Public APIs (`/update-doc`)
+> * **Changes:**
+>   - Enriched rustdoc comments in `src/config.rs` with `# Arguments`, `# Returns`, and `# Errors` sections for `TargetSyncConfig::builder`, `TargetSyncConfig::new`, `TargetSyncConfigBuilder::new`, and `TargetSyncConfigBuilder::build`.
+>   - Synchronized `spec.md` verification baseline hash against source commit `57e1de8`.
+>   - Verified 100% metadata alignment across `Cargo.toml [package.description]`, `src/lib.rs //!`, and `README.md` overview.
+>   - Verified 0 rustdoc warnings across all 7 doc-tests.
+> * **New Constraints:**
+>   - All builder and constructor public APIs must document explicit parameter types, return values, error triggers, and invariants per `doc-rules.md §1`.
+> * **Pruned:**
+>   - Undocumented builder parameters and missing `# Returns` sections resolved.
+
+
