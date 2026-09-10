@@ -493,6 +493,23 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Outdated test suite counts and undocumented worker runner APIs eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-10):**
+> * **Feature:** Architecture Documentation Synchronization (`architecture.md`)
+> * **Changes:**
+>   - **Section 5 (`Module Boundaries`)**: Documented `SyncWorkerRunner<E>` state machine, `SyncEngine::invalidate_verified_dirs` trait method, `LocalSyncEngine::evict_verified_dir`, root junction safety checks in `prune_archive`, active destination truncation/corruption repair in `sync_file_to_dest_core`, and watcher buffer overflow error recovery in `monitor` dispatching `SyncCommand::TriggerFullScan`.
+>   - **Section 8 (`Error Handling Strategy`)**: Documented `SyncError::is_permanent_validation_failure()` classification and semantic constructors (`validation_security`, `validation_invariant`) for worker queue eviction without retry exhaustion.
+>   - **Section 10 (`Testing Strategy`)**: Synchronized test suite metrics to 289 passing automated tests (235 unit tests in `src/lib.rs`, 3 in `src/main.rs`, 12 integration, 8 property, 20 snapshot, 11 doc-tests) and refreshed submodule unit test descriptions.
+>   - **Section 14 (`Known Constraints & Technical Debt`)**: Documented two-phase locking in `verify_destination_cached` for SMB latency optimization and dynamic reparse cache invalidation hooks.
+> * **Verification:**
+>   - Full test suite passed (289/289 automated tests, zero warnings).
+>   - Format and clippy gates clean.
+>   - Changes committed in `cbbe903` and pushed to `origin/refactor/hardening`.
+> * **New Constraints:** None (documentation synchronization only).
+> * **Pruned:** Outdated test counts and missing module boundary descriptions in `architecture.md` eliminated.
+
+
 
 
 
