@@ -7,7 +7,8 @@ use crate::error::SyncError;
 
 use super::engine::LocalSyncEngine;
 use super::path_safety::{
-    is_reparse_or_symlink, is_safe_relative_path, verify_destination_not_reparse,
+    is_reparse_or_symlink, is_reparse_or_symlink_meta, is_safe_relative_path,
+    verify_destination_not_reparse,
 };
 
 /// Global atomic counter for unique archive path generation across threads and timestamps.
@@ -28,8 +29,16 @@ pub(crate) fn prune_archive(
     max_age_days: u64,
     max_bytes: u64,
 ) -> Result<(), SyncError> {
-    if !archive_dir.exists() {
-        return Ok(());
+    let sym_meta = match fs::symlink_metadata(archive_dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(SyncError::Io(e)),
+    };
+    if is_reparse_or_symlink_meta(&sym_meta) || !sym_meta.is_dir() {
+        return Err(SyncError::validation(format!(
+            "Archive directory '{}' is a reparse point or junction; refusing to prune",
+            archive_dir.display()
+        )));
     }
     let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86_400));
     let now = SystemTime::now();
@@ -708,5 +717,31 @@ mod tests {
             res.is_err(),
             "Must reject archiving when .syncdir_archive is a reparse point"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_prune_archive_returns_err_on_junction_archive_dir() {
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let archive_junction = dir.path().join("archive_junction");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        if create_test_junction(&outside, &archive_junction).is_err() {
+            return;
+        }
+
+        let res = prune_archive(&archive_junction, 30, 10_000_000);
+        assert!(
+            res.is_err(),
+            "prune_archive must reject junction archive_dir"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            matches!(err, SyncError::Validation(_)),
+            "Expected Validation error, got {:?}",
+            err
+        );
+        assert!(err.to_string().contains("reparse point or junction"));
     }
 }
