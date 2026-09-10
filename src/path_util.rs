@@ -63,11 +63,11 @@ pub fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
         s = repaired;
     }
 
-    // Trim redundant trailing backslashes while preserving root drive paths like C:\ or X:\
-    while s.ends_with('\\') && s.len() > 3 {
+    // Trim redundant trailing backslashes while preserving root drive paths like C:\ or X:\ or UNC root \\ or \
+    while s.ends_with('\\') {
         let is_root_drive =
             s.len() == 3 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic();
-        if is_root_drive {
+        if is_root_drive || s == "\\" || s == "\\\\" {
             break;
         }
         s.pop();
@@ -149,7 +149,7 @@ pub fn collapse_components(path: &Path) -> Vec<Component<'_>> {
 pub fn is_same_or_descendant(base: &Path, target: &Path) -> bool {
     let base_comps = collapse_components(base);
     let target_comps = collapse_components(target);
-    if target_comps.len() < base_comps.len() {
+    if base_comps.is_empty() || target_comps.is_empty() || target_comps.len() < base_comps.len() {
         return false;
     }
     base_comps.iter().zip(target_comps.iter()).all(|(b, t)| {
@@ -289,5 +289,28 @@ mod tests {
 
         let res = open_path(Path::new(r"C:\NonExistent_syncdir_dummy_path_12345"));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_is_same_or_descendant_empty_base_returns_false() {
+        assert!(!is_same_or_descendant(
+            Path::new(""),
+            Path::new(r"C:\Users")
+        ));
+        assert!(!is_same_or_descendant(
+            Path::new(r"C:\Users"),
+            Path::new("")
+        ));
+        assert!(!is_same_or_descendant(Path::new(""), Path::new("")));
+    }
+
+    #[test]
+    fn test_normalize_path_short_paths_and_root_preservation() {
+        assert_eq!(normalize_path(r"fo\").to_string_lossy(), "fo");
+        assert_eq!(normalize_path(r"a\").to_string_lossy(), "a");
+        assert_eq!(normalize_path(r"fo/").to_string_lossy(), "fo");
+        assert_eq!(normalize_path(r"C:\").to_string_lossy(), r"C:\");
+        assert_eq!(normalize_path(r"\\").to_string_lossy(), r"\\");
+        assert_eq!(normalize_path(r"\").to_string_lossy(), r"\");
     }
 }
