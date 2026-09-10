@@ -610,7 +610,7 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(db, target_cfg);
 
         let outcome = engine.run_full_scan().unwrap();

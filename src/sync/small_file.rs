@@ -343,7 +343,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
         let config = Config::test_default(src.clone(), dst.clone());
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(
             MockHashStore::new(),
             TargetSyncConfig {
@@ -374,7 +374,7 @@ mod tests {
             .verify_writes(false)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
@@ -544,7 +544,7 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let dst_file = dst.join("target.txt");

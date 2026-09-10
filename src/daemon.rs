@@ -267,7 +267,7 @@ impl SyncDaemon {
 
                     if should_check {
                         last_status_check = Some(now);
-                        let current_source = config.resolved_source_dir();
+                        let current_source = config.source_dir();
                         let is_online = current_source.exists() && current_source.is_dir();
                         source_connectivity.set_online(is_online);
 
@@ -278,7 +278,7 @@ impl SyncDaemon {
                                     "Source directory online. Starting directory watcher..."
                                 );
                                 match crate::monitor::DirectoryWatcher::start(
-                                    config.resolved_source_dir(),
+                                    config.source_dir(),
                                     command_tx.clone(),
                                 ) {
                                     Ok(w) => {
@@ -426,7 +426,7 @@ impl SyncDaemon {
 
         // 1. Initialize target databases and workers
         let mut worker_txs = Vec::new();
-        for (idx, target_config) in config.target_configs().into_iter().enumerate() {
+        for (idx, target_config) in config.target_configs()?.into_iter().enumerate() {
             let engine = factory.create_engine(idx, &target_config, app_dir)?;
 
             // Wire per-worker channel

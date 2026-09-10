@@ -625,7 +625,7 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let src_file = src.join("large.bin");
@@ -661,7 +661,7 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let src_file = src.join("large.bin");
         let dst_file = dst.join("large.bin");
 
@@ -725,7 +725,7 @@ mod tests {
             .verify_writes(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let src_file = src.join("large.bin");
@@ -760,7 +760,7 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         // Sync file 1

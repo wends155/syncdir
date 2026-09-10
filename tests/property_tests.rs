@@ -162,7 +162,8 @@ proptest! {
         let config = Config::test_default(source.clone(), dest.clone());
         let store =
             SqliteHashStore::new(db_file.path(), StoreConfig::new(config.block_size_bytes(), config.block_sync_threshold_bytes()).unwrap()).unwrap();
-        let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
+        let target_config =
+            syncdir::config::TargetSyncConfig::from_config(&config, dest.clone()).unwrap();
         let engine = LocalSyncEngine::new(store, target_config);
 
         let file_path = source.join("prop_test.bin");
@@ -199,7 +200,8 @@ proptest! {
             .unwrap();
         let store =
             SqliteHashStore::new(db_file.path(), StoreConfig::new(config.block_size_bytes(), config.block_sync_threshold_bytes()).unwrap()).unwrap();
-        let target_config = syncdir::config::TargetSyncConfig::from_config(&config, dest.clone());
+        let target_config =
+            syncdir::config::TargetSyncConfig::from_config(&config, dest.clone()).unwrap();
         let engine = LocalSyncEngine::new(store, target_config);
 
         let file_path = source.join("delta_test.bin");

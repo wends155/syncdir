@@ -1258,7 +1258,7 @@ mod tests {
 
         let config = Config::builder(source)
             .dest_dir(dest.clone())
-            .debounce_seconds(0)
+            .debounce_seconds(1)
             .retry_interval_seconds(1)
             .propagate_deletions(true)
             .build_unvalidated();
@@ -1287,7 +1287,7 @@ mod tests {
 
         let config = Config::builder(source.clone())
             .dest_dir(dest.clone())
-            .debounce_seconds(0)
+            .debounce_seconds(1)
             .retry_interval_seconds(1)
             .build_unvalidated();
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
@@ -1318,7 +1318,7 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
         let config = Config::builder(src)
             .dest_dir(dst)
-            .debounce_seconds(0)
+            .debounce_seconds(1)
             .retry_interval_seconds(1)
             .build_unvalidated();
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
@@ -1329,7 +1329,12 @@ mod tests {
             "unsafe/../file.txt",
         )))
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let start = Instant::now();
+        while engine.failed_calls().is_empty()
+            && start.elapsed() < std::time::Duration::from_secs(3)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         drop(tx);
         handle.join().unwrap();
         assert_eq!(
@@ -1516,8 +1521,8 @@ mod tests {
 
         let config = Config::builder(source.clone())
             .dest_dir(dest.clone())
-            .debounce_seconds(0)
-            .retry_interval_seconds(0)
+            .debounce_seconds(1)
+            .retry_interval_seconds(1)
             .build_unvalidated();
 
         let engine = MockSyncEngine::new();
@@ -1571,8 +1576,8 @@ mod tests {
 
         let config = Config::builder(source)
             .dest_dir(dest)
-            .debounce_seconds(0)
-            .retry_interval_seconds(0)
+            .debounce_seconds(1)
+            .retry_interval_seconds(1)
             .build_unvalidated();
 
         let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
@@ -1631,7 +1636,7 @@ mod tests {
 
         let config = Config::builder(source)
             .dest_dir(fake_dest.clone())
-            .debounce_seconds(0)
+            .debounce_seconds(1)
             .retry_interval_seconds(1)
             .build_unvalidated();
 
@@ -1731,7 +1736,7 @@ mod tests {
 
         let config = Config::builder(source)
             .dest_dir(dest)
-            .debounce_seconds(0)
+            .debounce_seconds(1)
             .retry_interval_seconds(5)
             .build_unvalidated();
 
@@ -1747,7 +1752,7 @@ mod tests {
         engine.set_sync_error(|| SyncError::validation("temporary lock conflict"));
 
         runner.handle_command(SyncCommand::FileModified(PathBuf::from("transient.txt")));
-        let t0 = Instant::now() + Duration::from_millis(50);
+        let t0 = Instant::now() + Duration::from_secs(2);
         let _ = runner.tick(t0).unwrap();
 
         // Non-permanent validation error must be requeued for retry (with 5s backoff)
@@ -1761,7 +1766,7 @@ mod tests {
         runner.handle_command(SyncCommand::FileModified(PathBuf::from("traversal.txt")));
         assert_eq!(runner.queue.pending_count(), 2);
 
-        let t1 = Instant::now() + Duration::from_millis(50);
+        let t1 = t0 + Duration::from_secs(2);
         let _ = runner.tick(t1).unwrap();
 
         // Permanent validation failure must be evicted without retry
@@ -1770,7 +1775,7 @@ mod tests {
 
         // Advance simulated time past the 5s backoff; clear error so transient.txt succeeds
         engine.clear_sync_error();
-        let t2 = Instant::now() + Duration::from_secs(6);
+        let t2 = t1 + Duration::from_secs(6);
         let _ = runner.tick(t2).unwrap();
         assert_eq!(runner.queue.pending_count(), 0);
         assert_eq!(engine.synced_calls().len(), 1);

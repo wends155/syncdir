@@ -5,6 +5,7 @@
 
 use crate::error::SyncError;
 use crate::path_util::normalize_path;
+pub use crate::path_util::{is_same_or_descendant, system_root};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -96,19 +97,22 @@ impl TargetSyncConfig {
         Self::builder(source_dir, dest_dir).build()
     }
 
-    /// Create a new `TargetSyncConfig` from a `Config` and a specific destination directory.
-    pub fn from_config(config: &Config, dest_dir: impl Into<TargetDir>) -> Self {
-        Self {
-            source_dir: config.source_dir().to_path_buf(),
-            dest_dir: dest_dir.into(),
-            block_size_bytes: config.block_size_bytes(),
-            block_sync_threshold_bytes: config.block_sync_threshold_bytes(),
-            verify_writes: config.verify_writes(),
-            verification_mode: config.verification_mode(),
-            debounce_seconds: config.debounce_seconds(),
-            retry_interval_seconds: config.retry_interval_seconds(),
-            propagate_deletions: config.propagate_deletions(),
-        }
+    /// Create a new `TargetSyncConfig` from a `Config` and a specific destination directory,
+    /// routing through `TargetSyncConfigBuilder` to enforce path safety and parameter invariants.
+    ///
+    /// # Errors
+    /// Returns [`SyncError::Validation`] if parameters, timeouts, block sizes, or paths fail validation,
+    /// or if the destination directory is identical to or nested within the source directory.
+    pub fn from_config(config: &Config, dest_dir: impl Into<TargetDir>) -> Result<Self, SyncError> {
+        TargetSyncConfigBuilder::new(config.source_dir(), dest_dir)
+            .block_size_bytes(config.block_size_bytes())
+            .block_sync_threshold_bytes(config.block_sync_threshold_bytes())
+            .verify_writes(config.verify_writes())
+            .verification_mode(config.verification_mode())
+            .debounce_seconds(config.debounce_seconds())
+            .retry_interval_seconds(config.retry_interval_seconds())
+            .propagate_deletions(config.propagate_deletions())
+            .build()
     }
 
     /// Source directory getter.
@@ -191,7 +195,7 @@ impl TargetSyncConfig {
         let dest = cfg.dest_dir().ok_or_else(|| {
             SyncError::validation("Config has no destination directories configured")
         })?;
-        Ok(Self::from_config(cfg, dest))
+        Self::from_config(cfg, dest)
     }
 
     /// Explicit fallible conversion from owned `Config`.
@@ -330,7 +334,7 @@ impl TargetSyncConfigBuilder {
         if is_same_or_descendant(src_target.as_path(), self.dest_dir.as_path())
             || is_same_or_descendant(self.dest_dir.as_path(), src_target.as_path())
         {
-            return Err(SyncError::validation(format!(
+            return Err(SyncError::validation_loop(format!(
                 "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
                 self.dest_dir.display(),
                 src_target.display()
@@ -866,23 +870,6 @@ impl ConfigBuilder {
     }
 }
 
-/// Returns true if `target` is identical to `base` or is a descendant of `base`.
-///
-/// Uses Windows case-insensitive component comparison with lexical component collapsing.
-#[must_use]
-pub fn is_same_or_descendant(base: &Path, target: &Path) -> bool {
-    let base_comps = crate::path_util::collapse_components(base);
-    let target_comps = crate::path_util::collapse_components(target);
-    if target_comps.len() < base_comps.len() {
-        return false;
-    }
-    base_comps.iter().zip(target_comps.iter()).all(|(b, t)| {
-        b.as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&t.as_os_str().to_string_lossy())
-    })
-}
-
 impl Config {
     /// Return builder initialized with source directory.
     pub fn builder(source_dir: impl Into<PathBuf>) -> ConfigBuilder {
@@ -907,6 +894,7 @@ impl Config {
     }
 
     /// Return the normalized source directory path.
+    #[deprecated(since = "0.2.0", note = "Use source_dir() directly")]
     pub fn resolved_source_dir(&self) -> &Path {
         self.source_dir.as_path()
     }
@@ -975,7 +963,10 @@ impl Config {
     }
 
     /// Generate isolated target sync configurations for each configured destination directory.
-    pub fn target_configs(&self) -> Vec<TargetSyncConfig> {
+    ///
+    /// # Errors
+    /// Returns [`SyncError::Validation`] if any target configuration fails invariant validation.
+    pub fn target_configs(&self) -> Result<Vec<TargetSyncConfig>, SyncError> {
         self.destinations
             .iter()
             .map(|dest| TargetSyncConfig::from_config(self, dest.clone()))
@@ -1111,15 +1102,6 @@ impl Config {
     pub fn default_config_path() -> Result<PathBuf, SyncError> {
         Ok(Self::default_app_dir()?.join("config.toml"))
     }
-}
-
-/// Returns the Windows system root directory (e.g. `C:\Windows`).
-/// Reads `%SystemRoot%`, then `%windir%`, defaulting to `C:\Windows`.
-pub fn system_root() -> PathBuf {
-    std::env::var("SystemRoot")
-        .or_else(|_| std::env::var("windir"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
 }
 
 fn preprocess_config_toml(content: &str) -> String {
@@ -1753,6 +1735,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolved_source_dir_alternate_resolution() {
         let temp = tempdir().unwrap();
         let source_path = temp.path().join("source");
@@ -1902,7 +1885,7 @@ mod tests {
             .propagate_deletions(false)
             .build()
             .unwrap();
-        let target = TargetSyncConfig::from_config(&config, PathBuf::from(r"C:\dst2"));
+        let target = TargetSyncConfig::from_config(&config, PathBuf::from(r"C:\dst2")).unwrap();
         assert_eq!(target.source_dir(), Path::new(r"C:\src"));
         assert_eq!(target.dest_dir(), Path::new(r"C:\dst2"));
         assert_eq!(target.block_size_bytes(), 1024);
@@ -2136,7 +2119,7 @@ mod tests {
             .verification_mode(VerificationMode::MetadataAndFlush)
             .build()
             .unwrap();
-        let target = TargetSyncConfig::from_config(&config, r"D:\dest");
+        let target = TargetSyncConfig::from_config(&config, r"D:\dest").unwrap();
         assert_eq!(
             target.verification_mode(),
             VerificationMode::MetadataAndFlush
@@ -2188,7 +2171,7 @@ mod tests {
         // because they silently drop secondary destinations or fabricate empty targets.
         // Callers must use Config::target_configs() or TargetSyncConfig::try_from_config().
         let cfg = Config::test_default(r"C:\source", r"D:\dest");
-        let targets = cfg.target_configs();
+        let targets = cfg.target_configs().unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].dest_dir().to_string_lossy(), r"D:\dest");
     }
@@ -2226,5 +2209,47 @@ mod tests {
             res_order.is_err(),
             "Expected error for threshold < block_size"
         );
+    }
+
+    #[test]
+    fn test_target_sync_config_from_config_rejects_nested_and_ancestor_paths() {
+        let config = Config::test_default(r"C:\source", r"D:\dest");
+        // Nested path (dest inside source)
+        let res_nested = TargetSyncConfig::from_config(&config, r"C:\source\nested");
+        assert!(res_nested.is_err());
+        match res_nested.unwrap_err() {
+            SyncError::Validation { kind, .. } => {
+                assert_eq!(kind, crate::error::ValidationKind::RecursiveLoop);
+            }
+            err => panic!("Unexpected error type: {err:?}"),
+        }
+
+        // Ancestor path (source inside dest)
+        let res_ancestor = TargetSyncConfig::from_config(&config, r"C:\");
+        assert!(res_ancestor.is_err());
+        match res_ancestor.unwrap_err() {
+            SyncError::Validation { kind, .. } => {
+                assert_eq!(kind, crate::error::ValidationKind::RecursiveLoop);
+            }
+            err => panic!("Unexpected error type: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_target_sync_config_from_config_rejects_invalid_block_size_and_ordering() {
+        let invalid_config = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .block_size_bytes(0)
+            .build_unvalidated();
+        let res = TargetSyncConfig::from_config(&invalid_config, r"D:\dest");
+        assert!(res.is_err());
+
+        let invalid_order = Config::builder(r"C:\source")
+            .dest_dir(r"D:\dest")
+            .block_size_bytes(1024)
+            .block_sync_threshold_bytes(512)
+            .build_unvalidated();
+        let res_order = TargetSyncConfig::from_config(&invalid_order, r"D:\dest");
+        assert!(res_order.is_err());
     }
 }

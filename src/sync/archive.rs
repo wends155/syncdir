@@ -439,7 +439,7 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = std::sync::Arc::new(LocalSyncEngine::new(MockHashStore::new(), target_cfg));
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(50));
@@ -509,7 +509,7 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
@@ -572,7 +572,8 @@ mod tests {
             .propagate_deletions(false)
             .build()
             .unwrap();
-        let target_cfg_no_prop = TargetSyncConfig::from_config(&config_no_prop, dst.clone());
+        let target_cfg_no_prop =
+            TargetSyncConfig::from_config(&config_no_prop, dst.clone()).unwrap();
         let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
         let rec3 = FileRecord {
             id: None,
@@ -721,7 +722,7 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone());
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let file = dst.join("victim.txt");
