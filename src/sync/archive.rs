@@ -33,7 +33,7 @@ pub(crate) fn prune_archive(
         Err(e) => return Err(SyncError::Io(e)),
     };
     if is_reparse_or_symlink_meta(&sym_meta) || !sym_meta.is_dir() {
-        return Err(SyncError::validation(format!(
+        return Err(SyncError::validation_reparse(format!(
             "Archive directory '{}' is a reparse point or junction; refusing to prune",
             archive_dir.display()
         )));
@@ -162,7 +162,7 @@ impl ArchiveManager {
         dest_dir: &Path,
     ) -> Result<(), SyncError> {
         if !is_safe_relative_path(rel_path) {
-            return Err(SyncError::validation(format!(
+            return Err(SyncError::validation_security(format!(
                 "Unsafe path traversal detected: {}",
                 rel_path.display()
             )));

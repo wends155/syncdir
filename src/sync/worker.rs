@@ -1528,7 +1528,7 @@ mod tests {
     #[test]
     fn test_sync_worker_evicts_validation_errors_without_retry() {
         let engine = MockSyncEngine::new();
-        engine.set_sync_error(|| SyncError::validation("Permanent validation failure"));
+        engine.set_sync_error(|| SyncError::validation_security("Permanent validation failure"));
         let (tx, rx) = std::sync::mpsc::channel();
         let dir = tempdir().unwrap();
         let src = dir.path().join("src");

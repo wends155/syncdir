@@ -16,7 +16,7 @@ pub(crate) fn verify_destination_not_reparse(
         .map(|m| is_reparse_or_symlink_meta(&m))
         .unwrap_or(false)
     {
-        return Err(SyncError::validation(format!(
+        return Err(SyncError::validation_reparse(format!(
             "Destination root '{}' is a symlink or reparse point; refusing to write",
             dest_dir.display()
         )));
@@ -27,7 +27,7 @@ pub(crate) fn verify_destination_not_reparse(
         current.push(component);
         if let Ok(m) = fs::symlink_metadata(&current) {
             if is_reparse_or_symlink_meta(&m) {
-                return Err(SyncError::validation(format!(
+                return Err(SyncError::validation_reparse(format!(
                     "Destination component '{}' is a symlink or reparse point; refusing to write",
                     current.display()
                 )));
@@ -49,7 +49,7 @@ pub(crate) fn verify_destination_not_reparse(
         .map(|m| is_reparse_or_symlink_meta(&m))
         .unwrap_or(false)
     {
-        return Err(SyncError::validation(format!(
+        return Err(SyncError::validation_reparse(format!(
             "Destination root '{}' is a symlink; refusing to write",
             dest_dir.display()
         )));
@@ -60,7 +60,7 @@ pub(crate) fn verify_destination_not_reparse(
         current.push(component);
         if let Ok(m) = fs::symlink_metadata(&current) {
             if is_reparse_or_symlink_meta(&m) {
-                return Err(SyncError::validation(format!(
+                return Err(SyncError::validation_reparse(format!(
                     "Destination component '{}' is a symlink; refusing to write",
                     current.display()
                 )));
@@ -85,7 +85,7 @@ pub fn verify_destination_not_reparse_cached(
             .map(|m| is_reparse_or_symlink_meta(&m))
             .unwrap_or(false)
         {
-            return Err(SyncError::validation(format!(
+            return Err(SyncError::validation_reparse(format!(
                 "Destination root '{}' is a symlink or reparse point; refusing to write",
                 dest_dir.display()
             )));
@@ -110,7 +110,7 @@ pub fn verify_destination_not_reparse_cached(
         }
         if let Ok(m) = fs::symlink_metadata(&current) {
             if is_reparse_or_symlink_meta(&m) {
-                return Err(SyncError::validation(format!(
+                return Err(SyncError::validation_reparse(format!(
                     "Destination component '{}' is a symlink or reparse point; refusing to write",
                     current.display()
                 )));
@@ -141,7 +141,7 @@ pub fn verify_destination_not_reparse_cached(
     if !verified_dirs.contains(dest_dir) {
         if let Ok(m) = fs::symlink_metadata(dest_dir) {
             if is_reparse_or_symlink_meta(&m) {
-                return Err(SyncError::validation(format!(
+                return Err(SyncError::validation_reparse(format!(
                     "Destination root '{}' is a symlink; refusing to write",
                     dest_dir.display()
                 )));
@@ -167,7 +167,7 @@ pub fn verify_destination_not_reparse_cached(
         }
         if let Ok(m) = fs::symlink_metadata(&current) {
             if is_reparse_or_symlink_meta(&m) {
-                return Err(SyncError::validation(format!(
+                return Err(SyncError::validation_reparse(format!(
                     "Destination component '{}' is a symlink; refusing to write",
                     current.display()
                 )));
@@ -199,7 +199,7 @@ pub(crate) fn verify_source_not_reparse(
         if let Ok(m) = fs::symlink_metadata(&current)
             && is_reparse_or_symlink_meta(&m)
         {
-            return Err(SyncError::validation(format!(
+            return Err(SyncError::validation_reparse(format!(
                 "Source ancestor '{}' is a symlink or reparse point; refusing to read",
                 current.display()
             )));
@@ -219,7 +219,7 @@ pub(crate) fn verify_source_not_reparse(
         if let Ok(m) = fs::symlink_metadata(&current)
             && is_reparse_or_symlink_meta(&m)
         {
-            return Err(SyncError::validation(format!(
+            return Err(SyncError::validation_reparse(format!(
                 "Source ancestor '{}' is a symlink; refusing to read",
                 current.display()
             )));
@@ -519,6 +519,115 @@ mod tests {
                     let result = is_reparse_or_symlink(&entry).unwrap();
                     assert!(result, "junction/symlink must be detected as reparse point");
                 }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_verify_destination_and_source_reparse_error_classification() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("target_dir");
+        let link = temp.path().join("link_dir");
+        fs::create_dir_all(&target).unwrap();
+
+        let created = if std::os::windows::fs::symlink_dir(&target, &link).is_ok() {
+            true
+        } else {
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        link.display(),
+                        target.display()
+                    ),
+                ])
+                .status();
+            status.map(|s| s.success()).unwrap_or(false)
+        };
+
+        if created {
+            // Test verify_destination_not_reparse on root junction
+            let res_dest_root = verify_destination_not_reparse(&link, Path::new("sub/file.txt"));
+            assert!(res_dest_root.is_err());
+            let err = res_dest_root.err().unwrap();
+            assert!(
+                err.is_permanent_validation_failure(),
+                "Reparse error must be permanent validation failure"
+            );
+            assert!(matches!(
+                err,
+                SyncError::Validation {
+                    kind: crate::error::ValidationKind::ReparsePoint,
+                    ..
+                }
+            ));
+
+            // Test verify_destination_not_reparse on component junction
+            let valid_dest = temp.path().join("valid_dest");
+            fs::create_dir_all(&valid_dest).unwrap();
+            let dest_comp_link = valid_dest.join("junction_comp");
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        dest_comp_link.display(),
+                        target.display()
+                    ),
+                ])
+                .status();
+            if dest_comp_link.exists() {
+                let res_dest_comp = verify_destination_not_reparse(
+                    &valid_dest,
+                    Path::new("junction_comp/file.txt"),
+                );
+                assert!(res_dest_comp.is_err());
+                let err_comp = res_dest_comp.err().unwrap();
+                assert!(
+                    err_comp.is_permanent_validation_failure(),
+                    "Reparse component must be permanent validation failure"
+                );
+                assert!(matches!(
+                    err_comp,
+                    SyncError::Validation {
+                        kind: crate::error::ValidationKind::ReparsePoint,
+                        ..
+                    }
+                ));
+            }
+
+            // Test verify_source_not_reparse on component junction
+            let valid_src = temp.path().join("valid_src");
+            fs::create_dir_all(&valid_src).unwrap();
+            let src_comp_link = valid_src.join("src_junction");
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        src_comp_link.display(),
+                        target.display()
+                    ),
+                ])
+                .status();
+            if src_comp_link.exists() {
+                let res_src =
+                    verify_source_not_reparse(&valid_src, Path::new("src_junction/file.txt"));
+                assert!(res_src.is_err());
+                let err_src = res_src.err().unwrap();
+                assert!(
+                    err_src.is_permanent_validation_failure(),
+                    "Source reparse component must be permanent validation failure"
+                );
+                assert!(matches!(
+                    err_src,
+                    SyncError::Validation {
+                        kind: crate::error::ValidationKind::ReparsePoint,
+                        ..
+                    }
+                ));
             }
         }
     }

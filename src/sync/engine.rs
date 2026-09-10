@@ -563,7 +563,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
             if !root_verified {
                 let meta = fs::symlink_metadata(dest_dir).map_err(SyncError::Io)?;
                 if is_reparse_or_symlink_meta(&meta) {
-                    return Err(SyncError::validation(format!(
+                    return Err(SyncError::validation_reparse(format!(
                         "Destination directory '{}' is a symlink or reparse point; refusing to sync",
                         dest_dir.display()
                     )));
@@ -577,7 +577,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 match fs::symlink_metadata(ancestor) {
                     Ok(meta) => {
                         if is_reparse_or_symlink_meta(&meta) {
-                            return Err(SyncError::validation(format!(
+                            return Err(SyncError::validation_reparse(format!(
                                 "Destination component '{}' is a symlink or reparse point; refusing to write",
                                 ancestor.display()
                             )));
@@ -612,7 +612,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let meta = match fs::symlink_metadata(&leaf_path) {
             Ok(m) => {
                 if is_reparse_or_symlink_meta(&m) {
-                    return Err(SyncError::validation(format!(
+                    return Err(SyncError::validation_reparse(format!(
                         "Destination component '{}' is a symlink or reparse point; refusing to write",
                         leaf_path.display()
                     )));
@@ -633,7 +633,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         file_record: Option<&FileRecord>,
     ) -> Result<Option<(FileRecord, Vec<crate::db::BlockHash>)>, SyncError> {
         if !is_safe_relative_path(rel_path) {
-            return Err(SyncError::validation(format!(
+            return Err(SyncError::validation_security(format!(
                 "Unsafe path traversal detected: {}",
                 rel_path.display()
             )));
