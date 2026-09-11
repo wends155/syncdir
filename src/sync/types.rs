@@ -41,7 +41,7 @@ impl<'a> FileSyncTask<'a> {
 
 /// Extract file modified time as milliseconds since UNIX epoch.
 ///
-/// Pre-1970 timestamps are clamped to 0 (epoch) with a warning log.
+/// Pre-1970 timestamps are silently clamped to 0 (epoch).
 ///
 /// # Errors
 ///
@@ -50,10 +50,7 @@ pub fn safe_modified_millis(metadata: &std::fs::Metadata) -> Result<i64, SyncErr
     let modified = metadata.modified().map_err(SyncError::Io)?;
     match modified.duration_since(UNIX_EPOCH) {
         Ok(dur) => Ok(dur.as_millis() as i64),
-        Err(_) => {
-            tracing::warn!("File has pre-1970 modified timestamp, clamping to epoch");
-            Ok(0)
-        }
+        Err(_) => Ok(0),
     }
 }
 
@@ -86,6 +83,31 @@ mod tests {
         assert_eq!(
             safe_epoch_duration_millis(-500),
             std::time::Duration::from_millis(0)
+        );
+    }
+
+    #[test]
+    fn test_safe_modified_millis_no_side_effect_logs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("pre_epoch.txt");
+        std::fs::write(&test_file, b"test").unwrap();
+
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&test_file)
+            .unwrap();
+        let pre_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(86400 * 365);
+        let times = std::fs::FileTimes::new().set_modified(pre_epoch);
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let meta = std::fs::metadata(&test_file).unwrap();
+        let (res, log_output) =
+            crate::test_support::with_captured_tracing(|| safe_modified_millis(&meta));
+        assert_eq!(res.unwrap(), 0);
+        assert!(
+            log_output.is_empty(),
+            "Expected zero log records emitted, but got: {log_output}"
         );
     }
 }

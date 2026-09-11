@@ -60,6 +60,8 @@ pub mod net;
 pub mod path_util;
 pub mod startup;
 pub mod sync;
+#[doc(hidden)]
+pub mod test_support;
 pub mod tray;
 
 pub use daemon::{DaemonHandle, SyncDaemon};

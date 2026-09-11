@@ -61,13 +61,7 @@ pub fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
 
     // Repair single-backslash UNC network paths (\172... -> \\172...)
     if s.starts_with('\\') && !s.starts_with("\\\\") && s.len() > 1 && s[1..].contains('\\') {
-        let repaired = format!("\\{}", s);
-        tracing::warn!(
-            raw = %s,
-            normalized = %repaired,
-            "Normalized single-backslash path to UNC network path"
-        );
-        s = repaired;
+        s = format!("\\{}", s);
     }
 
     // Trim redundant trailing backslashes while preserving root drive paths like C:\ or X:\ or UNC root \\ or \
@@ -784,5 +778,17 @@ mod tests {
         let invalid_toml = "path = \"../traversal.txt\"\n";
         let err = toml::from_str::<Wrapper>(invalid_toml);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_normalize_path_single_backslash_unc_no_side_effect_logs() {
+        let (norm, log_output) = crate::test_support::with_captured_tracing(|| {
+            normalize_path(r"\172.16.0.1\share\sub\file.txt")
+        });
+        assert_eq!(norm, PathBuf::from(r"\\172.16.0.1\share\sub\file.txt"));
+        assert!(
+            log_output.is_empty(),
+            "Expected zero log records from normalize_path, got: {log_output}"
+        );
     }
 }

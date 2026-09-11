@@ -98,10 +98,6 @@ impl TargetDir {
         let is_drive = is_valid_drive_path(&s);
         let is_unix_abs = s.starts_with('/');
 
-        if is_drive {
-            tracing::debug!(target_path = %s, "Validated Windows drive path target");
-        }
-
         if !is_unc && !is_drive && !is_unix_abs {
             let example_drive = match role {
                 TargetRole::Source => "C:\\, R:\\",
@@ -341,5 +337,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_target_dir_validate_drive_path_no_side_effect_logs() {
+        let target = TargetDir(std::path::PathBuf::from(r"C:\data\sync"));
+        let (res, log_output) =
+            crate::test_support::with_captured_tracing(|| target.validate(TargetRole::Source));
+        assert!(res.is_ok());
+        assert!(
+            log_output.is_empty(),
+            "Expected zero log records from TargetDir::validate, got: {log_output}"
+        );
     }
 }
