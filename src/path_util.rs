@@ -10,7 +10,14 @@
 //!   guarantees trailing backslashes on Windows drive roots (e.g. `R:` -> `R:\`), and
 //!   repairs single-backslash UNC network prefixes.
 
+use std::borrow::Cow;
+use std::fmt;
+use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::SyncError;
 
 /// Normalizes a path string for Windows compatibility and internal consistency.
 ///
@@ -204,6 +211,280 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn normalize_superscripts_cow<'a>(s: &'a str) -> Cow<'a, str> {
+    if !s.bytes().any(|b| b >= 0x80) {
+        return Cow::Borrowed(s);
+    }
+    if !s
+        .chars()
+        .any(|c| matches!(c, '⁰' | '¹' | '²' | '³' | '⁴'..='⁹'))
+    {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '⁰' => out.push('0'),
+            '¹' => out.push('1'),
+            '²' => out.push('2'),
+            '³' => out.push('3'),
+            '⁴' => out.push('4'),
+            '⁵' => out.push('5'),
+            '⁶' => out.push('6'),
+            '⁷' => out.push('7'),
+            '⁸' => out.push('8'),
+            '⁹' => out.push('9'),
+            other => out.push(other),
+        }
+    }
+    Cow::Owned(out)
+}
+
+#[doc(hidden)]
+pub fn is_safe_relative_path(path: &Path) -> bool {
+    if !path.is_relative() || path.as_os_str().is_empty() {
+        return false;
+    }
+    let s_raw = path.to_string_lossy();
+    for seg in s_raw.split(['/', '\\']) {
+        if seg == "." || seg == ".." {
+            return false;
+        }
+    }
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$",
+        "CONOUT$", "CLOCK$",
+    ];
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+            Component::Normal(os_str) => {
+                let s = os_str.to_string_lossy();
+                if s.contains(':') {
+                    return false;
+                }
+                // Reject Win32 wildcards and forbidden characters (including ASCII control characters)
+                if s.chars()
+                    .any(|c| matches!(c, '*' | '?' | '<' | '>' | '|' | '"') || (c as u32) < 0x20)
+                {
+                    return false;
+                }
+                // Reject components with trailing spaces or dots (Windows strips these)
+                if s.ends_with(' ') || s.ends_with('.') {
+                    return false;
+                }
+                // Normalize Unicode superscripts ('⁰'..'⁹') before stem extraction with zero-allocation on ASCII
+                let normalized = normalize_superscripts_cow(&s);
+                // Trim trailing spaces and dots before reserved name check
+                let trimmed = normalized.trim_end_matches([' ', '.']);
+                let stem = trimmed.split('.').next().unwrap_or("");
+                if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Strongly-typed relative path domain newtype.
+///
+/// Guarantees:
+/// - Path is relative (not empty, no drive letters, no root slashes, no UNC prefixes).
+/// - Path has no directory traversal components (`..`).
+/// - Path does not contain DOS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, etc.).
+/// - Path does not contain Alternate Data Stream delimiters (`:`).
+/// - Path does not contain Win32 forbidden characters (`*`, `?`, `<`, `>`, `|`, `"`).
+/// - Path components do not have trailing spaces or dots.
+/// - Slashes are normalized to forward slashes (`/`).
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "PathBuf", into = "PathBuf")]
+pub struct RelativePath(PathBuf);
+
+impl RelativePath {
+    /// Construct a new `RelativePath`, validating security invariants and normalizing slashes to `/`.
+    ///
+    /// # Errors
+    /// Returns `SyncError::Validation` if the path is empty, absolute, contains directory traversals,
+    /// DOS device names, Alternate Data Streams, or other unsafe patterns.
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
+        let p = path.as_ref();
+        if p.as_os_str().is_empty() || p.to_string_lossy().trim().is_empty() {
+            return Err(SyncError::validation_security(
+                "Relative path cannot be empty",
+            ));
+        }
+
+        let s = p.to_string_lossy();
+        for seg in s.split(['/', '\\']) {
+            if seg == "." || seg == ".." {
+                return Err(SyncError::validation_security(format!(
+                    "Invalid relative path containing '.' or '..' segment: '{}'",
+                    p.display()
+                )));
+            }
+        }
+
+        let normalized_str = s.replace('\\', "/");
+        let normalized_path = PathBuf::from(normalized_str);
+
+        if !is_safe_relative_path(&normalized_path) {
+            return Err(SyncError::validation_security(format!(
+                "Invalid or unsafe relative path: '{}'",
+                p.display()
+            )));
+        }
+
+        Ok(Self(normalized_path))
+    }
+
+    /// Construct a `RelativePath` without running invariant checks.
+    ///
+    /// # Safety / Invariants
+    /// Caller must guarantee that `path` has already been sanitized and uses forward slashes.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn from_sanitized_unchecked(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    /// Borrows the underlying path slice.
+    #[inline]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Converts to SQLite storage key format.
+    #[inline]
+    pub fn to_sqlite_key(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+
+    /// Returns a new `RelativePath` with ASCII characters converted to lowercase.
+    #[inline]
+    pub fn to_ascii_lowercase(&self) -> Self {
+        Self(PathBuf::from(self.0.to_string_lossy().to_ascii_lowercase()))
+    }
+}
+
+impl Deref for RelativePath {
+    type Target = Path;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for RelativePath {
+    #[inline]
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<Path> for RelativePath {
+    #[inline]
+    fn borrow(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Display for RelativePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
+impl fmt::Debug for RelativePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RelativePath").field(&self.0).finish()
+    }
+}
+
+impl From<RelativePath> for PathBuf {
+    #[inline]
+    fn from(rp: RelativePath) -> Self {
+        rp.0
+    }
+}
+
+impl TryFrom<&Path> for RelativePath {
+    type Error = SyncError;
+
+    #[inline]
+    fn try_from(p: &Path) -> Result<Self, Self::Error> {
+        Self::new(p)
+    }
+}
+
+impl TryFrom<PathBuf> for RelativePath {
+    type Error = SyncError;
+
+    #[inline]
+    fn try_from(p: PathBuf) -> Result<Self, Self::Error> {
+        Self::new(p)
+    }
+}
+
+impl PartialEq<Path> for RelativePath {
+    #[inline]
+    fn eq(&self, other: &Path) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&Path> for RelativePath {
+    #[inline]
+    fn eq(&self, other: &&Path) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<str> for RelativePath {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.0 == Path::new(other)
+    }
+}
+
+impl PartialEq<&str> for RelativePath {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == Path::new(*other)
+    }
+}
+
+impl PartialEq<RelativePath> for Path {
+    #[inline]
+    fn eq(&self, other: &RelativePath) -> bool {
+        self == other.0.as_path()
+    }
+}
+
+impl PartialEq<RelativePath> for &Path {
+    #[inline]
+    fn eq(&self, other: &RelativePath) -> bool {
+        *self == other.0.as_path()
+    }
+}
+
+impl PartialEq<RelativePath> for str {
+    #[inline]
+    fn eq(&self, other: &RelativePath) -> bool {
+        Path::new(self) == other.0.as_path()
+    }
+}
+
+impl PartialEq<RelativePath> for &str {
+    #[inline]
+    fn eq(&self, other: &RelativePath) -> bool {
+        Path::new(*self) == other.0.as_path()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +595,194 @@ mod tests {
         assert_eq!(normalize_path(r"C:\").to_string_lossy(), r"C:\");
         assert_eq!(normalize_path(r"\\").to_string_lossy(), r"\\");
         assert_eq!(normalize_path(r"\").to_string_lossy(), r"\");
+    }
+
+    #[test]
+    fn test_relative_path_valid_simple_nested_unicode() {
+        let valid_paths = &[
+            "file.txt",
+            "README.md",
+            "docs/spec.pdf",
+            "nested/sub/folder/data.bin",
+            "nested\\windows\\separator.log",
+            "документ/отчет.txt",
+            "日本語/ノート.md",
+            "münchen/straße.txt",
+            "emoji/🎉_party.dat",
+        ];
+
+        for path_str in valid_paths {
+            let rel = RelativePath::new(*path_str).unwrap_or_else(|e| {
+                panic!("Expected valid path for '{}', got error: {:?}", path_str, e)
+            });
+            let expected = path_str.replace('\\', "/");
+            assert_eq!(rel.as_path(), Path::new(&expected));
+        }
+    }
+
+    #[test]
+    fn test_relative_path_rejects_empty_and_absolute() {
+        let invalid_paths = &[
+            "",
+            "   ",
+            "\t",
+            "\n",
+            "/",
+            "\\",
+            "//",
+            "\\\\",
+            "C:\\foo",
+            "C:/foo",
+            "c:\\nested\\file.txt",
+            "/foo",
+            "\\foo",
+            "/nested/file.txt",
+            "\\nested\\file.txt",
+            "\\\\server\\share\\file.txt",
+            "//server/share/file.txt",
+        ];
+
+        for path_str in invalid_paths {
+            let res = RelativePath::new(*path_str);
+            assert!(
+                res.is_err(),
+                "Expected '{}' to be rejected as empty or absolute, but got: {:?}",
+                path_str,
+                res.map(|r| r.as_path().to_path_buf())
+            );
+        }
+    }
+
+    #[test]
+    fn test_relative_path_rejects_traversal_devices_trailing_ads() {
+        let unsafe_paths = &[
+            // Directory traversals
+            "..",
+            "../file.txt",
+            "docs/../secret.txt",
+            "nested/dir/..",
+            ".",
+            "./file.txt",
+            "nested/./file.txt",
+            // DOS devices
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "COM1",
+            "COM9",
+            "LPT1",
+            "LPT9",
+            "CONIN$",
+            "CONOUT$",
+            "CLOCK$",
+            "subdir/CON",
+            "nested/NUL.txt",
+            "dir/com1.dat",
+            "lpt3.log",
+            // Unicode superscripts
+            "COM¹",
+            "LPT²",
+            // Trailing spaces & dots
+            "file.txt ",
+            "file.txt.",
+            "dir /file.txt",
+            "dir./file.txt",
+            "CON ",
+            "NUL.",
+            // Alternate Data Streams
+            "file.txt:stream",
+            "dir:ads/file.txt",
+            "foo:$DATA",
+            // Win32 forbidden characters
+            "file*.txt",
+            "file?.bin",
+            "<tag>.dat",
+            "pipe|name",
+            "quote\"name",
+        ];
+
+        for path_str in unsafe_paths {
+            let res = RelativePath::new(*path_str);
+            assert!(
+                res.is_err(),
+                "Expected '{}' to be rejected for safety/traversal/device/ads, but got Ok",
+                path_str
+            );
+        }
+    }
+
+    #[test]
+    fn test_relative_path_traits_and_methods() {
+        let rel = RelativePath::new("docs\\nested\\spec.txt").unwrap();
+
+        // Path normalization
+        assert_eq!(rel.as_path(), Path::new("docs/nested/spec.txt"));
+
+        // Deref
+        assert_eq!(rel.file_name(), Some(std::ffi::OsStr::new("spec.txt")));
+
+        // AsRef
+        fn assert_as_ref(p: impl AsRef<Path>) {
+            assert_eq!(p.as_ref(), Path::new("docs/nested/spec.txt"));
+        }
+        assert_as_ref(&rel);
+
+        // Borrow & HashMap
+        let mut map = std::collections::HashMap::new();
+        map.insert(rel.clone(), 42);
+        assert_eq!(map.get(Path::new("docs/nested/spec.txt")), Some(&42));
+
+        // Display & Debug
+        assert_eq!(format!("{}", rel), "docs/nested/spec.txt");
+        assert_eq!(
+            format!("{:?}", rel),
+            "RelativePath(\"docs/nested/spec.txt\")"
+        );
+
+        // to_sqlite_key
+        assert_eq!(rel.to_sqlite_key(), "docs/nested/spec.txt");
+
+        // to_ascii_lowercase
+        let upper_rel = RelativePath::new("Docs/Nested/SPEC.txt").unwrap();
+        assert_eq!(
+            upper_rel.to_ascii_lowercase().as_path(),
+            Path::new("docs/nested/spec.txt")
+        );
+
+        // Conversions
+        let pb: PathBuf = rel.clone().into();
+        assert_eq!(pb, PathBuf::from("docs/nested/spec.txt"));
+
+        let try_from_ref = RelativePath::try_from(Path::new("a/b.txt")).unwrap();
+        assert_eq!(try_from_ref.as_path(), Path::new("a/b.txt"));
+
+        let try_from_buf = RelativePath::try_from(PathBuf::from("a/b.txt")).unwrap();
+        assert_eq!(try_from_buf.as_path(), Path::new("a/b.txt"));
+
+        // Cross-type PartialEq
+        assert_eq!(rel, *Path::new("docs/nested/spec.txt"));
+        assert_eq!(rel, Path::new("docs/nested/spec.txt"));
+        assert_eq!(rel, "docs/nested/spec.txt");
+        assert_eq!(rel, *"docs/nested/spec.txt");
+        assert_eq!(*Path::new("docs/nested/spec.txt"), rel);
+        assert_eq!(Path::new("docs/nested/spec.txt"), rel);
+        assert_eq!("docs/nested/spec.txt", rel);
+        assert_eq!(*"docs/nested/spec.txt", rel);
+
+        // Serde roundtrip via toml
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+        struct Wrapper {
+            path: RelativePath,
+        }
+        let wrapper = Wrapper { path: rel.clone() };
+        let toml_str = toml::to_string(&wrapper).unwrap();
+        let decoded: Wrapper = toml::from_str(&toml_str).unwrap();
+        assert_eq!(decoded, wrapper);
+
+        // Serde deserialization invariant check
+        let invalid_toml = "path = \"../traversal.txt\"\n";
+        let err = toml::from_str::<Wrapper>(invalid_toml);
+        assert!(err.is_err());
     }
 }

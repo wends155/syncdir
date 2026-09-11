@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -431,83 +430,12 @@ pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> Result<bool, s
     Ok(entry.file_type()?.is_symlink())
 }
 
-pub(crate) fn normalize_superscripts_cow<'a>(s: &'a str) -> Cow<'a, str> {
-    if !s.bytes().any(|b| b >= 0x80) {
-        return Cow::Borrowed(s);
-    }
-    if !s
-        .chars()
-        .any(|c| matches!(c, '⁰' | '¹' | '²' | '³' | '⁴'..='⁹'))
-    {
-        return Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '⁰' => out.push('0'),
-            '¹' => out.push('1'),
-            '²' => out.push('2'),
-            '³' => out.push('3'),
-            '⁴' => out.push('4'),
-            '⁵' => out.push('5'),
-            '⁶' => out.push('6'),
-            '⁷' => out.push('7'),
-            '⁸' => out.push('8'),
-            '⁹' => out.push('9'),
-            other => out.push(other),
-        }
-    }
-    Cow::Owned(out)
-}
-
-#[doc(hidden)]
-pub fn is_safe_relative_path(path: &Path) -> bool {
-    if !path.is_relative() || path.as_os_str().is_empty() {
-        return false;
-    }
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$",
-        "CONOUT$", "CLOCK$",
-    ];
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => return false,
-            std::path::Component::Normal(os_str) => {
-                let s = os_str.to_string_lossy();
-                if s.contains(':') {
-                    return false;
-                }
-                // Reject Win32 wildcards and forbidden characters
-                if s.chars()
-                    .any(|c| matches!(c, '*' | '?' | '<' | '>' | '|' | '"'))
-                {
-                    return false;
-                }
-                // Reject components with trailing spaces or dots (Windows strips these)
-                if s.ends_with(' ') || s.ends_with('.') {
-                    return false;
-                }
-                // Normalize Unicode superscripts ('⁰'..'⁹') before stem extraction with zero-allocation on ASCII
-                let normalized = normalize_superscripts_cow(&s);
-                // Trim trailing spaces and dots before reserved name check
-                let trimmed = normalized.trim_end_matches([' ', '.']);
-                let stem = trimmed.split('.').next().unwrap_or("");
-                if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
-}
+pub use crate::path_util::is_safe_relative_path;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_util::normalize_superscripts_cow;
     use tempfile::tempdir;
 
     #[test]

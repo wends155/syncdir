@@ -1,6 +1,7 @@
 //! Domain types and task representations for synchronization operations.
 
 use crate::error::SyncError;
+pub use crate::path_util::RelativePath;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
