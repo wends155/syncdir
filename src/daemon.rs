@@ -11,7 +11,7 @@ use crate::sync::{
     LocalSyncEngine, SyncCommand, SyncEngine, SyncStatusObserver, SyncWorkerContext,
     start_sync_worker,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -324,9 +324,88 @@ impl SyncDaemon {
             })
             .map_err(SyncError::Io)
     }
+}
 
-    /// Starts all sync workers, the central directory watcher, and the central command broadcaster.
-    ///
+/// Fluent builder for constructing and starting a [`SyncDaemon`].
+pub struct SyncDaemonBuilder<F = SqliteEngineFactory> {
+    factory: F,
+    config: Config,
+    app_dir: PathBuf,
+    observer: Option<Arc<dyn SyncStatusObserver>>,
+    resolver: Arc<dyn crate::net::NetworkResolver>,
+    watcher_factory: Arc<dyn crate::monitor::WatcherFactory>,
+}
+
+impl SyncDaemonBuilder<SqliteEngineFactory> {
+    /// Create a new builder with default services (SqliteEngineFactory, Win32NetworkResolver, RecommendedWatcherFactory).
+    pub fn new(config: Config, app_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            factory: SqliteEngineFactory,
+            config,
+            app_dir: app_dir.into(),
+            observer: None,
+            resolver: Arc::new(crate::net::Win32NetworkResolver),
+            watcher_factory: Arc::new(crate::monitor::RecommendedWatcherFactory),
+        }
+    }
+}
+
+impl<F: SyncEngineFactory> SyncDaemonBuilder<F> {
+    /// Provide a custom engine factory.
+    pub fn factory<F2: SyncEngineFactory>(self, factory: F2) -> SyncDaemonBuilder<F2> {
+        SyncDaemonBuilder {
+            factory,
+            config: self.config,
+            app_dir: self.app_dir,
+            observer: self.observer,
+            resolver: self.resolver,
+            watcher_factory: self.watcher_factory,
+        }
+    }
+
+    /// Provide an optional sync status observer.
+    pub fn observer(mut self, observer: Option<Arc<dyn SyncStatusObserver>>) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Provide a custom network resolver.
+    pub fn resolver(mut self, resolver: Arc<dyn crate::net::NetworkResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Provide a custom watcher factory.
+    pub fn watcher_factory(
+        mut self,
+        watcher_factory: Arc<dyn crate::monitor::WatcherFactory>,
+    ) -> Self {
+        self.watcher_factory = watcher_factory;
+        self
+    }
+
+    /// Start the sync daemon with configured services.
+    pub fn start(self) -> Result<SyncDaemon, SyncError> {
+        SyncDaemon::start_with_all_services(
+            self.factory,
+            self.config,
+            &self.app_dir,
+            self.observer,
+            self.resolver,
+            self.watcher_factory,
+        )
+    }
+}
+
+impl SyncDaemon {
+    /// Create a fluent [`SyncDaemonBuilder`] for configuring and starting a daemon.
+    pub fn builder(
+        config: Config,
+        app_dir: impl Into<PathBuf>,
+    ) -> SyncDaemonBuilder<SqliteEngineFactory> {
+        SyncDaemonBuilder::new(config, app_dir)
+    }
+
     /// Initializes isolated signature cache SQLite databases for each configured target directory,
     /// launches independent worker threads, wires the filesystem directory watcher on the source folder,
     /// and triggers an initial full synchronization scan.
@@ -350,10 +429,11 @@ impl SyncDaemon {
         app_dir: &Path,
         observer: Option<Arc<dyn SyncStatusObserver>>,
     ) -> Result<Self, SyncError> {
-        Self::start_with_factory(SqliteEngineFactory, config, app_dir, observer)
+        Self::builder(config, app_dir).observer(observer).start()
     }
 
     /// Starts all sync workers using the provided engine factory.
+    #[deprecated(since = "0.2.0", note = "use SyncDaemon::builder instead")]
     #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
     pub fn start_with_factory<F: SyncEngineFactory>(
         factory: F,
@@ -361,11 +441,14 @@ impl SyncDaemon {
         app_dir: &Path,
         observer: Option<Arc<dyn SyncStatusObserver>>,
     ) -> Result<Self, SyncError> {
-        let resolver = Arc::new(crate::net::Win32NetworkResolver);
-        Self::start_with_factory_and_resolver(factory, config, app_dir, observer, resolver)
+        Self::builder(config, app_dir)
+            .factory(factory)
+            .observer(observer)
+            .start()
     }
 
     /// Starts all sync workers using the provided engine factory and network resolver.
+    #[deprecated(since = "0.2.0", note = "use SyncDaemon::builder instead")]
     #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
     pub fn start_with_factory_and_resolver<F: SyncEngineFactory>(
         factory: F,
@@ -374,17 +457,15 @@ impl SyncDaemon {
         observer: Option<Arc<dyn SyncStatusObserver>>,
         resolver: Arc<dyn crate::net::NetworkResolver>,
     ) -> Result<Self, SyncError> {
-        Self::start_with_all_services(
-            factory,
-            config,
-            app_dir,
-            observer,
-            resolver,
-            Arc::new(crate::monitor::RecommendedWatcherFactory),
-        )
+        Self::builder(config, app_dir)
+            .factory(factory)
+            .observer(observer)
+            .resolver(resolver)
+            .start()
     }
 
     /// Starts all sync workers using standard SqliteEngineFactory and custom resolver and watcher factory.
+    #[deprecated(since = "0.2.0", note = "use SyncDaemon::builder instead")]
     #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
     pub fn start_with_services(
         config: Config,
@@ -393,14 +474,11 @@ impl SyncDaemon {
         resolver: Arc<dyn crate::net::NetworkResolver>,
         watcher_factory: Arc<dyn crate::monitor::WatcherFactory>,
     ) -> Result<Self, SyncError> {
-        Self::start_with_all_services(
-            SqliteEngineFactory,
-            config,
-            app_dir,
-            observer,
-            resolver,
-            watcher_factory,
-        )
+        Self::builder(config, app_dir)
+            .observer(observer)
+            .resolver(resolver)
+            .watcher_factory(watcher_factory)
+            .start()
     }
 
     /// Starts all sync workers using custom engine factory, resolver, and watcher factory.
@@ -437,16 +515,17 @@ impl SyncDaemon {
                 target_path = %target_config.dest_dir().display(),
                 "Starting sync worker thread for target..."
             );
-            let worker_ctx = SyncWorkerContext::new(
+            let worker_ctx = SyncWorkerContext::builder(
                 idx,
                 target_config,
                 engine,
                 w_rx,
-                observer.clone(),
                 source_connectivity.clone(),
             )
-            .with_resolver(resolver.clone())
-            .with_cancellation(cancellation.clone());
+            .maybe_observer(observer.clone())
+            .resolver(resolver.clone())
+            .cancellation(cancellation.clone())
+            .build()?;
             let worker_handle = start_sync_worker(worker_ctx)?;
             worker_handles.push(worker_handle);
         }
@@ -597,6 +676,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sync_daemon_start_with_custom_factory() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("source");
@@ -678,6 +758,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sync_daemon_rejects_unvalidated_config() {
         let dir = tempdir().unwrap();
         // Config with zero destinations fails config.validate()
@@ -691,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sync_daemon_start_with_custom_resolver() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("source");
@@ -790,35 +872,27 @@ mod tests {
         assert!(daemon.worker_handles.is_empty());
     }
 
+    struct DummyWatcher(Arc<AtomicBool>);
+    impl crate::monitor::FileWatcher for DummyWatcher {
+        fn is_watching(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct DummyFactory(Arc<AtomicBool>);
+    impl crate::monitor::WatcherFactory for DummyFactory {
+        fn create_watcher(
+            &self,
+            _source_dir: &Path,
+            _tx: std::sync::mpsc::Sender<crate::sync::SyncCommand>,
+        ) -> Result<Box<dyn crate::monitor::FileWatcher>, SyncError> {
+            Ok(Box::new(DummyWatcher(self.0.clone())))
+        }
+    }
+
     #[test]
+    #[allow(deprecated)]
     fn test_sync_daemon_coordinates_with_mock_watcher() {
-        use crate::daemon::SyncDaemon;
-        use crate::error::SyncError;
-        use crate::monitor::{FileWatcher, WatcherFactory};
-        use crate::sync::SyncCommand;
-        use std::path::Path;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::mpsc::Sender;
-
-        struct DummyWatcher(Arc<AtomicBool>);
-        impl FileWatcher for DummyWatcher {
-            fn is_watching(&self) -> bool {
-                self.0.load(Ordering::SeqCst)
-            }
-        }
-
-        struct DummyFactory(Arc<AtomicBool>);
-        impl WatcherFactory for DummyFactory {
-            fn create_watcher(
-                &self,
-                _source_dir: &Path,
-                _tx: Sender<SyncCommand>,
-            ) -> Result<Box<dyn FileWatcher>, SyncError> {
-                Ok(Box::new(DummyWatcher(self.0.clone())))
-            }
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         let src = dir.path().join("source");
         let dst = dir.path().join("dest");
@@ -840,6 +914,34 @@ mod tests {
             factory,
         )
         .expect("daemon start");
+
+        assert!(daemon.watcher_running());
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn test_sync_daemon_builder_default_and_custom_services() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&dst).expect("dst");
+
+        let config = crate::config::Config::builder(src)
+            .dest_dir(dst)
+            .build()
+            .expect("config");
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let mock_watcher_factory = Arc::new(DummyFactory(flag));
+        let mock_resolver = Arc::new(crate::net::MockNetworkResolver::new());
+
+        let daemon = SyncDaemon::builder(config, dir.path())
+            .factory(MockEngineFactory)
+            .resolver(mock_resolver)
+            .watcher_factory(mock_watcher_factory)
+            .start()
+            .expect("start via builder");
 
         assert!(daemon.watcher_running());
         daemon.shutdown();
