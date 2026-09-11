@@ -22,6 +22,9 @@ fn parse_archive_timestamp(name: &str) -> Option<SystemTime> {
     }
 }
 
+/// Maximum candidate files evaluated per archive pruning cycle to bound memory and I/O.
+pub(crate) const MAX_ARCHIVE_PRUNE_CANDIDATES: usize = 5000;
+
 pub(crate) fn prune_archive(
     archive_dir: &Path,
     max_age_days: u64,
@@ -52,11 +55,16 @@ pub(crate) fn prune_archive(
         depth: usize,
     ) -> std::io::Result<()> {
         const MAX_ARCHIVE_DEPTH: usize = 32;
-        if depth > MAX_ARCHIVE_DEPTH {
-            tracing::warn!(path = %dir.display(), "Max archive directory depth exceeded, skipping");
+        if depth > MAX_ARCHIVE_DEPTH || files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
+            if depth > MAX_ARCHIVE_DEPTH {
+                tracing::warn!(path = %dir.display(), "Max archive directory depth exceeded, skipping");
+            }
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
+            if files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
+                break;
+            }
             let entry = entry?;
             match is_reparse_or_symlink(&entry) {
                 Ok(true) => {
@@ -78,6 +86,9 @@ pub(crate) fn prune_archive(
             if ft.is_dir() {
                 let next_inherited = parsed_time.or(inherited_time);
                 collect_files(&path, files, total_bytes, next_inherited, depth + 1)?;
+                if files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
+                    break;
+                }
             } else if ft.is_file()
                 && let Ok(meta) = entry.metadata()
             {
@@ -628,5 +639,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_archive_manager_prune_bounded_candidate_limit() {
+        assert_eq!(MAX_ARCHIVE_PRUNE_CANDIDATES, 5000);
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("dest");
+        let archive_dir = dest.join(".syncdir_archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        // Create 10 dummy archive files
+        for i in 0..10 {
+            let f = archive_dir.join(format!("172600000000{}_file.txt", i));
+            fs::write(f, b"dummy").unwrap();
+        }
+
+        // Direct prune with 0 age days and 0 max bytes enforces eviction ceiling
+        assert!(prune_archive(&archive_dir, 0, 0).is_ok());
+        let remaining = fs::read_dir(&archive_dir).unwrap().count();
+        assert_eq!(remaining, 0);
     }
 }

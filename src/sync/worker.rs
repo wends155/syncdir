@@ -837,6 +837,31 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
         }
     }
 
+    fn flush_staged_paths(&mut self, staged_paths: &mut Vec<PathBuf>, retry_dur: Duration) {
+        if staged_paths.is_empty() {
+            return;
+        }
+        match self.context.engine.flush_staged_syncs() {
+            Ok(()) => {
+                for p in staged_paths.drain(..) {
+                    self.state.reset_failure(&p);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    count = staged_paths.len(),
+                    "Failed to flush staged sync batch; requeuing paths for retry"
+                );
+                for p in staged_paths.drain(..) {
+                    let attempts = self.state.record_failure(&p);
+                    let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                    self.queue.requeue_sync_retry(p, backoff);
+                }
+            }
+        }
+    }
+
     /// Execute a discrete tick of the worker state machine at simulated timestamp `now`.
     ///
     /// Evaluates target reachability, prunes archives, drains expired debounce queues,
@@ -908,10 +933,18 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
 
         if self.reachability.is_dest_online() && self.state.should_prune_archive(now) {
             self.state.record_prune(now);
-            let _ = self
+            if let Err(e) = self
                 .context
                 .engine
-                .prune_archive(self.reachability.active_dest());
+                .prune_archive(self.reachability.active_dest())
+            {
+                tracing::warn!(
+                    target_index = self.context.target_index + 1,
+                    target = %self.reachability.active_dest().display(),
+                    error = %e,
+                    "Periodic archive prune failed"
+                );
+            }
         }
 
         let can_drain = self.reachability.is_dest_online()
@@ -920,12 +953,14 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
 
         if can_drain {
             let ready_syncs = self.queue.drain_ready_syncs(now);
+            let mut staged_paths: Vec<PathBuf> = Vec::new();
             for path in ready_syncs {
                 if self
                     .context
                     .cancellation
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    self.flush_staged_paths(&mut staged_paths, retry_dur);
                     return Ok(WorkerTickOutcome::ShutdownRequested);
                 }
                 if network_offline_detected
@@ -936,13 +971,16 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                     continue;
                 }
 
-                match self.context.engine.sync_file_to_dest_buffered(
+                match self.context.engine.sync_file_to_dest_staged(
                     &path,
                     self.reachability.active_dest(),
                     &mut self.state.scratch,
                 ) {
                     Ok(()) => {
-                        self.state.reset_failure(&path);
+                        staged_paths.push(path);
+                        if staged_paths.len() >= 500 {
+                            self.flush_staged_paths(&mut staged_paths, retry_dur);
+                        }
                     }
                     Err(SyncError::WriteVerificationFailed { .. }) => {
                         let attempts = self.state.record_failure(&path);
@@ -1051,6 +1089,7 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                     }
                 }
             }
+            self.flush_staged_paths(&mut staged_paths, retry_dur);
 
             let ready_deletes = self.queue.drain_ready_deletes(now);
             for path in ready_deletes {
@@ -2092,5 +2131,59 @@ mod tests {
             "Worker thread failed to terminate after draining Shutdown/Cancelled command"
         );
         let _ = join_thread.join();
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_sync_worker_runner_periodic_archive_prune_failure_emits_warn_log() {
+        let buffer = SharedBuffer::default();
+        let writer_buffer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer_buffer.clone())
+            .with_ansi(false)
+            .finish();
+
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source).dest_dir(dest).build_unvalidated();
+
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = MockSyncEngine::new();
+        engine
+            .set_sync_error(|| SyncError::Io(std::io::Error::other("disk full on archive volume")));
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+        let mut runner = SyncWorkerRunner::new(ctx);
+
+        // Advance simulated time past 3600s interval to trigger prune
+        let now = Instant::now() + Duration::from_secs(3605);
+        let outcome = tracing::subscriber::with_default(subscriber, || runner.tick(now)).unwrap();
+        assert_eq!(outcome, WorkerTickOutcome::Continue);
+
+        let bytes = buffer.0.lock().unwrap().clone();
+        let log_str = String::from_utf8_lossy(&bytes);
+        assert!(
+            log_str.contains("Periodic archive prune failed"),
+            "Expected 'Periodic archive prune failed' in logs, got: {}",
+            log_str
+        );
     }
 }

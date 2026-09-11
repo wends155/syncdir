@@ -10,9 +10,7 @@ use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 
 use super::delta::DirtyBlockRange;
-use super::path_safety::{
-    is_reparse_or_symlink_meta, is_safe_relative_path, verify_source_not_reparse,
-};
+use super::path_safety::{is_reparse_or_symlink_meta, is_safe_relative_path};
 use super::scanner::scan_dir;
 
 #[allow(unused_imports)]
@@ -158,6 +156,26 @@ pub trait SyncEngine: Send + Sync {
         dest_dir: &Path,
         scratch: &mut [u8],
     ) -> Result<(), SyncError>;
+
+    /// Synchronize a single file to a destination directory, staging its database metadata update
+    /// in an in-memory queue instead of committing immediately to SQLite.
+    ///
+    /// The default trait implementation falls back to `sync_file_to_dest_buffered`, committing immediately.
+    fn sync_file_to_dest_staged(
+        &self,
+        path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
+        self.sync_file_to_dest_buffered(path, dest_dir, scratch)
+    }
+
+    /// Flush all staged file records and hash metadata updates to the database in a single transaction.
+    ///
+    /// The default trait implementation is a no-op returning `Ok(())`.
+    fn flush_staged_syncs(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
 
     /// Handle deletion of a file by archiving it on the default configured destination.
     ///
@@ -352,11 +370,12 @@ pub struct LocalSyncEngine<S: HashStore> {
     db: std::sync::Arc<S>,
     config: TargetSyncConfig,
     resolved_dest: Option<PathBuf>,
-    verified_dirs: std::sync::Mutex<HashSet<PathBuf>>,
+    reparse_cache: std::sync::Arc<crate::sync::path_safety::ReparseCache>,
     small_file_engine: crate::sync::small_file::SmallFileTransferEngine,
     delta_engine: crate::sync::delta::DeltaTransferEngine<std::sync::Arc<S>>,
     archive_manager: crate::sync::archive::ArchiveManager,
     scanner: crate::sync::scanner::DirectoryScanner,
+    staged_records: std::sync::Mutex<Vec<(FileRecord, Vec<crate::db::BlockHash>)>>,
 }
 
 impl<S: HashStore> LocalSyncEngine<S> {
@@ -376,24 +395,28 @@ impl<S: HashStore> LocalSyncEngine<S> {
             db,
             config,
             resolved_dest: None,
-            verified_dirs: std::sync::Mutex::new(HashSet::new()),
+            reparse_cache: std::sync::Arc::new(crate::sync::path_safety::ReparseCache::new(
+                50_000, 10_000,
+            )),
             small_file_engine,
             delta_engine,
             archive_manager,
             scanner,
+            staged_records: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Return a shared handle to the engine's `ReparseCache`.
+    pub fn reparse_cache(&self) -> std::sync::Arc<crate::sync::path_safety::ReparseCache> {
+        std::sync::Arc::clone(&self.reparse_cache)
     }
 
     /// Invalidate any cached directory metadata (e.g. reparse point and ancestor junction checks).
     ///
-    /// Clears the internal `verified_dirs` cache so that subsequent synchronizations re-verify
+    /// Clears the internal `reparse_cache` so that subsequent synchronizations re-verify
     /// the entire path tree against reparse point and symlink substitution attacks.
     pub fn invalidate_verified_dirs(&self) {
-        let mut cache = self
-            .verified_dirs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.clear();
+        self.reparse_cache.clear();
     }
 
     /// Evict a specific directory and its descendants from the verified directory cache.
@@ -405,11 +428,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
     ///
     /// * `dir` - The directory path whose cache entries should be purged.
     pub fn evict_verified_dir(&self, dir: &Path) {
-        let mut cache = self
-            .verified_dirs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.retain(|p| !p.starts_with(dir));
+        self.reparse_cache.evict_dir(dir);
     }
 
     /// Acquire an exclusive RAII lease on a `DirtyBlockRange` buffer.
@@ -496,93 +515,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
         dest_dir: &Path,
         rel_path: &Path,
     ) -> Result<Option<std::fs::Metadata>, SyncError> {
-        // Phase 1: Inspect cache under brief lock and collect unverified ancestors
-        let (root_verified, unverified_ancestors) = {
-            let cache = self
-                .verified_dirs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let root_ok = cache.contains(dest_dir);
-            let mut unverified = Vec::new();
-            let mut curr = dest_dir.to_path_buf();
-            let components: Vec<_> = rel_path.components().collect();
-            let total = components.len();
-            for (i, c) in components.into_iter().enumerate() {
-                curr.push(c);
-                if i + 1 < total && !cache.contains(&curr) {
-                    unverified.push(curr.clone());
-                }
-            }
-            (root_ok, unverified)
-        };
-
-        // Phase 2: If cache miss, verify ancestors over filesystem without holding lock
-        if !root_verified || !unverified_ancestors.is_empty() {
-            let mut verified_to_insert = Vec::new();
-
-            if !root_verified {
-                let meta = fs::symlink_metadata(dest_dir).map_err(SyncError::Io)?;
-                if is_reparse_or_symlink_meta(&meta) {
-                    return Err(SyncError::validation_reparse(format!(
-                        "Destination directory '{}' is a symlink or reparse point; refusing to sync",
-                        dest_dir.display()
-                    )));
-                }
-                if meta.is_dir() {
-                    verified_to_insert.push(dest_dir.to_path_buf());
-                }
-            }
-
-            for ancestor in &unverified_ancestors {
-                match fs::symlink_metadata(ancestor) {
-                    Ok(meta) => {
-                        if is_reparse_or_symlink_meta(&meta) {
-                            return Err(SyncError::validation_reparse(format!(
-                                "Destination component '{}' is a symlink or reparse point; refusing to write",
-                                ancestor.display()
-                            )));
-                        }
-                        if meta.is_dir() {
-                            verified_to_insert.push(ancestor.clone());
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Intermediate parent does not exist yet; stop caching deeper uncreated children
-                        break;
-                    }
-                    Err(e) => return Err(SyncError::Io(e)),
-                }
-            }
-
-            // Phase 3: Re-acquire lock briefly to insert only genuinely verified directories
-            let mut cache = self
-                .verified_dirs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cache.len() > 1000 {
-                cache.clear();
-            }
-            for verified in verified_to_insert {
-                cache.insert(verified);
-            }
-        }
-
-        // Leaf check
-        let leaf_path = dest_dir.join(rel_path);
-        let meta = match fs::symlink_metadata(&leaf_path) {
-            Ok(m) => {
-                if is_reparse_or_symlink_meta(&m) {
-                    return Err(SyncError::validation_reparse(format!(
-                        "Destination component '{}' is a symlink or reparse point; refusing to write",
-                        leaf_path.display()
-                    )));
-                }
-                Some(m)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(SyncError::Io(e)),
-        };
-        Ok(meta)
+        crate::sync::path_safety::verify_destination_not_reparse_cached(
+            dest_dir,
+            rel_path,
+            &self.reparse_cache,
+        )
     }
 
     pub(crate) fn sync_file_to_dest_core(
@@ -606,7 +543,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
             tracing::debug!(path = %src_path.display(), "Skipping symlink or reparse point");
             return Ok(None);
         }
-        verify_source_not_reparse(self.config.source_dir(), rel_path)?;
+        crate::sync::path_safety::verify_source_not_reparse_cached(
+            self.config.source_dir(),
+            rel_path,
+            &self.reparse_cache,
+        )?;
         if sym_meta.is_dir() {
             let _ = self.verify_destination_cached(dest_dir, rel_path)?;
             fs::create_dir_all(&dest_path)?;
@@ -704,6 +645,35 @@ impl<S: HashStore> LocalSyncEngine<S> {
         )
     }
 
+    /// Synchronize a file using a reusable scratch buffer and stage its metadata update for batch persistence.
+    pub fn sync_file_to_dest_staged(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
+        let file_record = self.db.get_file(rel_path)?;
+        if let Some((record, hashes)) =
+            self.sync_file_to_dest_core(rel_path, dest_dir, scratch, file_record.as_ref())?
+        {
+            let mut staged = self
+                .staged_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            staged.push((record, hashes));
+        }
+        Ok(())
+    }
+
+    /// Flush all staged file records and hash metadata updates to the database in a single batch.
+    pub fn flush_staged_syncs(&self) -> Result<(), SyncError> {
+        let mut staged = self
+            .staged_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.flush_record_batch(&mut staged)
+    }
+
     /// Flush accumulated file records and hashes to the database in a single batch.
     pub(crate) fn flush_record_batch(
         &self,
@@ -716,7 +686,12 @@ impl<S: HashStore> LocalSyncEngine<S> {
             .iter()
             .map(|(rec, hashes)| (rec, hashes.as_slice()))
             .collect();
-        self.db.save_files_batch(&refs)?;
+        if let Err(e) = self.db.save_files_batch(&refs) {
+            tracing::warn!(error = %e, "Batch save failed; falling back to individual record saves");
+            for (rec, hashes) in batch.iter() {
+                self.db.save_file(rec, hashes)?;
+            }
+        }
         batch.clear();
         Ok(())
     }
@@ -1026,6 +1001,19 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         scratch: &mut [u8],
     ) -> Result<(), SyncError> {
         self.sync_file_to_dest_buffered(path, dest_dir, scratch)
+    }
+
+    fn sync_file_to_dest_staged(
+        &self,
+        path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+    ) -> Result<(), SyncError> {
+        self.sync_file_to_dest_staged(path, dest_dir, scratch)
+    }
+
+    fn flush_staged_syncs(&self) -> Result<(), SyncError> {
+        self.flush_staged_syncs()
     }
 
     fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
@@ -1472,7 +1460,7 @@ mod tests {
         // Populate verified_dirs cache via verify_destination_cached
         let _ = engine.verify_destination_cached(&dst, Path::new("sub/nested/file.txt"));
         {
-            let cache = engine.verified_dirs.lock().unwrap();
+            let cache = engine.reparse_cache();
             assert!(cache.contains(&dst));
             assert!(cache.contains(&sub));
             assert!(cache.contains(&nested));
@@ -1481,7 +1469,7 @@ mod tests {
         // Test prefix eviction: evicting sub must remove sub and sub/nested, keeping dst
         engine.evict_verified_dir(&sub);
         {
-            let cache = engine.verified_dirs.lock().unwrap();
+            let cache = engine.reparse_cache();
             assert!(cache.contains(&dst), "Root destination must remain cached");
             assert!(!cache.contains(&sub), "Evicted dir must be removed");
             assert!(
@@ -1494,7 +1482,7 @@ mod tests {
         let engine_trait: &dyn SyncEngine = &engine;
         engine_trait.invalidate_verified_dirs();
         {
-            let cache = engine.verified_dirs.lock().unwrap();
+            let cache = engine.reparse_cache();
             assert!(cache.is_empty(), "Full invalidation must clear all entries");
         }
     }
@@ -2332,5 +2320,99 @@ mod tests {
         drop(lease);
         let pooled = pool.lock().unwrap();
         assert!(pooled.is_some());
+    }
+
+    #[test]
+    fn test_local_sync_engine_reparse_cache_shared_across_components() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let config = Config::builder(src)
+            .dest_dir(dst.clone())
+            .build_unvalidated();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+
+        let cache = engine.reparse_cache();
+        assert_eq!(cache.len(), 0);
+        let _ = engine.verify_destination_cached(&dst, Path::new("sub/file.txt"));
+        assert!(cache.contains(&dst));
+    }
+
+    #[test]
+    fn test_sync_engine_staged_sync_and_flush_trait_methods() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("f1.txt"), b"hello 1").unwrap();
+        fs::write(src.join("f2.txt"), b"hello 2").unwrap();
+
+        let config = Config::builder(src)
+            .dest_dir(dst.clone())
+            .build_unvalidated();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+
+        let mut scratch = vec![0u8; 64 * 1024];
+        engine
+            .sync_file_to_dest_staged(Path::new("f1.txt"), &dst, &mut scratch)
+            .unwrap();
+        engine
+            .sync_file_to_dest_staged(Path::new("f2.txt"), &dst, &mut scratch)
+            .unwrap();
+
+        // Not yet committed to DB
+        assert_eq!(store.save_file_count(), 0);
+        assert_eq!(store.batch_save_count(), 0);
+
+        // Flush commits both records in 1 batch save call
+        engine.flush_staged_syncs().unwrap();
+        assert_eq!(store.batch_save_count(), 1);
+        assert_eq!(store.save_file_count(), 0);
+    }
+
+    #[test]
+    fn test_local_sync_engine_staged_sync_falls_back_to_individual_save_on_batch_error() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("f1.txt"), b"test 1").unwrap();
+        fs::write(src.join("f2.txt"), b"test 2").unwrap();
+
+        let config = Config::builder(src)
+            .dest_dir(dst.clone())
+            .build_unvalidated();
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let store = MockHashStore::new();
+
+        // Inject error hook on save_files_batch
+        store.set_error_hook(Some(Box::new(|op| {
+            if op == "save_files_batch" {
+                Some(SyncError::db("simulated batch failure"))
+            } else {
+                None
+            }
+        })));
+
+        let engine = LocalSyncEngine::new(store.clone(), target_cfg);
+        let mut scratch = vec![0u8; 64 * 1024];
+        engine
+            .sync_file_to_dest_staged(Path::new("f1.txt"), &dst, &mut scratch)
+            .unwrap();
+        engine
+            .sync_file_to_dest_staged(Path::new("f2.txt"), &dst, &mut scratch)
+            .unwrap();
+
+        // Flush should fall back to individual save_file calls
+        engine.flush_staged_syncs().unwrap();
+        assert_eq!(store.batch_save_count(), 0);
+        assert_eq!(store.save_file_count(), 2);
     }
 }

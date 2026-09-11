@@ -1,11 +1,126 @@
-#[cfg(test)]
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::{self, Metadata};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use crate::error::SyncError;
+
+/// Two-tiered reparse point verification cache partitioned by relative depth from the sync root.
+///
+/// Ancestors within 3 levels of the base root are retained in a persistent `shallow` set (up to `max_shallow` entries)
+/// to eliminate redundant network reparse validation on SMB roots. Deep directories beyond depth 3 are kept in `deep`
+/// (up to `max_deep` entries) with automatic eviction upon capacity breach.
+#[derive(Debug)]
+pub struct ReparseCache {
+    inner: RwLock<ReparseCacheInner>,
+    max_shallow: usize,
+    max_deep: usize,
+}
+
+#[derive(Debug)]
+struct ReparseCacheInner {
+    shallow: HashSet<PathBuf>,
+    deep: HashSet<PathBuf>,
+}
+
+impl ReparseCache {
+    /// Create a new `ReparseCache` with given shallow and deep capacity limits.
+    pub fn new(max_shallow: usize, max_deep: usize) -> Self {
+        Self {
+            inner: RwLock::new(ReparseCacheInner {
+                shallow: HashSet::new(),
+                deep: HashSet::new(),
+            }),
+            max_shallow,
+            max_deep,
+        }
+    }
+
+    /// Check whether `path` is contained in either the shallow or deep cache.
+    pub fn contains(&self, path: &Path) -> bool {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.shallow.contains(path) || inner.deep.contains(path)
+    }
+
+    /// Insert a verified ancestor directory, classifying it into `shallow` (relative depth <= 3) or `deep`.
+    pub fn insert_ancestor(&self, base_root: &Path, ancestor: &Path) {
+        let rel_depth = match ancestor.strip_prefix(base_root) {
+            Ok(rel) => rel.components().count(),
+            Err(_) => 0,
+        };
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rel_depth <= 3 {
+            if inner.shallow.len() >= self.max_shallow {
+                inner.shallow.clear();
+            }
+            inner.shallow.insert(ancestor.to_path_buf());
+        } else {
+            if inner.deep.len() >= self.max_deep {
+                inner.deep.clear();
+            }
+            inner.deep.insert(ancestor.to_path_buf());
+        }
+    }
+
+    /// Evict `dir` and all its descendants from both cache tiers.
+    pub fn evict_dir(&self, dir: &Path) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.shallow.retain(|p| !p.starts_with(dir));
+        inner.deep.retain(|p| !p.starts_with(dir));
+    }
+
+    /// Clear all cached directories across both tiers.
+    pub fn clear(&self) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.shallow.clear();
+        inner.deep.clear();
+    }
+
+    /// Number of entries in the shallow cache tier.
+    pub fn shallow_len(&self) -> usize {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.shallow.len()
+    }
+
+    /// Number of entries in the deep cache tier.
+    pub fn deep_len(&self) -> usize {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.deep.len()
+    }
+
+    /// Total number of cached entries across both tiers.
+    pub fn len(&self) -> usize {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.shallow.len() + inner.deep.len()
+    }
+
+    /// Returns `true` if no entries are cached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 #[cfg(windows)]
 pub(crate) fn verify_destination_not_reparse(
@@ -73,14 +188,13 @@ pub(crate) fn verify_destination_not_reparse(
     Ok(leaf_meta)
 }
 
-#[cfg(all(windows, test))]
-#[doc(hidden)]
+#[cfg(windows)]
 pub fn verify_destination_not_reparse_cached(
     dest_dir: &Path,
     rel_path: &Path,
-    verified_dirs: &mut HashSet<PathBuf>,
+    cache: &ReparseCache,
 ) -> Result<Option<Metadata>, SyncError> {
-    if !verified_dirs.contains(dest_dir) {
+    if !cache.contains(dest_dir) {
         if fs::symlink_metadata(dest_dir)
             .map(|m| is_reparse_or_symlink_meta(&m))
             .unwrap_or(false)
@@ -90,10 +204,7 @@ pub fn verify_destination_not_reparse_cached(
                 dest_dir.display()
             )));
         }
-        if verified_dirs.len() >= 1000 {
-            verified_dirs.clear();
-        }
-        verified_dirs.insert(dest_dir.to_path_buf());
+        cache.insert_ancestor(dest_dir, dest_dir);
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
@@ -102,7 +213,7 @@ pub fn verify_destination_not_reparse_cached(
     for (i, component) in components.into_iter().enumerate() {
         let is_leaf = i + 1 == total;
         current.push(component);
-        if verified_dirs.contains(&current) {
+        if cache.contains(&current) {
             if is_leaf {
                 leaf_meta = fs::symlink_metadata(&current).ok();
             }
@@ -116,10 +227,7 @@ pub fn verify_destination_not_reparse_cached(
                 )));
             }
             if m.is_dir() {
-                if verified_dirs.len() >= 1000 {
-                    verified_dirs.clear();
-                }
-                verified_dirs.insert(current.clone());
+                cache.insert_ancestor(dest_dir, &current);
             }
             if is_leaf {
                 leaf_meta = Some(m);
@@ -131,14 +239,13 @@ pub fn verify_destination_not_reparse_cached(
     Ok(leaf_meta)
 }
 
-#[cfg(all(not(windows), test))]
-#[doc(hidden)]
+#[cfg(not(windows))]
 pub fn verify_destination_not_reparse_cached(
     dest_dir: &Path,
     rel_path: &Path,
-    verified_dirs: &mut HashSet<PathBuf>,
+    cache: &ReparseCache,
 ) -> Result<Option<Metadata>, SyncError> {
-    if !verified_dirs.contains(dest_dir) {
+    if !cache.contains(dest_dir) {
         if let Ok(m) = fs::symlink_metadata(dest_dir) {
             if is_reparse_or_symlink_meta(&m) {
                 return Err(SyncError::validation_reparse(format!(
@@ -147,10 +254,7 @@ pub fn verify_destination_not_reparse_cached(
                 )));
             }
         }
-        if verified_dirs.len() >= 1000 {
-            verified_dirs.clear();
-        }
-        verified_dirs.insert(dest_dir.to_path_buf());
+        cache.insert_ancestor(dest_dir, dest_dir);
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
@@ -159,7 +263,7 @@ pub fn verify_destination_not_reparse_cached(
     for (i, component) in components.into_iter().enumerate() {
         let is_leaf = i + 1 == total;
         current.push(component);
-        if verified_dirs.contains(&current) {
+        if cache.contains(&current) {
             if is_leaf {
                 leaf_meta = fs::symlink_metadata(&current).ok();
             }
@@ -173,10 +277,7 @@ pub fn verify_destination_not_reparse_cached(
                 )));
             }
             if m.is_dir() {
-                if verified_dirs.len() >= 1000 {
-                    verified_dirs.clear();
-                }
-                verified_dirs.insert(current.clone());
+                cache.insert_ancestor(dest_dir, &current);
             }
             if is_leaf {
                 leaf_meta = Some(m);
@@ -189,6 +290,84 @@ pub fn verify_destination_not_reparse_cached(
 }
 
 #[cfg(windows)]
+pub fn verify_source_not_reparse_cached(
+    source_dir: &Path,
+    rel_path: &Path,
+    cache: &ReparseCache,
+) -> Result<(), SyncError> {
+    if !cache.contains(source_dir) {
+        if fs::symlink_metadata(source_dir)
+            .map(|m| is_reparse_or_symlink_meta(&m))
+            .unwrap_or(false)
+        {
+            return Err(SyncError::validation_reparse(format!(
+                "Source root '{}' is a symlink or reparse point; refusing to read",
+                source_dir.display()
+            )));
+        }
+        cache.insert_ancestor(source_dir, source_dir);
+    }
+    let mut current = source_dir.to_path_buf();
+    for component in rel_path.parent().into_iter().flat_map(|p| p.components()) {
+        current.push(component);
+        if cache.contains(&current) {
+            continue;
+        }
+        if let Ok(m) = fs::symlink_metadata(&current) {
+            if is_reparse_or_symlink_meta(&m) {
+                return Err(SyncError::validation_reparse(format!(
+                    "Source ancestor '{}' is a symlink or reparse point; refusing to read",
+                    current.display()
+                )));
+            }
+            if m.is_dir() {
+                cache.insert_ancestor(source_dir, &current);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn verify_source_not_reparse_cached(
+    source_dir: &Path,
+    rel_path: &Path,
+    cache: &ReparseCache,
+) -> Result<(), SyncError> {
+    if !cache.contains(source_dir) {
+        if let Ok(m) = fs::symlink_metadata(source_dir) {
+            if is_reparse_or_symlink_meta(&m) {
+                return Err(SyncError::validation_reparse(format!(
+                    "Source root '{}' is a symlink; refusing to read",
+                    source_dir.display()
+                )));
+            }
+        }
+        cache.insert_ancestor(source_dir, source_dir);
+    }
+    let mut current = source_dir.to_path_buf();
+    for component in rel_path.parent().into_iter().flat_map(|p| p.components()) {
+        current.push(component);
+        if cache.contains(&current) {
+            continue;
+        }
+        if let Ok(m) = fs::symlink_metadata(&current) {
+            if is_reparse_or_symlink_meta(&m) {
+                return Err(SyncError::validation_reparse(format!(
+                    "Source ancestor '{}' is a symlink; refusing to read",
+                    current.display()
+                )));
+            }
+            if m.is_dir() {
+                cache.insert_ancestor(source_dir, &current);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn verify_source_not_reparse(
     source_dir: &Path,
     rel_path: &Path,
@@ -209,6 +388,7 @@ pub(crate) fn verify_source_not_reparse(
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub(crate) fn verify_source_not_reparse(
     source_dir: &Path,
     rel_path: &Path,
@@ -251,6 +431,35 @@ pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> Result<bool, s
     Ok(entry.file_type()?.is_symlink())
 }
 
+pub(crate) fn normalize_superscripts_cow<'a>(s: &'a str) -> Cow<'a, str> {
+    if !s.bytes().any(|b| b >= 0x80) {
+        return Cow::Borrowed(s);
+    }
+    if !s
+        .chars()
+        .any(|c| matches!(c, '⁰' | '¹' | '²' | '³' | '⁴'..='⁹'))
+    {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '⁰' => out.push('0'),
+            '¹' => out.push('1'),
+            '²' => out.push('2'),
+            '³' => out.push('3'),
+            '⁴' => out.push('4'),
+            '⁵' => out.push('5'),
+            '⁶' => out.push('6'),
+            '⁷' => out.push('7'),
+            '⁸' => out.push('8'),
+            '⁹' => out.push('9'),
+            other => out.push(other),
+        }
+    }
+    Cow::Owned(out)
+}
+
 #[doc(hidden)]
 pub fn is_safe_relative_path(path: &Path) -> bool {
     if !path.is_relative() || path.as_os_str().is_empty() {
@@ -281,20 +490,10 @@ pub fn is_safe_relative_path(path: &Path) -> bool {
                 if s.ends_with(' ') || s.ends_with('.') {
                     return false;
                 }
-                // Normalize Unicode superscripts ('⁰'..'⁹') before stem extraction
-                let s = s
-                    .replace('⁰', "0")
-                    .replace('¹', "1")
-                    .replace('²', "2")
-                    .replace('³', "3")
-                    .replace('⁴', "4")
-                    .replace('⁵', "5")
-                    .replace('⁶', "6")
-                    .replace('⁷', "7")
-                    .replace('⁸', "8")
-                    .replace('⁹', "9");
+                // Normalize Unicode superscripts ('⁰'..'⁹') before stem extraction with zero-allocation on ASCII
+                let normalized = normalize_superscripts_cow(&s);
                 // Trim trailing spaces and dots before reserved name check
-                let trimmed = s.trim_end_matches([' ', '.']);
+                let trimmed = normalized.trim_end_matches([' ', '.']);
                 let stem = trimmed.split('.').next().unwrap_or("");
                 if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
                     return false;
@@ -371,15 +570,15 @@ mod tests {
         let dest_dir = tmp.path().join("dest");
         std::fs::create_dir(&dest_dir).unwrap();
 
-        let mut verified = HashSet::new();
+        let cache = ReparseCache::new(50_000, 10_000);
         let file_rel = Path::new("sub/file.txt");
-        assert!(!verified.contains(&dest_dir));
+        assert!(!cache.contains(&dest_dir));
 
-        let res = verify_destination_not_reparse_cached(&dest_dir, file_rel, &mut verified);
+        let res = verify_destination_not_reparse_cached(&dest_dir, file_rel, &cache);
         assert!(res.is_ok());
         assert!(
-            verified.contains(&dest_dir),
-            "Expected dest_dir to be cached in verified_dirs"
+            cache.contains(&dest_dir),
+            "Expected dest_dir to be cached in reparse cache"
         );
     }
 
@@ -406,9 +605,9 @@ mod tests {
         fs::write(deep.join("file1.txt"), b"1").unwrap();
         fs::write(deep.join("file2.txt"), b"2").unwrap();
 
-        let mut cache = HashSet::new();
+        let cache = ReparseCache::new(50_000, 10_000);
         let meta1 =
-            verify_destination_not_reparse_cached(&dest, Path::new("a/b/c/file1.txt"), &mut cache)
+            verify_destination_not_reparse_cached(&dest, Path::new("a/b/c/file1.txt"), &cache)
                 .unwrap();
         assert!(meta1.is_some());
         assert!(!cache.is_empty());
@@ -416,7 +615,7 @@ mod tests {
 
         // Second file in same directory should hit cache for all ancestors
         let meta2 =
-            verify_destination_not_reparse_cached(&dest, Path::new("a/b/c/file2.txt"), &mut cache)
+            verify_destination_not_reparse_cached(&dest, Path::new("a/b/c/file2.txt"), &cache)
                 .unwrap();
         assert!(meta2.is_some());
         assert_eq!(cache.len(), count_before);
@@ -431,14 +630,14 @@ mod tests {
         let file = deep.join("leaf.txt");
         fs::write(&file, b"content").unwrap();
 
-        let mut cache = HashSet::new();
+        let cache = ReparseCache::new(50_000, 10_000);
         // Pre-insert deep into cache
-        cache.insert(deep.clone());
+        cache.insert_ancestor(&dest, &deep);
 
         let meta = verify_destination_not_reparse_cached(
             &dest,
             Path::new("cached_ancestor/leaf.txt"),
-            &mut cache,
+            &cache,
         )
         .unwrap();
 
@@ -457,12 +656,11 @@ mod tests {
         let dir = dest.join("cached_dir");
         fs::create_dir_all(&dir).unwrap();
 
-        let mut cache = HashSet::new();
-        cache.insert(dir.clone());
+        let cache = ReparseCache::new(50_000, 10_000);
+        cache.insert_ancestor(&dest, &dir);
 
         let meta =
-            verify_destination_not_reparse_cached(&dest, Path::new("cached_dir"), &mut cache)
-                .unwrap();
+            verify_destination_not_reparse_cached(&dest, Path::new("cached_dir"), &cache).unwrap();
 
         assert!(meta.is_some());
         let meta = meta.unwrap();
@@ -630,5 +828,78 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn test_reparse_cache_shallow_retained_and_deep_evicted() {
+        let cache = ReparseCache::new(50_000, 10_000);
+        let root = Path::new("C:/dest");
+        let shallow = root.join("a/b/c"); // depth 3 from root
+        let deep = root.join("a/b/c/d/e"); // depth 5 from root
+
+        cache.insert_ancestor(root, &shallow);
+        cache.insert_ancestor(root, &deep);
+
+        assert_eq!(cache.shallow_len(), 1);
+        assert_eq!(cache.deep_len(), 1);
+        assert!(cache.contains(&shallow));
+        assert!(cache.contains(&deep));
+    }
+
+    #[test]
+    fn test_reparse_cache_eviction_bounded_capacity() {
+        let cache = ReparseCache::new(2, 2); // max 2 shallow, 2 deep
+        let root = Path::new("C:/dest");
+        let d1 = root.join("a/b/c/d/1");
+        let d2 = root.join("a/b/c/d/2");
+        cache.insert_ancestor(root, &d1);
+        cache.insert_ancestor(root, &d2);
+        assert_eq!(cache.deep_len(), 2);
+        assert!(cache.contains(&d1));
+        assert!(cache.contains(&d2));
+
+        let d3 = root.join("a/b/c/d/3");
+        cache.insert_ancestor(root, &d3);
+        assert_eq!(cache.deep_len(), 1);
+        assert!(cache.contains(&d3));
+        assert!(!cache.contains(&d1), "Older deep entry d1 must be evicted");
+        assert!(!cache.contains(&d2), "Older deep entry d2 must be evicted");
+    }
+
+    #[test]
+    fn test_normalize_superscripts_cow_zero_allocation_on_ascii() {
+        let ascii = "plain_path/file.txt";
+        let norm = normalize_superscripts_cow(ascii);
+        assert!(matches!(norm, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(norm, "plain_path/file.txt");
+
+        let superscript = "COM¹";
+        let norm2 = normalize_superscripts_cow(superscript);
+        assert!(matches!(norm2, std::borrow::Cow::Owned(_)));
+        assert_eq!(norm2, "COM1");
+    }
+
+    #[test]
+    fn test_verify_destination_not_reparse_cached_with_reparse_cache() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("dest");
+        let deep = dest.join("sub").join("nested");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("test.txt"), b"data").unwrap();
+
+        let cache = ReparseCache::new(50_000, 10_000);
+        let meta =
+            verify_destination_not_reparse_cached(&dest, Path::new("sub/nested/test.txt"), &cache)
+                .unwrap();
+        assert!(meta.is_some());
+        assert!(cache.contains(&dest));
+        assert!(cache.contains(&dest.join("sub")));
+        assert!(cache.contains(&deep));
+
+        // Verify source cached helper
+        assert!(
+            verify_source_not_reparse_cached(&dest, Path::new("sub/nested/test.txt"), &cache)
+                .is_ok()
+        );
     }
 }
