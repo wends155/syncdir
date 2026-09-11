@@ -235,13 +235,13 @@ mod tests {
 
     #[test]
     fn test_directory_scanner_discovers_files_and_ignores_junctions() {
+        use crate::config::{Config, TargetSyncConfig};
+        use crate::sync::scanner::DirectoryScanner;
         use std::collections::HashSet;
         use std::fs;
         use std::path::Path;
         use std::sync::atomic::AtomicBool;
         use tempfile::tempdir;
-        use crate::config::{Config, TargetSyncConfig};
-        use crate::sync::scanner::DirectoryScanner;
 
         let temp = tempdir().unwrap();
         let src = temp.path().join("source");
@@ -289,7 +289,9 @@ mod tests {
         assert!(files.contains(Path::new("root.txt")));
         assert!(files.contains(&Path::new("nested_folder").join("nested_file.txt")));
         assert!(
-            !files.iter().any(|p| p.to_string_lossy().contains("secret_data")),
+            !files
+                .iter()
+                .any(|p| p.to_string_lossy().contains("secret_data")),
             "Directory scanner must strictly ignore files located behind reparse junctions"
         );
     }

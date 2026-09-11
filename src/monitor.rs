@@ -458,10 +458,10 @@ mod tests {
 
     #[test]
     fn test_handle_rename_pair_case_only_dispatches_file_modified() {
-        use std::path::PathBuf;
         use crate::monitor::DirectoryWatcher;
         use crate::path_util::RelativePath;
         use crate::sync::engine::SyncCommand;
+        use std::path::PathBuf;
 
         let (tx, rx) = std::sync::mpsc::channel();
         let root = PathBuf::from(r"C:\syncdir\source");
@@ -480,7 +480,9 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let cmd = rx.try_recv().expect("Watcher must emit command for case-only rename");
+            let cmd = rx
+                .try_recv()
+                .expect("Watcher must emit command for case-only rename");
             assert_eq!(
                 cmd,
                 SyncCommand::FileModified(RelativePath::new("Document.pdf").unwrap())
@@ -490,9 +492,17 @@ mod tests {
         #[cfg(not(windows))]
         {
             let cmd1 = rx.try_recv().expect("Unix must dispatch FileDeleted first");
-            assert_eq!(cmd1, SyncCommand::FileDeleted(RelativePath::new("document.pdf").unwrap()));
-            let cmd2 = rx.try_recv().expect("Unix must dispatch FileModified second");
-            assert_eq!(cmd2, SyncCommand::FileModified(RelativePath::new("Document.pdf").unwrap()));
+            assert_eq!(
+                cmd1,
+                SyncCommand::FileDeleted(RelativePath::new("document.pdf").unwrap())
+            );
+            let cmd2 = rx
+                .try_recv()
+                .expect("Unix must dispatch FileModified second");
+            assert_eq!(
+                cmd2,
+                SyncCommand::FileModified(RelativePath::new("Document.pdf").unwrap())
+            );
         }
     }
 }

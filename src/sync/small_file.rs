@@ -437,12 +437,12 @@ mod tests {
 
     #[test]
     fn test_sync_small_file_staging_nonce_and_buffer_fallback() {
-        use std::fs;
-        use std::path::Path;
-        use tempfile::tempdir;
         use crate::config::{TargetSyncConfig, VerificationMode};
         use crate::sync::small_file::SmallFileTransferEngine;
         use crate::sync::types::{FileSyncTask, safe_modified_millis};
+        use std::fs;
+        use std::path::Path;
+        use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
         let src = temp.path().join("source");
@@ -488,7 +488,10 @@ mod tests {
 
         let lingering_tmp: Vec<_> = fs::read_dir(&dst)
             .unwrap()
-            .filter_map(|e| e.ok().map(|de| de.file_name().to_string_lossy().into_owned()))
+            .filter_map(|e| {
+                e.ok()
+                    .map(|de| de.file_name().to_string_lossy().into_owned())
+            })
             .filter(|name| name.ends_with(".syncdir_tmp"))
             .collect();
         assert!(lingering_tmp.is_empty());

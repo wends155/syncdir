@@ -1413,9 +1413,9 @@ mod tests {
 
     #[test]
     fn test_save_files_batch_statement_caching_and_casing_update() {
+        use crate::db::{BlockHash, FileRecord, HashStore, SqliteHashStore, StoreConfig};
         use std::path::Path;
         use tempfile::tempdir;
-        use crate::db::{BlockHash, FileRecord, HashStore, SqliteHashStore, StoreConfig};
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("batch_test.db");
@@ -1425,8 +1425,9 @@ mod tests {
         let mut records = Vec::with_capacity(500);
         let mut hashes_pool = Vec::with_capacity(500);
         for i in 0..500 {
-            let rec = FileRecord::from_raw(format!("data/file_{:03}.bin", i), 2048, 1000 + i as i64)
-                .unwrap();
+            let rec =
+                FileRecord::from_raw(format!("data/file_{:03}.bin", i), 2048, 1000 + i as i64)
+                    .unwrap();
             let h1: BlockHash = [i as u8; 32];
             let mut h2: BlockHash = [0u8; 32];
             h2[0] = (i % 256) as u8;
@@ -1447,7 +1448,9 @@ mod tests {
 
         assert_eq!(store.list_all_records().unwrap().len(), 500);
 
-        let initial_h0 = store.get_block_hashes(Path::new("data/file_000.bin")).unwrap();
+        let initial_h0 = store
+            .get_block_hashes(Path::new("data/file_000.bin"))
+            .unwrap();
         assert_eq!(initial_h0.len(), 2);
         assert_eq!(initial_h0[0], [0u8; 32]);
 
@@ -1461,26 +1464,42 @@ mod tests {
             (&cased_rec_250, new_h250.as_slice()),
         ];
 
-        store.save_files_batch(&update_batch).expect("Batch update must succeed");
+        store
+            .save_files_batch(&update_batch)
+            .expect("Batch update must succeed");
 
-        let queried_rec_0 = store.get_file(Path::new("DATA/FILE_000.BIN")).unwrap().unwrap();
-        assert_eq!(queried_rec_0.relative_path().as_path(), Path::new("DATA/FILE_000.BIN"));
+        let queried_rec_0 = store
+            .get_file(Path::new("DATA/FILE_000.BIN"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queried_rec_0.relative_path().as_path(),
+            Path::new("DATA/FILE_000.BIN")
+        );
         assert_eq!(queried_rec_0.file_size(), 4096);
 
-        let queried_rec_250 = store.get_file(Path::new("data/File_250.Bin")).unwrap().unwrap();
-        assert_eq!(queried_rec_250.relative_path().as_path(), Path::new("data/File_250.Bin"));
+        let queried_rec_250 = store
+            .get_file(Path::new("data/File_250.Bin"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queried_rec_250.relative_path().as_path(),
+            Path::new("data/File_250.Bin")
+        );
         assert_eq!(queried_rec_250.file_size(), 8192);
 
-        let updated_h250 = store.get_block_hashes(Path::new("data/File_250.Bin")).unwrap();
+        let updated_h250 = store
+            .get_block_hashes(Path::new("data/File_250.Bin"))
+            .unwrap();
         assert_eq!(updated_h250.len(), 3);
         assert_eq!(updated_h250[0], [0xBB; 32]);
     }
 
     #[test]
     fn test_get_block_hashes_multi_block_preallocation() {
+        use crate::db::{BlockHash, FileRecord, HashStore, SqliteHashStore, StoreConfig};
         use std::path::Path;
         use tempfile::tempdir;
-        use crate::db::{BlockHash, FileRecord, HashStore, SqliteHashStore, StoreConfig};
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("prealloc_test.db");
@@ -1488,7 +1507,9 @@ mod tests {
         let store = SqliteHashStore::new(&db_path, store_cfg).unwrap();
 
         let block_count = 16usize;
-        let record = FileRecord::from_raw("large_file.dat", (block_count * 1024 * 1024) as u64, 12345).unwrap();
+        let record =
+            FileRecord::from_raw("large_file.dat", (block_count * 1024 * 1024) as u64, 12345)
+                .unwrap();
         let expected_hashes: Vec<BlockHash> = (0..block_count)
             .map(|i| {
                 let mut h = [0u8; 32];
@@ -1506,14 +1527,18 @@ mod tests {
             .expect("Querying block hashes for multi-block file must succeed");
 
         assert_eq!(retrieved.len(), block_count);
-        assert!(retrieved.capacity() >= 64, "Vector capacity must be pre-allocated to at least 64");
+        assert!(
+            retrieved.capacity() >= 64,
+            "Vector capacity must be pre-allocated to at least 64"
+        );
 
         for (idx, (actual, expected)) in retrieved.iter().zip(expected_hashes.iter()).enumerate() {
             assert_eq!(actual, expected, "Block hash at index {} must match", idx);
         }
 
-        let missing = store.get_block_hashes(Path::new("nonexistent.dat")).unwrap();
+        let missing = store
+            .get_block_hashes(Path::new("nonexistent.dat"))
+            .unwrap();
         assert!(missing.is_empty());
     }
 }
-

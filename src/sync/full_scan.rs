@@ -167,7 +167,9 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
                 rel_path,
                 active_dest,
                 &mut scratch,
-                cached_lookup.get(&NormalizedCaseFoldedPath(rel_path)).copied(),
+                cached_lookup
+                    .get(&NormalizedCaseFoldedPath(rel_path))
+                    .copied(),
             ) {
                 Ok(Some((record, hashes))) => {
                     stats.synced += 1;
@@ -503,14 +505,14 @@ mod tests {
 
     #[test]
     fn test_case_folded_zero_allocation_cache_lookup() {
-        use std::collections::HashMap;
-        use std::path::{Path, PathBuf};
-        use std::sync::atomic::AtomicBool;
-        use tempfile::tempdir;
         use crate::config::{Config, TargetSyncConfig};
         use crate::db::{FileRecord, MockHashStore};
         use crate::sync::engine::LocalSyncEngine;
         use crate::sync::full_scan::{FullScanCoordinator, NormalizedCaseFoldedPath};
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::AtomicBool;
+        use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
         let src = temp.path().join("src");
@@ -522,8 +524,12 @@ mod tests {
         let coordinator = FullScanCoordinator::new(&engine, &dst, &cancel);
 
         let mut cached_records = HashMap::new();
-        let rec1 = FileRecord::from_raw("Docs/Architecture.md", 2048, 1000).unwrap().with_id(1);
-        let rec2 = FileRecord::from_raw(r"Assets\Icons\Logo.PNG", 4096, 2000).unwrap().with_id(2);
+        let rec1 = FileRecord::from_raw("Docs/Architecture.md", 2048, 1000)
+            .unwrap()
+            .with_id(1);
+        let rec2 = FileRecord::from_raw(r"Assets\Icons\Logo.PNG", 4096, 2000)
+            .unwrap()
+            .with_id(2);
         cached_records.insert(PathBuf::from("Docs/Architecture.md"), rec1);
         cached_records.insert(PathBuf::from(r"Assets\Icons\Logo.PNG"), rec2);
 
@@ -533,13 +539,19 @@ mod tests {
         assert!(hit1.is_some());
         assert_eq!(hit1.unwrap().id(), Some(1));
 
-        let hit2 = lookup.get(&NormalizedCaseFoldedPath(Path::new("assets/icons/logo.png")));
+        let hit2 = lookup.get(&NormalizedCaseFoldedPath(Path::new(
+            "assets/icons/logo.png",
+        )));
         assert!(hit2.is_some());
         assert_eq!(hit2.unwrap().id(), Some(2));
 
         let hit3 = lookup.get(&NormalizedCaseFoldedPath(Path::new("DOCS/ARCHITECTURE.MD")));
         assert!(hit3.is_some());
 
-        assert!(lookup.get(&NormalizedCaseFoldedPath(Path::new("docs/specification.md"))).is_none());
+        assert!(
+            !lookup.contains_key(&NormalizedCaseFoldedPath(Path::new(
+                "docs/specification.md"
+            )))
+        );
     }
 }

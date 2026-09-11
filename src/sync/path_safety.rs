@@ -419,7 +419,10 @@ pub(crate) fn is_reparse_or_symlink_meta(meta: &Metadata) -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry, path: &Path) -> Result<bool, std::io::Error> {
+pub(crate) fn is_reparse_or_symlink(
+    entry: &std::fs::DirEntry,
+    path: &Path,
+) -> Result<bool, std::io::Error> {
     use std::os::windows::fs::MetadataExt;
     if let Ok(meta) = entry.metadata() {
         return Ok((meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink());
@@ -429,7 +432,10 @@ pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry, path: &Path) -> R
 }
 
 #[cfg(not(windows))]
-pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry, _path: &Path) -> Result<bool, std::io::Error> {
+pub(crate) fn is_reparse_or_symlink(
+    entry: &std::fs::DirEntry,
+    _path: &Path,
+) -> Result<bool, std::io::Error> {
     Ok(entry.file_type()?.is_symlink())
 }
 
@@ -838,14 +844,20 @@ mod tests {
 
     #[test]
     fn test_verify_destination_not_reparse_cached_zero_allocation_iteration() {
+        use crate::sync::path_safety::{ReparseCache, verify_destination_not_reparse_cached};
         use std::fs;
         use std::path::Path;
         use tempfile::tempdir;
-        use crate::sync::path_safety::{ReparseCache, verify_destination_not_reparse_cached};
 
         let dir = tempdir().unwrap();
         let dest = dir.path().join("dest");
-        let deep_sub = dest.join("l1").join("l2").join("l3").join("l4").join("l5").join("l6");
+        let deep_sub = dest
+            .join("l1")
+            .join("l2")
+            .join("l3")
+            .join("l4")
+            .join("l5")
+            .join("l6");
         fs::create_dir_all(&deep_sub).unwrap();
 
         let target_file = deep_sub.join("nested_leaf.bin");

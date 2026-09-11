@@ -590,12 +590,13 @@ impl<S: HashStore> LocalSyncEngine<S> {
                     && record.file_size() == src_size as u64
                     && record.last_modified() == src_mod
                 {
-                    if let Ok(safe_rel) = crate::path_util::RelativePath::new(rel_path) {
-                        if record.relative_path() != &safe_rel {
-                            let hashes = self.db.get_block_hashes(rel_path)?;
-                            let updated_rec = FileRecord::from_raw(rel_path, src_size as u64, src_mod)?;
-                            self.db.save_file(&updated_rec, &hashes)?;
-                        }
+                    if let Ok(safe_rel) = crate::path_util::RelativePath::new(rel_path)
+                        && record.relative_path() != &safe_rel
+                    {
+                        let hashes = self.db.get_block_hashes(rel_path)?;
+                        let updated_rec =
+                            FileRecord::from_raw(rel_path, src_size as u64, src_mod)?;
+                        self.db.save_file(&updated_rec, &hashes)?;
                     }
                     tracing::debug!(path = %rel_path.display(), "Local signature cache hit and destination matches, skipping sync");
                     return Ok(None);
@@ -776,9 +777,15 @@ impl<S: HashStore> LocalSyncEngine<S> {
         rel_path: &Path,
     ) -> Result<(), SyncError> {
         let dest_path = dest_dir.join(rel_path);
-        let Some(expected_name) = rel_path.file_name() else { return Ok(()); };
-        let Some(parent) = dest_path.parent() else { return Ok(()); };
-        if !parent.exists() { return Ok(()); }
+        let Some(expected_name) = rel_path.file_name() else {
+            return Ok(());
+        };
+        let Some(parent) = dest_path.parent() else {
+            return Ok(());
+        };
+        if !parent.exists() {
+            return Ok(());
+        }
 
         let mut needs_rename = false;
         if let Ok(entries) = std::fs::read_dir(parent) {
@@ -795,7 +802,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
         }
 
         if needs_rename {
-            let temp_name = format!("{}.syncdir_casetmp_{}", dest_path.display(), std::process::id());
+            let temp_name = format!(
+                "{}.syncdir_casetmp_{}",
+                dest_path.display(),
+                std::process::id()
+            );
             let temp_path = std::path::PathBuf::from(temp_name);
             if temp_path.exists() {
                 let _ = std::fs::remove_file(&temp_path);
@@ -808,7 +819,11 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
     #[cfg(not(windows))]
     #[inline]
-    pub(crate) fn align_dest_file_casing_if_needed(&self, _dest_dir: &Path, _rel_path: &Path) -> Result<(), SyncError> {
+    pub(crate) fn align_dest_file_casing_if_needed(
+        &self,
+        _dest_dir: &Path,
+        _rel_path: &Path,
+    ) -> Result<(), SyncError> {
         Ok(())
     }
 
@@ -2322,12 +2337,12 @@ mod tests {
 
     #[test]
     fn test_delete_file_from_dest_symmetrical_reparse_eviction() {
-        use std::fs;
-        use std::path::Path;
-        use tempfile::tempdir;
         use crate::config::{Config, TargetSyncConfig};
         use crate::db::MockHashStore;
         use crate::sync::engine::LocalSyncEngine;
+        use std::fs;
+        use std::path::Path;
+        use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
         let src = temp.path().join("src");
@@ -2372,12 +2387,12 @@ mod tests {
 
     #[test]
     fn test_case_only_rename_on_destination_updates_disk_casing_and_db() {
-        use std::fs;
-        use std::path::Path;
-        use tempfile::tempdir;
         use crate::config::{Config, TargetSyncConfig};
         use crate::db::{HashStore, SqliteHashStore, StoreConfig};
         use crate::sync::engine::LocalSyncEngine;
+        use std::fs;
+        use std::path::Path;
+        use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
         let src = temp.path().join("source");
@@ -2437,7 +2452,10 @@ mod tests {
         {
             let entries: Vec<String> = fs::read_dir(&dst)
                 .unwrap()
-                .filter_map(|e| e.ok().map(|de| de.file_name().to_string_lossy().into_owned()))
+                .filter_map(|e| {
+                    e.ok()
+                        .map(|de| de.file_name().to_string_lossy().into_owned())
+                })
                 .collect();
             assert!(
                 entries.contains(&"Test.txt".to_string()),
