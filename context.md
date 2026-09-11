@@ -682,6 +682,32 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Per-file individual SQLite disk transaction overhead in worker debounce loop eliminated.
 >   - Unbounded candidate discovery in archive pruning eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Phase 4: FullScanCoordinator Decomposition, RelativePath Domain Newtype, and Final Code Quality Hardening (`review_report.md` Findings 1, 2, 4, 8, 10, 15, 16)
+> * **Changes:**
+>   - **`RelativePath` Domain Newtype (O1)**: Introduced `RelativePath` in `src/path_util.rs` (re-exported in `src/sync/types.rs`), enforcing `is_safe_relative_path`, forward-slash canonicalization, rejection of traversal/devices/trailing whitespace/ADS, and Serde deserialization invariant enforcement via `try_from`.
+>   - **`FileRecord` Encapsulation & Strongly-Typed `SyncCommand` (O2)**: Updated `FileRecord` to hold `relative_path: RelativePath`. Strongly typed `SyncCommand::SyncFile(RelativePath)` and `SyncCommand::DeleteFile(RelativePath)`, migrating all engine, monitor, worker, and test call sites. Updated `SqliteHashStore` to convert from/to `RelativePath`.
+>   - **`FullScanCoordinator` Extraction & Zero-Allocation Lookups (O3)**: Decomposed `LocalSyncEngine::run_cancellable_full_scan_impl` into `FullScanCoordinator` (`src/sync/full_scan.rs`), reducing cyclomatic complexity from 135 to <15 per stage. Introduced `NormalizedCaseFoldedPath` for zero-allocation Windows case-insensitive map lookups.
+>   - **ArchiveManager `ReparseCache` Integration (O4)**: Integrated `Arc<ReparseCache>` into `ArchiveManager::archive_dest_file_only` across production and test call sites via `verify_destination_not_reparse_cached`.
+>   - **Boundary Deduplication & `TargetDir` Validation (O5)**: Centralized sync loop containment into `validate_sync_boundaries` in `src/config/validation.rs`. Introduced `TargetDir::try_new` validating drive and UNC roots; deprecated `TargetDir::new` and `Config::dest_dirs`.
+>   - **Fluent `SyncDaemonBuilder` & Context Construction (O6)**: Implemented `SyncDaemonBuilder` consolidating lifecycle construction. Removed dead `SyncWorkerContext::for_test` and enforced `SyncWorkerContextBuilder`. Added manual structured tracing spans (`sync_file`, `full_scan`, `archive_file`) in `src/sync/engine.rs`.
+>   - **Retirement of `is_metadata_up_to_date_raw` & Integration Regression (O7)**: Deprecated `is_metadata_up_to_date_raw` in favor of `FileMetadataSnapshot::is_up_to_date`. Migrated property tests and internal callers. Updated `architecture.md § 6` allowing `db -> path_util`.
+>   - **Quality Verification Gate**: 343 passing tests (zero failures, 1 ignored), zero clippy warnings (`-D warnings`), and clean formatting check across the entire workspace.
+> * **New Constraints:**
+>   - Relative file paths across domain models (`FileRecord`, `SyncCommand`) must use `RelativePath`.
+>   - `TargetDir` construction must use `TargetDir::try_new` to validate root and syntax invariants.
+>   - Full scans must execute through `FullScanCoordinator`.
+>   - Background daemon configuration must use `SyncDaemonBuilder`.
+> * **Pruned:**
+>   - Primitive string/PathBuf representation for relative file paths eliminated.
+>   - 216-line monolithic `run_cancellable_full_scan_impl` method eliminated.
+>   - Per-iteration string allocation during Windows deletion reconciliation eliminated.
+>   - Duplicate sync loop boundary validation algorithms eliminated.
+>   - Telescoping constructors on `SyncDaemon` and unchecked `for_test` worker context eliminated.
+
+
 
 
 

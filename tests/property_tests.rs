@@ -79,11 +79,7 @@ proptest! {
 
         let dest = syncdir::sync::FileMetadataSnapshot::new(dest_size, dest_mod);
         let src = syncdir::sync::FileMetadataSnapshot::new(size, src_mod);
-        let result = syncdir::sync::is_metadata_up_to_date_raw(
-            &dest,
-            &src,
-            record.as_ref(),
-        );
+        let result = src.is_up_to_date(&dest, record.as_ref());
 
         let expected = has_matching_record
             && dest_size == size

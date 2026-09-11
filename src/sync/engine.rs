@@ -305,6 +305,10 @@ impl From<&crate::db::FileRecord> for FileMetadataSnapshot {
 }
 
 /// Raw metadata evaluation for testing and backward compatibility.
+#[deprecated(
+    since = "0.2.0",
+    note = "use FileMetadataSnapshot::is_up_to_date instead"
+)]
 #[doc(hidden)]
 pub fn is_metadata_up_to_date_raw(
     dest: &FileMetadataSnapshot,
@@ -510,7 +514,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
                 size: src_size,
                 modified_epoch_millis: src_mod,
             };
-            return is_metadata_up_to_date_raw(&dest, &src, rec);
+            return src.is_up_to_date(&dest, rec);
         }
         false
     }
@@ -932,6 +936,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_is_metadata_up_to_date_raw() {
         let record = crate::db::FileRecord::from_raw("file.txt", 100, 10_000)
             .unwrap()

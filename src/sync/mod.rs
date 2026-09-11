@@ -17,9 +17,11 @@ pub(crate) mod worker;
 pub(crate) use full_scan::FullScanCoordinator;
 
 pub use delta::DirtyBlockRange;
+#[allow(deprecated)]
+pub use engine::is_metadata_up_to_date_raw;
 pub use engine::{
     ConnectivityState, FileMetadataSnapshot, LocalSyncEngine, ScanOutcome, SyncCommand, SyncEngine,
-    SyncStatusObserver, WatcherState, is_metadata_up_to_date_raw,
+    SyncStatusObserver, WatcherState,
 };
 pub use mock::MockSyncEngine;
 pub use path_safety::is_safe_relative_path;
