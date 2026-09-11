@@ -550,20 +550,20 @@ impl<S: HashStore> LocalSyncEngine<S> {
         scratch: &mut [u8],
         file_record: Option<&FileRecord>,
     ) -> Result<Option<(FileRecord, Vec<crate::db::BlockHash>)>, SyncError> {
+        if !is_safe_relative_path(rel_path) {
+            return Err(SyncError::validation_security(format!(
+                "Unsafe path traversal detected: {:?}",
+                rel_path
+            )));
+        }
+
         let _span = tracing::info_span!(
             "sync_file",
-            rel_path = %rel_path.display(),
+            rel_path = ?rel_path,
             source = %self.config.source_dir().display(),
             destination = %dest_dir.display(),
         );
         let _guard = _span.enter();
-
-        if !is_safe_relative_path(rel_path) {
-            return Err(SyncError::validation_security(format!(
-                "Unsafe path traversal detected: {}",
-                rel_path.display()
-            )));
-        }
         let src_path = self.config.source_dir().join(rel_path);
         let dest_path = dest_dir.join(rel_path);
 
@@ -746,9 +746,15 @@ impl<S: HashStore> LocalSyncEngine<S> {
         rel_path: &Path,
         dest_dir: &Path,
     ) -> Result<(), SyncError> {
+        if !is_safe_relative_path(rel_path) {
+            return Err(SyncError::validation_security(format!(
+                "Unsafe path traversal detected: {:?}",
+                rel_path
+            )));
+        }
         let _span = tracing::info_span!(
             "archive_file",
-            rel_path = %rel_path.display(),
+            rel_path = ?rel_path,
             destination = %dest_dir.display(),
         );
         let _guard = _span.enter();

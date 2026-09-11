@@ -315,8 +315,8 @@ impl RelativePath {
         for seg in s.split(['/', '\\']) {
             if seg == "." || seg == ".." {
                 return Err(SyncError::validation_security(format!(
-                    "Invalid relative path containing '.' or '..' segment: '{}'",
-                    p.display()
+                    "Invalid relative path containing '.' or '..' segment: {:?}",
+                    p
                 )));
             }
         }
@@ -326,8 +326,8 @@ impl RelativePath {
 
         if !is_safe_relative_path(&normalized_path) {
             return Err(SyncError::validation_security(format!(
-                "Invalid or unsafe relative path: '{}'",
-                p.display()
+                "Invalid or unsafe relative path: {:?}",
+                p
             )));
         }
 

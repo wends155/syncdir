@@ -179,8 +179,8 @@ impl ArchiveManager {
     ) -> Result<(), SyncError> {
         if !is_safe_relative_path(rel_path) {
             return Err(SyncError::validation_security(format!(
-                "Unsafe path traversal detected: {}",
-                rel_path.display()
+                "Unsafe path traversal detected: {:?}",
+                rel_path
             )));
         }
         let dest_path = dest_dir.join(rel_path);

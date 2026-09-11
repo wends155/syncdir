@@ -146,7 +146,7 @@ impl DirectoryWatcher {
                 Ok(safe_rel) => send(SyncCommand::FileModified(safe_rel)),
                 Err(e) => {
                     tracing::warn!(
-                        path = %rel_path.display(),
+                        path = ?rel_path,
                         error = %e,
                         "Watcher observed unsafe or invalid relative path; skipping"
                     );
@@ -159,7 +159,7 @@ impl DirectoryWatcher {
                 Ok(safe_rel) => send(SyncCommand::FileDeleted(safe_rel)),
                 Err(e) => {
                     tracing::warn!(
-                        path = %rel_path.display(),
+                        path = ?rel_path,
                         error = %e,
                         "Watcher observed unsafe or invalid relative path; skipping"
                     );
@@ -432,5 +432,24 @@ mod tests {
             .create_watcher(Path::new("C:\\test"), tx)
             .expect("mock watcher");
         assert!(watcher.is_watching());
+    }
+
+    #[test]
+    fn test_watcher_dispatch_malicious_crlf_path_prevents_log_injection() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let root = PathBuf::from(r"C:\test\src");
+        let malicious_rel = Path::new("legit\r\n[CRITICAL] FORGED LOG ENTRY\r\nsub.txt");
+        let event = notify::Event {
+            kind: notify::EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![root.join(malicious_rel)],
+            attrs: Default::default(),
+        };
+        let (_, log_output) = crate::test_support::with_captured_tracing(|| {
+            DirectoryWatcher::dispatch_event(event, &root, &tx);
+        });
+        assert!(
+            !log_output.contains("\r\n[CRITICAL] FORGED LOG ENTRY"),
+            "Log output contained unescaped CRLF forged line: {log_output}"
+        );
     }
 }
