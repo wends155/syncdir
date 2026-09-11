@@ -192,6 +192,7 @@ mod ffi {
 /// to its underlying remote UNC share path (e.g. "\\\\172.16.0.193\\share").
 /// Returns `None` on non-Windows platforms, unmapped drives, or API errors.
 #[cfg(target_os = "windows")]
+#[tracing::instrument(level = "debug")]
 fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     let local_name: Vec<u16> = std::ffi::OsStr::new(drive_prefix)
@@ -218,6 +219,7 @@ fn resolve_mapped_drive_unc(drive_prefix: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[tracing::instrument(level = "debug")]
 fn resolve_mapped_drive_unc(_drive_prefix: &str) -> Option<String> {
     None
 }
@@ -252,6 +254,7 @@ fn try_resolve_unc_path(path: impl AsRef<Path>) -> PathBuf {
 /// Returns `SyncError::Validation` if the path is not a valid UNC path or share,
 /// or `SyncError::Io` if `WNetAddConnection2W` fails.
 #[cfg(target_os = "windows")]
+#[tracing::instrument(skip(unc_path), fields(path = %unc_path.as_ref().display()), level = "debug")]
 fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
     use std::os::windows::ffi::OsStrExt;
     let unc_path = unc_path.as_ref();
@@ -295,6 +298,7 @@ fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError>
 }
 
 #[cfg(not(target_os = "windows"))]
+#[tracing::instrument(skip(unc_path), fields(path = %unc_path.as_ref().display()), level = "debug")]
 fn establish_smb_connection(unc_path: impl AsRef<Path>) -> Result<(), SyncError> {
     let unc_path = unc_path.as_ref();
     if crate::path_util::parse_unc_host_and_share(unc_path).is_none() {

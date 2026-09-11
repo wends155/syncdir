@@ -406,6 +406,11 @@ impl SqliteHashStore {
 }
 
 impl HashStore for SqliteHashStore {
+    #[tracing::instrument(
+        skip(self),
+        fields(path = %path.display()),
+        level = "debug"
+    )]
     fn get_file(&self, path: &Path) -> Result<Option<FileRecord>, SyncError> {
         let key = path_to_sqlite_key(path)?;
         let conn = self.conn()?;
@@ -428,6 +433,11 @@ impl HashStore for SqliteHashStore {
         }
     }
 
+    #[tracing::instrument(
+        skip(self, hashes),
+        fields(path = %record.relative_path.as_path().display()),
+        level = "debug"
+    )]
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
         let key = record.relative_path.to_sqlite_key();
         let mut conn = self.conn()?;
@@ -532,6 +542,11 @@ impl HashStore for SqliteHashStore {
         Ok(hashes)
     }
 
+    #[tracing::instrument(
+        skip(self),
+        fields(path = %path.display()),
+        level = "debug"
+    )]
     fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
         let key = path_to_sqlite_key(path)?;
         let conn = self.conn()?;
