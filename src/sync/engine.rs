@@ -726,17 +726,20 @@ impl<S: HashStore> LocalSyncEngine<S> {
     }
 
     /// Full scan implementation with cooperative cancellation support.
+    #[tracing::instrument(
+        name = "full_scan",
+        skip(self, cancel),
+        fields(
+            source = %self.config.source_dir().display(),
+            destination = %dest_dir.display()
+        ),
+        level = "info"
+    )]
     pub(crate) fn run_cancellable_full_scan_impl(
         &self,
         dest_dir: &Path,
         cancel: &AtomicBool,
     ) -> Result<ScanOutcome, SyncError> {
-        let _span = tracing::info_span!(
-            "full_scan",
-            source = %self.config.source_dir().display(),
-            destination = %dest_dir.display(),
-        );
-        let _guard = _span.enter();
         crate::sync::FullScanCoordinator::new(self, dest_dir, cancel).run()
     }
 

@@ -253,6 +253,11 @@ impl ArchiveManager {
     }
 
     /// Prune old and excess files in the destination archive.
+    #[tracing::instrument(
+        skip(self),
+        fields(dest_dir = %dest_dir.display()),
+        level = "debug"
+    )]
     pub(crate) fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
         let archive_dir = dest_dir.join(".syncdir_archive");
         prune_archive(&archive_dir, 30, 10 * 1024 * 1024 * 1024)

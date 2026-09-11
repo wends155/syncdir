@@ -114,6 +114,11 @@ impl DirectoryScanner {
     }
 
     /// Perform a cancellable scan of the source directory, populating `files` with relative paths.
+    #[tracing::instrument(
+        skip(self, files, scan_complete, cancel),
+        fields(source_root = %source_root.display()),
+        level = "debug"
+    )]
     pub(crate) fn scan_dir_cancellable(
         &self,
         source_root: &Path,
