@@ -993,7 +993,7 @@ mod tests {
                 .start()
                 .expect("start via builder");
 
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(150));
             daemon.shutdown();
         });
 

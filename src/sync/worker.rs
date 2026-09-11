@@ -1033,6 +1033,16 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                             .mark_offline(self.context.observer.as_ref());
                         self.queue.requeue_sync_retry(path, retry_dur);
                     }
+                    Err(SyncError::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            && !self.context.config.source_dir().join(&path).exists() =>
+                    {
+                        tracing::info!(
+                            path = %path.display(),
+                            "Source file no longer exists; discarding retry"
+                        );
+                        self.state.reset_failure(&path);
+                    }
                     Err(SyncError::Io(e)) => {
                         if is_network_offline_io(&e) {
                             tracing::warn!(
@@ -1046,27 +1056,51 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                                 .mark_offline(self.context.observer.as_ref());
                         }
                         let attempts = self.state.record_failure(&path);
-                        let backoff = calculate_exponential_backoff(attempts, retry_dur);
-                        tracing::warn!(
-                            path = %path.display(),
-                            attempt = attempts,
-                            ?backoff,
-                            error = %e,
-                            "File sync failed with IO error; rescheduling retry"
-                        );
-                        self.queue.requeue_sync_retry(path, backoff);
+                        if attempts <= 10 {
+                            let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                            tracing::warn!(
+                                path = %path.display(),
+                                attempt = attempts,
+                                ?backoff,
+                                error = %e,
+                                "File sync failed with IO error; rescheduling retry"
+                            );
+                            self.queue.requeue_sync_retry(path, backoff);
+                        } else {
+                            tracing::error!(
+                                path = %path.display(),
+                                error = %e,
+                                "File sync permanently failed after 10 retries"
+                            );
+                            self.state.reset_failure(&path);
+                            if let Some(ref obs) = self.context.observer {
+                                obs.on_write_verification_failed(&path);
+                            }
+                        }
                     }
                     Err(e) => {
                         let attempts = self.state.record_failure(&path);
-                        let backoff = calculate_exponential_backoff(attempts, retry_dur);
-                        tracing::warn!(
-                            path = %path.display(),
-                            attempt = attempts,
-                            ?backoff,
-                            error = %e,
-                            "File sync failed; rescheduling retry"
-                        );
-                        self.queue.requeue_sync_retry(path, backoff);
+                        if attempts <= 10 {
+                            let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                            tracing::warn!(
+                                path = %path.display(),
+                                attempt = attempts,
+                                ?backoff,
+                                error = %e,
+                                "File sync failed; rescheduling retry"
+                            );
+                            self.queue.requeue_sync_retry(path, backoff);
+                        } else {
+                            tracing::error!(
+                                path = %path.display(),
+                                error = %e,
+                                "File sync permanently failed after 10 retries"
+                            );
+                            self.state.reset_failure(&path);
+                            if let Some(ref obs) = self.context.observer {
+                                obs.on_write_verification_failed(&path);
+                            }
+                        }
                     }
                 }
             }
@@ -1140,20 +1174,45 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                                     .mark_offline(self.context.observer.as_ref());
                             }
                             let attempts = self.state.record_failure(&path);
-                            let backoff = calculate_exponential_backoff(attempts, retry_dur);
-                            self.queue.requeue_delete_retry(path, backoff);
+                            if attempts <= 10 {
+                                let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    attempt = attempts,
+                                    ?backoff,
+                                    error = %e,
+                                    "File delete failed with IO error; rescheduling retry"
+                                );
+                                self.queue.requeue_delete_retry(path, backoff);
+                            } else {
+                                tracing::error!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "Deletion permanently failed after 10 retries"
+                                );
+                                self.state.reset_failure(&path);
+                            }
                         }
                         Err(e) => {
                             let attempts = self.state.record_failure(&path);
-                            let backoff = calculate_exponential_backoff(attempts, retry_dur);
-                            tracing::warn!(
-                                path = %path.display(),
-                                attempt = attempts,
-                                ?backoff,
-                                error = %e,
-                                "File delete failed; rescheduling retry"
-                            );
-                            self.queue.requeue_delete_retry(path, backoff);
+                            if attempts <= 10 {
+                                let backoff = calculate_exponential_backoff(attempts, retry_dur);
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    attempt = attempts,
+                                    ?backoff,
+                                    error = %e,
+                                    "File delete failed; rescheduling retry"
+                                );
+                                self.queue.requeue_delete_retry(path, backoff);
+                            } else {
+                                tracing::error!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "File delete permanently failed after 10 retries"
+                                );
+                                self.state.reset_failure(&path);
+                            }
                         }
                     }
                 }
@@ -2234,5 +2293,142 @@ mod tests {
             log_output.contains("target_index=1"),
             "Log output missing target_index field: {log_output}"
         );
+    }
+
+    #[test]
+    fn test_sync_worker_not_found_evicts_immediately_without_retry() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source)
+            .dest_dir(dest)
+            .debounce_seconds(1)
+            .build_unvalidated();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = MockSyncEngine::new();
+        engine.set_sync_error(|| {
+            SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "file not found",
+            ))
+        });
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+        let mut runner = SyncWorkerRunner::new(ctx);
+
+        let t0 = Instant::now();
+        let rel_path = RelativePath::new("deleted_on_disk.txt").unwrap();
+        runner.handle_command(SyncCommand::FileModified(rel_path.clone()));
+
+        let outcome = runner.tick(t0).unwrap();
+        assert_eq!(outcome, WorkerTickOutcome::Continue);
+        assert_eq!(runner.queue.pending_count(), 1);
+
+        // T0 + 3s: Debounce elapsed; sync fails with NotFound and source file does not exist on disk
+        let t1 = t0 + Duration::from_secs(3);
+        let outcome = runner.tick(t1).unwrap();
+        assert_eq!(outcome, WorkerTickOutcome::Continue);
+
+        // Invariant: Path must be evicted immediately without requeuing, and failure count reset
+        assert_eq!(
+            runner.queue.pending_count(),
+            0,
+            "Path must be immediately discarded from retry queues upon NotFound when source is missing"
+        );
+        assert!(
+            !runner
+                .state
+                .failure_tracker
+                .contains_key(Path::new("deleted_on_disk.txt")),
+            "Failure count must be reset upon NotFound eviction"
+        );
+
+        let t2 = t1 + Duration::from_secs(10);
+        let outcome = runner.tick(t2).unwrap();
+        assert_eq!(outcome, WorkerTickOutcome::Continue);
+        assert_eq!(runner.queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_sync_worker_generic_io_error_evicts_after_ten_retries() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        // Create dummy file on source so NotFound check does not trigger
+        fs::write(source.join("damaged_block.txt"), b"some data").unwrap();
+
+        let retry_secs = 2;
+        let config = Config::builder(source)
+            .dest_dir(dest)
+            .retry_interval_seconds(retry_secs)
+            .debounce_seconds(1)
+            .build_unvalidated();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = MockSyncEngine::new();
+        engine.set_sync_error(|| {
+            SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            ))
+        });
+
+        let observer = std::sync::Arc::new(crate::sync::mock::MockSyncStatusObserver::new());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(
+            0,
+            target_config,
+            engine.clone(),
+            rx,
+            Some(observer.clone()),
+            source_online,
+        );
+        let mut runner = SyncWorkerRunner::new(ctx);
+
+        let t0 = Instant::now();
+        let rel_path = RelativePath::new("damaged_block.txt").unwrap();
+        runner.handle_command(SyncCommand::FileModified(rel_path.clone()));
+
+        let mut current_time = t0 + Duration::from_secs(2);
+
+        // Retries 1 through 10 must remain queued with exponential backoff
+        for attempt in 1..=10 {
+            let outcome = runner.tick(current_time).unwrap();
+            assert_eq!(outcome, WorkerTickOutcome::Continue);
+            assert_eq!(
+                runner.queue.pending_count(),
+                1,
+                "Path must be requeued for retry after attempt {attempt}"
+            );
+            let backoff = calculate_exponential_backoff(attempt, Duration::from_secs(retry_secs));
+            current_time += backoff + Duration::from_millis(50);
+        }
+
+        // Attempt 11: 10 failures recorded; this tick permanently evicts
+        let outcome = runner.tick(current_time).unwrap();
+        assert_eq!(outcome, WorkerTickOutcome::Continue);
+        assert_eq!(
+            runner.queue.pending_count(),
+            0,
+            "Path must be permanently evicted after 10 retries"
+        );
+        assert!(
+            !runner
+                .state
+                .failure_tracker
+                .contains_key(Path::new("damaged_block.txt"))
+        );
+
+        let failures = observer.write_verification_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0], PathBuf::from("damaged_block.txt"));
     }
 }
