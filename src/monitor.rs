@@ -88,16 +88,23 @@ impl DirectoryWatcher {
         source_root: &Path,
         send: &mut impl FnMut(SyncCommand) -> bool,
     ) -> bool {
-        let from_res = from_path.strip_prefix(source_root);
-        let to_res = to_path.strip_prefix(source_root);
+        let safe_from = from_path
+            .strip_prefix(source_root)
+            .ok()
+            .and_then(|r| RelativePath::new(r).ok());
+        let safe_to = to_path
+            .strip_prefix(source_root)
+            .ok()
+            .and_then(|r| RelativePath::new(r).ok());
 
         #[cfg(windows)]
-        let is_case_only_rename = match (&from_res, &to_res) {
-            (Ok(from), Ok(to)) => {
-                from != to
+        let is_case_only_rename = match (&safe_from, &safe_to) {
+            (Some(from), Some(to)) => {
+                from.as_path() != to.as_path()
                     && from
+                        .as_path()
                         .to_string_lossy()
-                        .eq_ignore_ascii_case(&to.to_string_lossy())
+                        .eq_ignore_ascii_case(&to.as_path().to_string_lossy())
             }
             _ => false,
         };
@@ -105,22 +112,18 @@ impl DirectoryWatcher {
         let is_case_only_rename = false;
 
         if is_case_only_rename {
-            if let Ok(to_rel) = to_res
-                && let Ok(safe_to) = RelativePath::new(to_rel)
-            {
+            if let Some(safe_to) = safe_to {
                 return send(SyncCommand::FileModified(safe_to));
             }
             return true;
         }
 
-        if let Ok(from_rel) = from_res
-            && let Ok(safe_from) = RelativePath::new(from_rel)
+        if let Some(safe_from) = safe_from
             && !send(SyncCommand::FileDeleted(safe_from))
         {
             return false;
         }
-        if let Ok(to_rel) = to_res
-            && let Ok(safe_to) = RelativePath::new(to_rel)
+        if let Some(safe_to) = safe_to
             && !send(SyncCommand::FileModified(safe_to))
         {
             return false;
@@ -451,5 +454,45 @@ mod tests {
             !log_output.contains("\r\n[CRITICAL] FORGED LOG ENTRY"),
             "Log output contained unescaped CRLF forged line: {log_output}"
         );
+    }
+
+    #[test]
+    fn test_handle_rename_pair_case_only_dispatches_file_modified() {
+        use std::path::PathBuf;
+        use crate::monitor::DirectoryWatcher;
+        use crate::path_util::RelativePath;
+        use crate::sync::engine::SyncCommand;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = PathBuf::from(r"C:\syncdir\source");
+        let from_path = root.join("document.pdf");
+        let to_path = root.join("Document.pdf");
+
+        let event = notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            paths: vec![from_path, to_path],
+            attrs: notify::event::EventAttributes::default(),
+        };
+
+        DirectoryWatcher::dispatch_event(event, &root, &tx);
+
+        #[cfg(windows)]
+        {
+            let cmd = rx.try_recv().expect("Watcher must emit command for case-only rename");
+            assert_eq!(
+                cmd,
+                SyncCommand::FileModified(RelativePath::new("Document.pdf").unwrap())
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        #[cfg(not(windows))]
+        {
+            let cmd1 = rx.try_recv().expect("Unix must dispatch FileDeleted first");
+            assert_eq!(cmd1, SyncCommand::FileDeleted(RelativePath::new("document.pdf").unwrap()));
+            let cmd2 = rx.try_recv().expect("Unix must dispatch FileModified second");
+            assert_eq!(cmd2, SyncCommand::FileModified(RelativePath::new("Document.pdf").unwrap()));
+        }
     }
 }

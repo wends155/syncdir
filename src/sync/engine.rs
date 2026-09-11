@@ -499,26 +499,6 @@ impl<S: HashStore> LocalSyncEngine<S> {
         self.sync_file_to_dest_buffered(rel_path, dest_dir, &mut scratch)
     }
 
-    fn is_metadata_up_to_date(
-        dest_meta: Option<&std::fs::Metadata>,
-        src_size: i64,
-        src_mod: i64,
-        rec: Option<&FileRecord>,
-    ) -> bool {
-        if let Some(dest_meta) = dest_meta {
-            let dest = FileMetadataSnapshot {
-                size: dest_meta.len() as i64,
-                modified_epoch_millis: safe_modified_millis(dest_meta).unwrap_or(0),
-            };
-            let src = FileMetadataSnapshot {
-                size: src_size,
-                modified_epoch_millis: src_mod,
-            };
-            return src.is_up_to_date(&dest, rec);
-        }
-        false
-    }
-
     pub(crate) fn sync_file_core(
         &self,
         task: &FileSyncTask<'_>,
@@ -604,18 +584,20 @@ impl<S: HashStore> LocalSyncEngine<S> {
             let dest_size = dest_meta_ref.len() as i64;
             let dest_mod = safe_modified_millis(dest_meta_ref).unwrap_or(0);
             if dest_size == src_size && dest_mod.abs_diff(src_mod) <= 2000 {
+                self.align_dest_file_casing_if_needed(dest_dir, rel_path)?;
                 if let Some(record) = file_record
                     && record.is_tracked()
                     && record.file_size() == src_size as u64
                     && record.last_modified() == src_mod
                 {
+                    if let Ok(safe_rel) = crate::path_util::RelativePath::new(rel_path) {
+                        if record.relative_path() != &safe_rel {
+                            let hashes = self.db.get_block_hashes(rel_path)?;
+                            let updated_rec = FileRecord::from_raw(rel_path, src_size as u64, src_mod)?;
+                            self.db.save_file(&updated_rec, &hashes)?;
+                        }
+                    }
                     tracing::debug!(path = %rel_path.display(), "Local signature cache hit and destination matches, skipping sync");
-                    return Ok(None);
-                }
-
-                if Self::is_metadata_up_to_date(Some(dest_meta_ref), src_size, src_mod, file_record)
-                {
-                    tracing::debug!(path = %rel_path.display(), "Metadata unchanged, skipping sync");
                     return Ok(None);
                 }
             } else {
@@ -772,6 +754,10 @@ impl<S: HashStore> LocalSyncEngine<S> {
         if let Some(parent) = dest_path.parent() {
             self.evict_verified_dir(parent);
         }
+        let source_path = self.config.source_dir().join(rel_path);
+        if let Some(parent) = source_path.parent() {
+            self.evict_verified_dir(parent);
+        }
         if self.config.propagate_deletions() || !dest_path.exists() {
             self.db.delete_file(rel_path)?;
         }
@@ -781,6 +767,49 @@ impl<S: HashStore> LocalSyncEngine<S> {
     /// Prune old and excess files in the destination archive.
     pub fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
         self.archive_manager.prune_destination_archive(dest_dir)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn align_dest_file_casing_if_needed(
+        &self,
+        dest_dir: &Path,
+        rel_path: &Path,
+    ) -> Result<(), SyncError> {
+        let dest_path = dest_dir.join(rel_path);
+        let Some(expected_name) = rel_path.file_name() else { return Ok(()); };
+        let Some(parent) = dest_path.parent() else { return Ok(()); };
+        if !parent.exists() { return Ok(()); }
+
+        let mut needs_rename = false;
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let expected_str = expected_name.to_string_lossy();
+            for entry in entries.flatten() {
+                let name_str = entry.file_name().to_string_lossy().into_owned();
+                if name_str.eq_ignore_ascii_case(&expected_str) {
+                    if name_str != expected_str {
+                        needs_rename = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if needs_rename {
+            let temp_name = format!("{}.syncdir_casetmp_{}", dest_path.display(), std::process::id());
+            let temp_path = std::path::PathBuf::from(temp_name);
+            if temp_path.exists() {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            std::fs::rename(&dest_path, &temp_path)?;
+            std::fs::rename(&temp_path, &dest_path)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[inline]
+    pub(crate) fn align_dest_file_casing_if_needed(&self, _dest_dir: &Path, _rel_path: &Path) -> Result<(), SyncError> {
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2288,6 +2317,137 @@ mod tests {
                 assert_eq!(p.as_path(), Path::new("valid/path.txt"));
             }
             _ => panic!("Expected FileDeleted"),
+        }
+    }
+
+    #[test]
+    fn test_delete_file_from_dest_symmetrical_reparse_eviction() {
+        use std::fs;
+        use std::path::Path;
+        use tempfile::tempdir;
+        use crate::config::{Config, TargetSyncConfig};
+        use crate::db::MockHashStore;
+        use crate::sync::engine::LocalSyncEngine;
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let src_sub = src.join("nested_dir");
+        let dst_sub = dst.join("nested_dir");
+        fs::create_dir_all(&src_sub).unwrap();
+        fs::create_dir_all(&dst_sub).unwrap();
+
+        let target_file = dst_sub.join("victim.txt");
+        fs::write(&target_file, b"to be deleted").unwrap();
+
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .propagate_deletions(true)
+            .build()
+            .unwrap();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let store = MockHashStore::new();
+        let engine = LocalSyncEngine::new(store, target_cfg);
+
+        let cache = engine.reparse_cache();
+        cache.insert_ancestor(&dst, &dst_sub);
+        cache.insert_ancestor(&src, &src_sub);
+
+        assert!(cache.contains(&dst_sub));
+        assert!(cache.contains(&src_sub));
+
+        engine
+            .delete_file_from_dest(Path::new("nested_dir/victim.txt"), &dst)
+            .unwrap();
+
+        assert!(
+            !cache.contains(&dst_sub),
+            "Destination parent must be evicted from ReparseCache upon file deletion"
+        );
+        assert!(
+            !cache.contains(&src_sub),
+            "Source parent must be symmetrically evicted from ReparseCache upon file deletion (CWE-59)"
+        );
+    }
+
+    #[test]
+    fn test_case_only_rename_on_destination_updates_disk_casing_and_db() {
+        use std::fs;
+        use std::path::Path;
+        use tempfile::tempdir;
+        use crate::config::{Config, TargetSyncConfig};
+        use crate::db::{HashStore, SqliteHashStore, StoreConfig};
+        use crate::sync::engine::LocalSyncEngine;
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        let initial_content = b"Case Sensitivity In-Place Delta Content";
+        let src_file_lower = src.join("test.txt");
+        fs::write(&src_file_lower, initial_content).unwrap();
+
+        let db_path = temp.path().join("sigcache.db");
+        let store_cfg = StoreConfig::new(64 * 1024, 1024 * 1024).unwrap();
+        let db = SqliteHashStore::new(&db_path, store_cfg).unwrap();
+
+        let config = Config::builder(src.clone())
+            .dest_dir(dst.clone())
+            .build()
+            .unwrap();
+        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let engine = LocalSyncEngine::new(db, target_cfg);
+
+        let mut scratch = vec![0u8; 64 * 1024];
+
+        engine
+            .sync_file_to_dest_buffered(Path::new("test.txt"), &dst, &mut scratch)
+            .unwrap();
+
+        let initial_rec = engine
+            .db()
+            .get_file(Path::new("test.txt"))
+            .unwrap()
+            .expect("Record must exist after initial sync");
+        assert_eq!(initial_rec.relative_path().as_path(), Path::new("test.txt"));
+
+        let src_file_cased = src.join("Test.txt");
+        let temp_stage = src.join("test.txt.syncdir_casetmp");
+        fs::rename(&src_file_lower, &temp_stage).unwrap();
+        fs::rename(&temp_stage, &src_file_cased).unwrap();
+
+        engine
+            .sync_file_to_dest_buffered(Path::new("Test.txt"), &dst, &mut scratch)
+            .unwrap();
+
+        let updated_rec = engine
+            .db()
+            .get_file(Path::new("Test.txt"))
+            .unwrap()
+            .expect("Record must be queryable via new casing");
+        assert_eq!(
+            updated_rec.relative_path().as_path(),
+            Path::new("Test.txt"),
+            "SQLite relative_path must preserve new path casing"
+        );
+
+        #[cfg(windows)]
+        {
+            let entries: Vec<String> = fs::read_dir(&dst)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|de| de.file_name().to_string_lossy().into_owned()))
+                .collect();
+            assert!(
+                entries.contains(&"Test.txt".to_string()),
+                "Destination directory entry must update to 'Test.txt', found: {:?}",
+                entries
+            );
+            assert!(
+                !entries.contains(&"test.txt".to_string()),
+                "Old lowercase 'test.txt' directory entry must not linger on destination filesystem"
+            );
         }
     }
 }
