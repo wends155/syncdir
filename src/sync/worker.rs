@@ -1211,9 +1211,22 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
     context: SyncWorkerContext<E>,
 ) -> Result<std::thread::JoinHandle<()>, SyncError> {
     let target_index = context.target_index;
+    let parent_span = tracing::Span::current();
+    let dest = context.config.dest_dir().to_path_buf();
+    let target_idx = target_index + 1;
+    let worker_span = tracing::info_span!(
+        parent: &parent_span,
+        "sync_worker",
+        target_index = target_idx,
+        dest = %dest.display()
+    );
+    let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
     std::thread::Builder::new()
         .name(format!("sync-worker-{}", target_index))
         .spawn(move || {
+            let _dispatch_guard = tracing::dispatcher::set_default(&dispatcher);
+            let _span_guard = worker_span.entered();
             let mut runner = SyncWorkerRunner::new(context);
             'worker: loop {
                 if runner
@@ -2189,6 +2202,37 @@ mod tests {
             log_str.contains("Periodic archive prune failed"),
             "Expected 'Periodic archive prune failed' in logs, got: {}",
             log_str
+        );
+    }
+
+    #[test]
+    fn test_sync_worker_thread_span_propagation() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source).dest_dir(dest).build_unvalidated();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = MockSyncEngine::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+
+        let (_, log_output) = crate::test_support::with_captured_tracing(|| {
+            let handle = start_sync_worker(ctx).unwrap();
+            drop(tx);
+            let _ = handle.join();
+        });
+
+        assert!(
+            log_output.contains("sync_worker"),
+            "Log output missing sync_worker span: {log_output}"
+        );
+        assert!(
+            log_output.contains("target_index=1"),
+            "Log output missing target_index field: {log_output}"
         );
     }
 }

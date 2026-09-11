@@ -202,7 +202,7 @@ impl SyncDaemon {
                     (Some(w), active)
                 }
                 Err(e) => {
-                    tracing::error!("Failed to start directory watcher: {e}");
+                    tracing::error!(error = %e, "Failed to start directory watcher");
                     (None, false)
                 }
             }
@@ -215,9 +215,21 @@ impl SyncDaemon {
             obs.on_watcher_status_change(initial_online.into(), is_initially_active.into());
         }
 
+        let parent_span = tracing::Span::current();
+        let source_dir = config.source_dir().to_path_buf();
+        let watcher_span = tracing::info_span!(
+            parent: &parent_span,
+            "watcher_coordinator",
+            source_dir = %source_dir.display()
+        );
+        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
         std::thread::Builder::new()
             .name("watcher-coordinator".to_string())
             .spawn(move || {
+                let _dispatch_guard = tracing::dispatcher::set_default(&dispatcher);
+                let _span_guard = watcher_span.entered();
+                tracing::debug!("Watcher coordinator thread started");
                 let mut watcher: Option<Box<dyn crate::monitor::FileWatcher>> = initial_watcher;
                 let retry_interval =
                     std::time::Duration::from_secs(config.retry_interval_seconds());
@@ -258,7 +270,7 @@ impl SyncDaemon {
                                     let _ = command_tx.send(SyncCommand::TriggerFullScan);
                                 }
                                 Err(e) => {
-                                    tracing::error!("Failed to start directory watcher: {e}");
+                                    tracing::error!(error = %e, "Failed to start directory watcher");
                                     active = false;
                                 }
                             }
@@ -292,9 +304,18 @@ impl SyncDaemon {
         mut worker_senders: Vec<Sender<SyncCommand>>,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Result<JoinHandle<()>, SyncError> {
+        let parent_span = tracing::Span::current();
+        let broadcaster_span = tracing::info_span!(
+            parent: &parent_span,
+            "command_broadcaster"
+        );
+        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
         std::thread::Builder::new()
             .name("command-broadcaster".to_string())
             .spawn(move || {
+                let _dispatch_guard = tracing::dispatcher::set_default(&dispatcher);
+                let _span_guard = broadcaster_span.entered();
                 while !shutdown_flag.load(Ordering::Relaxed) {
                     match command_rx.recv_timeout(std::time::Duration::from_millis(200)) {
                         Ok(mut cmd) => {
@@ -945,5 +966,44 @@ mod tests {
 
         assert!(daemon.watcher_running());
         daemon.shutdown();
+    }
+
+    #[test]
+    fn test_watcher_thread_logs_correlate_with_daemon_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&dst).expect("dst");
+
+        let config = crate::config::Config::builder(&src)
+            .dest_dir(dst)
+            .build()
+            .expect("config");
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let mock_watcher_factory = Arc::new(DummyFactory(flag));
+        let mock_resolver = Arc::new(crate::net::MockNetworkResolver::new());
+
+        let (_, log_output) = crate::test_support::with_captured_tracing(|| {
+            let daemon = SyncDaemon::builder(config, dir.path())
+                .factory(MockEngineFactory)
+                .resolver(mock_resolver)
+                .watcher_factory(mock_watcher_factory)
+                .start()
+                .expect("start via builder");
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            daemon.shutdown();
+        });
+
+        assert!(
+            log_output.contains("watcher_coordinator"),
+            "Missing watcher_coordinator span: {log_output}"
+        );
+        assert!(
+            log_output.contains("source_dir="),
+            "Missing source_dir field: {log_output}"
+        );
     }
 }
