@@ -618,18 +618,48 @@ This file documents the chronological history, design decisions, and rules conte
 
 ---
 
-> 📝 **Context Update (2026-09-10):**
-> * **Feature:** Documentation & Architecture Synchronization (`/update-doc` & `/architecture`)
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Phase 1: Critical Bug, Concurrency, and Security Fixes
 > * **Changes:**
->   - **Architecture Documentation Sync (`architecture.md`)**: Updated Project Layout (§4) to document the `src/config/` submodule structure (`mod.rs`, `builder.rs`, `raw.rs`, `target.rs`, `validation.rs`, `tests.rs`) and decomposed sync transfer components. Synchronized Module Boundaries (§5) for `config`, `daemon`, `tray`, `sync`, `net`, `db`, and `monitor`. Updated Known Constraints & Technical Debt (§14) confirming full resolution of all 17 review findings from `review_report.md`.
->   - **Behavioral Specification Sync (`spec.md`)**: Bumped verification commit baseline to `96f1765`. Updated public API contracts across all 10 modules: documented `Config::destinations` slice accessor, `TargetSyncConfigBuilder`, `StoreConfig` bridges, `SyncWorkerContextBuilder`, private `LocalSyncEngine` fields, `TrayEventLoop` windowing encapsulation, `DaemonHandle`, and private internal helpers in `net.rs` and `monitor.rs`. Verified 100% semantic alignment between `Cargo.toml`, `lib.rs`, and `README.md`.
->   - **Verification Gate**: Passed all quality checks (`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --all-features`) with 302 passing tests and zero regressions.
+>   - **Worker Drain Shutdown Safety (O1)**: Labeled outer loop `'worker: loop` and broke out of `'worker` on `!runner.handle_command(cmd)` in inner `while let Ok(cmd) = runner.context.rx.try_recv()` drain loop in `src/sync/worker.rs`.
+>   - **Full Scan Underflow Guard (O2)**: Calculated `remaining = source_files.len().saturating_sub(synced_count.saturating_add(failed_count))` in `LocalSyncEngine::run_cancellable_full_scan_impl` logging in `src/sync/engine.rs`.
+>   - **Destination TOCTOU Symlink Hijack Defense (O3)**: Used `OpenOptionsExt::custom_flags(0x0020_0000)` (`FILE_FLAG_OPEN_REPARSE_POINT`) and verified `(meta.file_attributes() & 0x400) == 0` in `DeltaTransferEngine::sync_delta_large_file_core` in `src/sync/delta.rs`.
+>   - **Immediate Eviction on Permanent Failures (O4)**: Dispatched `SyncError::validation_reparse` on junction/symlink detections and `SyncError::validation_security` on path traversals across `path_safety.rs`, `engine.rs`, and `archive.rs`.
+>   - **Path Normalization & Hierarchy Containment (O5)**: Guarded empty base paths in `is_same_or_descendant` and restructured trailing backslash trimming in `normalize_path` in `src/path_util.rs`.
+>   - **Verification Builder Synchronization & Panic Elimination (O6)**: Synchronized `verify_writes` with `verification_mode` in `TargetSyncConfigBuilder` and `ConfigBuilder`. Replaced `.expect()` with compile-time const default in `block_size_nonzero`. Made `DirtyRangeLease` deref methods panic-free.
+>   - **Archive Ancestor Defense & Sampled Optimization (O7)**: Audited intermediate subpath directories under `.syncdir_archive/` with `verify_destination_not_reparse`. Optimized `VerificationMode::Sampled` in `SmallFileTransferEngine` to avoid unnecessary full-file readbacks.
 > * **New Constraints:**
->   - Documentation updates must preserve the verified commit hash link in `spec.md`.
->   - Module contracts in `spec.md` and boundary definitions in `architecture.md` must accurately reflect internal encapsulation and public API surfaces.
+>   - All file opens on potentially unprivileged target paths must specify `FILE_FLAG_OPEN_REPARSE_POINT` on Windows.
+>   - Reparse and traversal errors must use `ValidationKind::ReparsePoint` / `ValidationKind::Security` to enable instant worker queue eviction.
 > * **Pruned:**
->   - Stale references to monolithic `src/config.rs` eliminated.
->   - Obsolete `daemon -> tray` references and dead `open_path` signatures eliminated.
+>   - Drained shutdown hang in sync worker eliminated.
+>   - Full scan arithmetic underflow panic on network disconnect eliminated.
+>   - Production code `.expect()` calls in `TargetSyncConfig` and `DirtyRangeLease` eliminated.
+
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Phase 2: Leaf & Trait Decoupling (`review_report.md` Findings 1, 2, 3, 4, 7, 9, 11)
+> * **Changes:**
+>   - **Path Util Purification & Shell Execution Relocation (O1)**: Relocated `open_path` to `src/tray.rs` as `pub(crate) fn open_path`. Retained self-contained deprecation shim in `src/path_util.rs` without importing `tray`. Removed orphaned `test_system_root`.
+>   - **Leaf Component Decoupling via `src/sync/types.rs` (O2)**: Extracted `src/sync/types.rs` declaring `FileSyncTask<'a>`, `safe_epoch_duration_millis`, and `safe_modified_millis`. Severed circular imports from `delta.rs` and `small_file.rs` to `engine.rs`.
+>   - **FileRecord Domain Encapsulation (O3)**: Encapsulated `FileRecord` in `src/db.rs` with private fields, `file_size: u64`, constructor `FileRecord::new`, and getters (`.relative_path()`, `.file_size()`, `.last_modified()`, `.id()`, `.is_tracked()`).
+>   - **TargetSyncConfig Domain Symmetry (O4)**: Restored `source_dir: TargetDir` in `TargetSyncConfig`, provided `.source_dir() -> &Path` and `.source_target_dir() -> &TargetDir`, updated `TargetSyncConfigBuilder` to hold and validate `TargetDir` without extra clones.
+>   - **FileWatcher & WatcherFactory Trait Abstractions (O5)**: Abstracted directory watching in `src/monitor.rs` behind `pub trait FileWatcher: Send + 'static` and `pub trait WatcherFactory: Send + Sync + 'static`. Injected `Arc<dyn WatcherFactory>` into `SyncDaemon` with `RecommendedWatcherFactory` as default. Added `watcher_running(&self) -> bool` and removed dead `command_tx(&self)`.
+>   - **Watcher Error Modularization (O6)**: Defined `pub enum WatcherError` in `src/error.rs` (wrapping `notify::Error`, `PathNotFound`, `ChannelDisconnected`, `Other`), re-exported in `src/monitor.rs`. Transparently wrapped in `SyncError::Watcher(#[from] WatcherError)` preserving causal source chains.
+>   - **Daemon Shutdown Panic Logging & Event Coordination (O7)**: Added `join_thread_and_log_panic` safely extracting downcasted panic strings across worker, watcher, and broadcaster threads during `perform_shutdown`. Added 100ms interval shutdown polling in watcher coordinator loop.
+>   - **Quality Verification Gate**: 320 passing tests (zero failures), zero clippy warnings, and clean formatting check.
+> * **New Constraints:**
+>   - Leaf transfer engines (`delta.rs`, `small_file.rs`) must import types from `src/sync/types.rs`, never from `engine.rs`.
+>   - Direct access to `FileRecord` fields is prohibited; consumers must use getter methods.
+>   - Directory watchers must be instantiated via `WatcherFactory` to allow mock injection.
+> * **Pruned:**
+>   - Inverted circular dependencies from `delta.rs` / `small_file.rs` to `engine.rs` eliminated.
+>   - Dead `command_tx` method on `SyncDaemon` eliminated.
+>   - Raw panic leaks during daemon thread shutdown eliminated.
+
 
 
 
