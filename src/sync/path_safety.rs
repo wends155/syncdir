@@ -209,10 +209,9 @@ pub fn verify_destination_not_reparse_cached(
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
-    let components: Vec<_> = rel_path.components().collect();
-    let total = components.len();
-    for (i, component) in components.into_iter().enumerate() {
-        let is_leaf = i + 1 == total;
+    let mut components = rel_path.components().peekable();
+    while let Some(component) = components.next() {
+        let is_leaf = components.peek().is_none();
         current.push(component);
         if cache.contains(&current) {
             if is_leaf {
@@ -259,10 +258,9 @@ pub fn verify_destination_not_reparse_cached(
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
-    let components: Vec<_> = rel_path.components().collect();
-    let total = components.len();
-    for (i, component) in components.into_iter().enumerate() {
-        let is_leaf = i + 1 == total;
+    let mut components = rel_path.components().peekable();
+    while let Some(component) = components.next() {
+        let is_leaf = components.peek().is_none();
         current.push(component);
         if cache.contains(&current) {
             if is_leaf {
@@ -421,14 +419,17 @@ pub(crate) fn is_reparse_or_symlink_meta(meta: &Metadata) -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> Result<bool, std::io::Error> {
+pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry, path: &Path) -> Result<bool, std::io::Error> {
     use std::os::windows::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(entry.path())?;
+    if let Ok(meta) = entry.metadata() {
+        return Ok((meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink());
+    }
+    let meta = std::fs::symlink_metadata(path)?;
     Ok((meta.file_attributes() & 0x400) != 0 || meta.file_type().is_symlink())
 }
 
 #[cfg(not(windows))]
-pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry) -> Result<bool, std::io::Error> {
+pub(crate) fn is_reparse_or_symlink(entry: &std::fs::DirEntry, _path: &Path) -> Result<bool, std::io::Error> {
     Ok(entry.file_type()?.is_symlink())
 }
 
@@ -607,7 +608,8 @@ mod tests {
         fs::create_dir(&sub).unwrap();
         for entry in fs::read_dir(dir.path()).unwrap() {
             let entry = entry.unwrap();
-            let result = is_reparse_or_symlink(&entry).unwrap();
+            let path = entry.path();
+            let result = is_reparse_or_symlink(&entry, &path).unwrap();
             assert!(
                 !result,
                 "regular directory must not be flagged as reparse point"
@@ -643,8 +645,9 @@ mod tests {
         if created {
             for entry in fs::read_dir(dir.path()).unwrap() {
                 let entry = entry.unwrap();
-                if entry.path() == link {
-                    let result = is_reparse_or_symlink(&entry).unwrap();
+                let path = entry.path();
+                if path == link {
+                    let result = is_reparse_or_symlink(&entry, &path).unwrap();
                     assert!(result, "junction/symlink must be detected as reparse point");
                 }
             }
@@ -831,5 +834,42 @@ mod tests {
             verify_source_not_reparse_cached(&dest, Path::new("sub/nested/test.txt"), &cache)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_verify_destination_not_reparse_cached_zero_allocation_iteration() {
+        use std::fs;
+        use std::path::Path;
+        use tempfile::tempdir;
+        use crate::sync::path_safety::{ReparseCache, verify_destination_not_reparse_cached};
+
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        let deep_sub = dest.join("l1").join("l2").join("l3").join("l4").join("l5").join("l6");
+        fs::create_dir_all(&deep_sub).unwrap();
+
+        let target_file = deep_sub.join("nested_leaf.bin");
+        fs::write(&target_file, b"deep nested payload").unwrap();
+
+        let cache = ReparseCache::new(50_000, 10_000);
+        let rel_path = Path::new("l1/l2/l3/l4/l5/l6/nested_leaf.bin");
+
+        let meta = verify_destination_not_reparse_cached(&dest, rel_path, &cache)
+            .expect("Deeply nested path verification must succeed");
+        assert!(meta.is_some());
+        assert_eq!(meta.unwrap().len(), 19);
+
+        assert!(cache.contains(&dest.join("l1")));
+        assert!(cache.contains(&dest.join("l1/l2/l3")));
+        assert!(cache.contains(&dest.join("l1/l2/l3/l4/l5/l6")));
+
+        let sibling_file = deep_sub.join("sibling_leaf.bin");
+        fs::write(&sibling_file, b"sibling payload").unwrap();
+        let rel_sibling = Path::new("l1/l2/l3/l4/l5/l6/sibling_leaf.bin");
+
+        let sibling_meta = verify_destination_not_reparse_cached(&dest, rel_sibling, &cache)
+            .expect("Sibling verification must succeed via cached ancestors");
+        assert!(sibling_meta.is_some());
+        assert_eq!(sibling_meta.unwrap().len(), 15);
     }
 }

@@ -67,19 +67,19 @@ pub(crate) fn prune_archive(
                 break;
             }
             let entry = entry?;
-            match is_reparse_or_symlink(&entry) {
+            let path = entry.path();
+            match is_reparse_or_symlink(&entry, &path) {
                 Ok(true) => {
-                    tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in archive");
+                    tracing::debug!(path = %path.display(), "Skipping reparse point or symlink in archive");
                     continue;
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(path = %entry.path().display(), error = %e, "Failed checking reparse point; skipping");
+                    tracing::warn!(path = %path.display(), error = %e, "Failed checking reparse point; skipping");
                     continue;
                 }
             }
             let ft = entry.file_type()?;
-            let path = entry.path();
             let file_name = entry.file_name();
             let name_str = file_name.to_string_lossy();
             let parsed_time = parse_archive_timestamp(&name_str);
@@ -227,11 +227,6 @@ impl ArchiveManager {
                     let archive_rel = archive_path
                         .strip_prefix(&archive_dir)
                         .map_err(|e| SyncError::validation_security(e.to_string()))?;
-                    verify_destination_not_reparse_cached(
-                        &archive_dir,
-                        archive_rel,
-                        &self.reparse_cache,
-                    )?;
 
                     if let Some(parent) = archive_path.parent() {
                         fs::create_dir_all(parent)?;

@@ -47,14 +47,15 @@ pub(crate) fn scan_dir_cancellable(
             }
             Err(e) => return Err(SyncError::Io(e)),
         };
-        match is_reparse_or_symlink(&entry) {
+        let path = entry.path();
+        match is_reparse_or_symlink(&entry, &path) {
             Ok(true) => {
-                tracing::debug!(path = %entry.path().display(), "Skipping reparse point or symlink in scan");
+                tracing::debug!(path = %path.display(), "Skipping reparse point or symlink in scan");
                 continue;
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(path = %entry.path().display(), error = %e, "Failed checking reparse point; skipping entry and marking scan incomplete");
+                tracing::warn!(path = %path.display(), error = %e, "Failed checking reparse point; skipping entry and marking scan incomplete");
                 *scan_complete = false;
                 continue;
             }
@@ -62,13 +63,12 @@ pub(crate) fn scan_dir_cancellable(
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::warn!(path = %entry.path().display(), error = %e, "Permission denied querying file type; skipping");
+                tracing::warn!(path = %path.display(), error = %e, "Permission denied querying file type; skipping");
                 *scan_complete = false;
                 continue;
             }
             Err(e) => return Err(SyncError::Io(e)),
         };
-        let path = entry.path();
         if file_type.is_dir() {
             scan_dir_cancellable(&path, source_root, files, scan_complete, depth + 1, cancel)?;
         } else if file_type.is_file()
@@ -231,5 +231,66 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(Path::new("file1.txt")));
         assert!(files.contains(&Path::new("nested").join("file2.txt")));
+    }
+
+    #[test]
+    fn test_directory_scanner_discovers_files_and_ignores_junctions() {
+        use std::collections::HashSet;
+        use std::fs;
+        use std::path::Path;
+        use std::sync::atomic::AtomicBool;
+        use tempfile::tempdir;
+        use crate::config::{Config, TargetSyncConfig};
+        use crate::sync::scanner::DirectoryScanner;
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        let outside = temp.path().join("outside_target");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        fs::write(src.join("root.txt"), b"root content").unwrap();
+        let sub = src.join("nested_folder");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("nested_file.txt"), b"nested content").unwrap();
+        fs::write(outside.join("secret_data.txt"), b"confidential").unwrap();
+
+        #[cfg(windows)]
+        {
+            let junction_path = src.join("external_junction");
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' -Force",
+                        junction_path.display(),
+                        outside.display()
+                    ),
+                ])
+                .status();
+        }
+
+        let config = Config::test_default(src.clone(), dst);
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let scanner = DirectoryScanner::new(target_cfg);
+
+        let mut files = HashSet::new();
+        let mut scan_complete = true;
+        let cancel = AtomicBool::new(false);
+
+        scanner
+            .scan_dir_cancellable(&src, &mut files, &mut scan_complete, &cancel)
+            .expect("Directory scanner must execute successfully");
+
+        assert!(scan_complete);
+        assert!(files.contains(Path::new("root.txt")));
+        assert!(files.contains(&Path::new("nested_folder").join("nested_file.txt")));
+        assert!(
+            !files.iter().any(|p| p.to_string_lossy().contains("secret_data")),
+            "Directory scanner must strictly ignore files located behind reparse junctions"
+        );
     }
 }
