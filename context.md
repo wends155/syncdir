@@ -718,6 +718,28 @@ This file documents the chronological history, design decisions, and rules conte
 >   - **`architecture.md` Synchronization**: Applied all 5 recommendations to `architecture.md`: added `full_scan.rs` and `types.rs` to layout tree (§ 4), added `path_util` to `monitor` and pruned `config` from `startup` in § 6, documented `WatcherError` domain error isolation in § 8, updated test suite metrics to 343 tests and 5 in-memory mocks in § 10, and synchronized Mermaid Module Interaction Graph (`db --> path_util & error`, `monitor --> sync & path_util & error`, `startup --> error`) in § 13. Committed as `f736f7c`.
 >   - **Quality Verification Gate**: 343 passing tests (zero failures, 1 ignored), zero clippy warnings (`-D warnings`), and clean formatting check across the entire workspace.
 
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Block 1: Observability & Tracing Modernization (`/build`, `/audit`)
+> * **Changes:**
+>   - **Declarative Instrumentation (`Cargo.toml`, Subsystem Spans)**: Added `features = ["attributes"]` to `tracing = "0.1"`. Annotated architectural entry points with `#[tracing::instrument]` across `LocalSyncEngine::run_cancellable_full_scan_impl`, `DirectoryScanner::scan_dir_cancellable`, `ArchiveManager::prune_destination_archive`, `SqliteHashStore` (`get_file`, `save_file`, `delete_file`), and Win32 SMB helpers (`resolve_mapped_drive_unc`, `establish_smb_connection`). Kept hot chunk hashing and byte streaming loops span-free.
+>   - **CRLF Log Injection Defense (CWE-117)**: Reordered validation so `is_safe_relative_path` strictly precedes span creation in `LocalSyncEngine::sync_file_to_dest_core` and `archive_dest_file_only`. Sanitized relative paths and error messages using Debug representation (`?rel_path`, `{:?}`) across `src/monitor.rs`, `src/path_util.rs`, and `src/sync/archive.rs` to escape `\r\n` control bytes by construction.
+>   - **Cross-Thread Span & Dispatcher Propagation**: Propagated parent spans and thread-local dispatchers across spawned OS threads in `start_sync_worker` (`src/sync/worker.rs`) and `SyncDaemon::spawn_watcher_coordinator` / `spawn_command_broadcaster` (`src/daemon.rs`), ensuring background worker logs correlate with daemon contexts.
+>   - **Telemetry PII Scrubbing (CWE-532) & Crash-Resilient Panic Flush**: Masked usernames and hostnames in telemetry logs using deterministic Blake3 KDF (`domain: "syncdir telemetry pseudonymization v1"`), outputting `anon-<12-hex>`. Registered `WorkerGuard` in `LOG_WORKER_GUARD` static mutex, added non-blocking log flush in panic hook with double-panic protection (`AtomicBool`), and implemented emergency crash logger `write_emergency_panic_log` to `%APPDATA%\syncdir\logs\crash.log`.
+>   - **Pure Helper Purity**: Removed side-effecting log statements from pure lexical and calculation helpers (`safe_modified_millis`, `normalize_path`, `TargetDir::validate`). Added centralized `src/test_support.rs` with `TracingCaptureBuffer` and `with_captured_tracing`.
+>   - **Quality Verification Gate**: 347 passing tests across all targets, zero clippy warnings (`-D warnings`), and 100% clean formatting.
+> * **New Constraints:**
+>   - Untrusted file paths must be validated before entering tracing spans and formatted with Debug specifier `?rel_path` or `{:?}` in error messages to prevent CWE-117 log injection.
+>   - Usernames and hostnames in persistent log events must be pseudonymized via `pseudonymize_identifier` to prevent CWE-532 telemetry PII leaks.
+>   - Spawned background OS threads must capture and enter the active `parent_span` and `tracing::dispatcher` inside thread closures.
+>   - Pure lexical and value helpers must remain side-effect free and emit no tracing events.
+> * **Pruned:**
+>   - Manual, ad-hoc tracing spans on subsystem boundaries replaced with declarative `#[tracing::instrument]`.
+>   - Side-effecting logs in `safe_modified_millis`, `normalize_path`, and `TargetDir::validate` eliminated.
+>   - Redundant in-memory tracing buffer test harnesses consolidated into `src/test_support.rs`.
+
+
 
 
 
