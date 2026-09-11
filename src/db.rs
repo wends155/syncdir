@@ -449,6 +449,7 @@ impl HashStore for SqliteHashStore {
             "INSERT INTO file_metadata (relative_path, file_size, last_modified) \
              VALUES (?1, ?2, ?3) \
              ON CONFLICT(relative_path) DO UPDATE SET \
+               relative_path = excluded.relative_path, \
                file_size = excluded.file_size, \
                last_modified = excluded.last_modified \
              RETURNING id",
@@ -480,33 +481,40 @@ impl HashStore for SqliteHashStore {
     fn save_files_batch(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
-        for (record, hashes) in records {
-            let key = record.relative_path.to_sqlite_key();
-            let file_id: i64 = tx.query_row(
+        {
+            let mut meta_stmt = tx.prepare_cached(
                 "INSERT INTO file_metadata (relative_path, file_size, last_modified) \
                  VALUES (?1, ?2, ?3) \
                  ON CONFLICT(relative_path) DO UPDATE SET \
+                   relative_path = excluded.relative_path, \
                    file_size = excluded.file_size, \
                    last_modified = excluded.last_modified \
                  RETURNING id",
-                params![key, record.file_size as i64, record.last_modified],
-                |row| row.get(0),
             )?;
-            {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT INTO block_hashes (file_id, block_index, hash) \
-                     VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(file_id, block_index) DO UPDATE SET hash = excluded.hash \
-                     WHERE block_hashes.hash != excluded.hash",
+            let mut hash_stmt = tx.prepare_cached(
+                "INSERT INTO block_hashes (file_id, block_index, hash) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(file_id, block_index) DO UPDATE SET hash = excluded.hash \
+                 WHERE block_hashes.hash != excluded.hash",
+            )?;
+            let mut prune_stmt = tx.prepare_cached(
+                "DELETE FROM block_hashes WHERE file_id = ?1 AND block_index >= ?2",
+            )?;
+
+            for (record, hashes) in records {
+                let key = record.relative_path.to_sqlite_key();
+                let file_id: i64 = meta_stmt.query_row(
+                    params![key, record.file_size as i64, record.last_modified],
+                    |row| row.get(0),
                 )?;
                 for (idx, hash) in hashes.iter().enumerate() {
-                    stmt.execute(params![file_id, idx as i64, hash.as_slice()])?;
+                    hash_stmt.execute(params![file_id, idx as i64, hash.as_slice()])?;
                 }
+                prune_stmt.execute(params![file_id, hashes.len() as i64])?;
             }
-            tx.execute(
-                "DELETE FROM block_hashes WHERE file_id = ?1 AND block_index >= ?2",
-                params![file_id, hashes.len() as i64],
-            )?;
+            drop(meta_stmt);
+            drop(hash_stmt);
+            drop(prune_stmt);
         }
         tx.commit()?;
         Ok(())
@@ -522,7 +530,7 @@ impl HashStore for SqliteHashStore {
              ORDER BY b.block_index ASC",
         )?;
         let mut rows = stmt.query(params![key])?;
-        let mut hashes = Vec::new();
+        let mut hashes = Vec::with_capacity(64);
         while let Some(row) = rows.next()? {
             let val_ref = row.get_ref(0)?;
             let hash_blob = val_ref
@@ -1402,4 +1410,110 @@ mod tests {
             expected_path
         );
     }
+
+    #[test]
+    fn test_save_files_batch_statement_caching_and_casing_update() {
+        use std::path::Path;
+        use tempfile::tempdir;
+        use crate::db::{BlockHash, FileRecord, HashStore, SqliteHashStore, StoreConfig};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("batch_test.db");
+        let store_cfg = StoreConfig::new(1024 * 1024, 10 * 1024 * 1024).unwrap();
+        let store = SqliteHashStore::new(&db_path, store_cfg).unwrap();
+
+        let mut records = Vec::with_capacity(500);
+        let mut hashes_pool = Vec::with_capacity(500);
+        for i in 0..500 {
+            let rec = FileRecord::from_raw(format!("data/file_{:03}.bin", i), 2048, 1000 + i as i64)
+                .unwrap();
+            let h1: BlockHash = [i as u8; 32];
+            let mut h2: BlockHash = [0u8; 32];
+            h2[0] = (i % 256) as u8;
+            h2[31] = 0xFF;
+            records.push(rec);
+            hashes_pool.push(vec![h1, h2]);
+        }
+
+        let batch_slices: Vec<(&FileRecord, &[BlockHash])> = records
+            .iter()
+            .zip(hashes_pool.iter())
+            .map(|(r, h)| (r, h.as_slice()))
+            .collect();
+
+        store
+            .save_files_batch(&batch_slices)
+            .expect("Batch insert of 500 records with cached prepared statements must succeed");
+
+        assert_eq!(store.list_all_records().unwrap().len(), 500);
+
+        let initial_h0 = store.get_block_hashes(Path::new("data/file_000.bin")).unwrap();
+        assert_eq!(initial_h0.len(), 2);
+        assert_eq!(initial_h0[0], [0u8; 32]);
+
+        let cased_rec_0 = FileRecord::from_raw("DATA/FILE_000.BIN", 4096, 5000).unwrap();
+        let cased_rec_250 = FileRecord::from_raw("data/File_250.Bin", 8192, 6000).unwrap();
+        let new_h0 = vec![[0xAA; 32]];
+        let new_h250 = vec![[0xBB; 32], [0xCC; 32], [0xDD; 32]];
+
+        let update_batch = vec![
+            (&cased_rec_0, new_h0.as_slice()),
+            (&cased_rec_250, new_h250.as_slice()),
+        ];
+
+        store.save_files_batch(&update_batch).expect("Batch update must succeed");
+
+        let queried_rec_0 = store.get_file(Path::new("DATA/FILE_000.BIN")).unwrap().unwrap();
+        assert_eq!(queried_rec_0.relative_path().as_path(), Path::new("DATA/FILE_000.BIN"));
+        assert_eq!(queried_rec_0.file_size(), 4096);
+
+        let queried_rec_250 = store.get_file(Path::new("data/File_250.Bin")).unwrap().unwrap();
+        assert_eq!(queried_rec_250.relative_path().as_path(), Path::new("data/File_250.Bin"));
+        assert_eq!(queried_rec_250.file_size(), 8192);
+
+        let updated_h250 = store.get_block_hashes(Path::new("data/File_250.Bin")).unwrap();
+        assert_eq!(updated_h250.len(), 3);
+        assert_eq!(updated_h250[0], [0xBB; 32]);
+    }
+
+    #[test]
+    fn test_get_block_hashes_multi_block_preallocation() {
+        use std::path::Path;
+        use tempfile::tempdir;
+        use crate::db::{BlockHash, FileRecord, HashStore, SqliteHashStore, StoreConfig};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("prealloc_test.db");
+        let store_cfg = StoreConfig::new(1024 * 1024, 10 * 1024 * 1024).unwrap();
+        let store = SqliteHashStore::new(&db_path, store_cfg).unwrap();
+
+        let block_count = 16usize;
+        let record = FileRecord::from_raw("large_file.dat", (block_count * 1024 * 1024) as u64, 12345).unwrap();
+        let expected_hashes: Vec<BlockHash> = (0..block_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[15] = 0xAA;
+                h[31] = (255 - i) as u8;
+                h
+            })
+            .collect();
+
+        store.save_file(&record, &expected_hashes).unwrap();
+
+        let retrieved = store
+            .get_block_hashes(Path::new("large_file.dat"))
+            .expect("Querying block hashes for multi-block file must succeed");
+
+        assert_eq!(retrieved.len(), block_count);
+        assert!(retrieved.capacity() >= 64, "Vector capacity must be pre-allocated to at least 64");
+
+        for (idx, (actual, expected)) in retrieved.iter().zip(expected_hashes.iter()).enumerate() {
+            assert_eq!(actual, expected, "Block hash at index {} must match", idx);
+        }
+
+        let missing = store.get_block_hashes(Path::new("nonexistent.dat")).unwrap();
+        assert!(missing.is_empty());
+    }
 }
+
