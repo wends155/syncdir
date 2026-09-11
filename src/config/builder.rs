@@ -4,7 +4,6 @@ use crate::config::target::{DestinationCollection, TargetDir, TargetRole, Verifi
 use crate::config::validation;
 use crate::config::{Config, TargetSyncConfig};
 use crate::error::SyncError;
-use crate::path_util::is_same_or_descendant;
 use std::path::PathBuf;
 
 /// Builder for constructing and validating a [`TargetSyncConfig`].
@@ -134,15 +133,7 @@ impl TargetSyncConfigBuilder {
         self.source_dir.validate(TargetRole::Source)?;
         self.dest_dir.validate(TargetRole::Destination)?;
 
-        if is_same_or_descendant(self.source_dir.as_path(), self.dest_dir.as_path())
-            || is_same_or_descendant(self.dest_dir.as_path(), self.source_dir.as_path())
-        {
-            return Err(SyncError::validation_loop(format!(
-                "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
-                self.dest_dir.display(),
-                self.source_dir.display()
-            )));
-        }
+        validation::validate_sync_boundaries(self.source_dir.as_path(), self.dest_dir.as_path())?;
 
         let verification_mode = self
             .verification_mode
@@ -306,6 +297,7 @@ impl ConfigBuilder {
     ///
     /// An unvalidated [`Config`].
     #[doc(hidden)]
+    #[allow(deprecated)]
     pub fn build_unvalidated(self) -> Config {
         Config::from_raw_parts(
             TargetDir::new(self.source_dir),

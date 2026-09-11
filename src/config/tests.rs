@@ -698,6 +698,7 @@ fn test_target_sync_config_from_config() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_target_dir_normalization_and_validation() {
     let t1 = TargetDir::new("X:/folder/subfolder/");
     assert_eq!(t1.as_path().to_string_lossy(), r"X:\folder\subfolder");
@@ -722,6 +723,7 @@ fn test_target_dir_normalization_and_validation() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_destination_collection_dedup_and_order() {
     let col = DestinationCollection::from_raw(
         Some(PathBuf::from(r"D:\Backup1")),
@@ -742,6 +744,7 @@ fn test_destination_collection_dedup_and_order() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_config_destinations_matches_dest_dirs() {
     let d1 = PathBuf::from(r"D:\Backup1");
     let d2 = PathBuf::from(r"E:\Backup2");
@@ -1168,6 +1171,7 @@ fn test_target_sync_config_block_size_nonzero_panic_free_fallback() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_target_sync_config_source_dir_target_dir() {
     use crate::config::TargetSyncConfig;
     use crate::config::target::TargetDir;

@@ -99,3 +99,70 @@ pub(crate) fn escape_backslashes_in_quotes(line: &str) -> String {
     }
     result
 }
+
+use std::path::Path;
+
+use crate::error::SyncError;
+
+/// Validates that neither `source` nor `dest` is identical to or nested within the other,
+/// preventing recursive synchronization loops.
+pub(crate) fn validate_sync_boundaries(source: &Path, dest: &Path) -> Result<(), SyncError> {
+    if crate::path_util::is_same_or_descendant(source, dest)
+        || crate::path_util::is_same_or_descendant(dest, source)
+    {
+        return Err(SyncError::validation_loop(format!(
+            "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
+            dest.display(),
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_validate_sync_boundaries_identical_and_nested() {
+        let src = Path::new(r"C:\data\sync");
+        let same = Path::new(r"C:\data\sync");
+        let child = Path::new(r"C:\data\sync\nested\dest");
+        let parent = Path::new(r"C:\data");
+        let separate = Path::new(r"C:\backup\dest");
+
+        // Separate paths must succeed
+        assert!(validate_sync_boundaries(src, separate).is_ok());
+
+        // Identical paths must fail with RecursiveLoop error
+        let err_identical = validate_sync_boundaries(src, same).unwrap_err();
+        assert!(matches!(
+            err_identical,
+            SyncError::Validation {
+                kind: crate::error::ValidationKind::RecursiveLoop,
+                ..
+            }
+        ));
+
+        // Destination inside source must fail with RecursiveLoop error
+        let err_child = validate_sync_boundaries(src, child).unwrap_err();
+        assert!(matches!(
+            err_child,
+            SyncError::Validation {
+                kind: crate::error::ValidationKind::RecursiveLoop,
+                ..
+            }
+        ));
+
+        // Source inside destination must fail with RecursiveLoop error
+        let err_parent = validate_sync_boundaries(src, parent).unwrap_err();
+        assert!(matches!(
+            err_parent,
+            SyncError::Validation {
+                kind: crate::error::ValidationKind::RecursiveLoop,
+                ..
+            }
+        ));
+    }
+}

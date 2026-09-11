@@ -34,7 +34,7 @@ impl VerificationMode {
 
 /// Role of a synchronized target directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TargetRole {
+pub enum TargetRole {
     Source,
     Destination,
 }
@@ -61,7 +61,18 @@ impl std::fmt::Display for TargetRole {
 pub struct TargetDir(PathBuf);
 
 impl TargetDir {
+    /// Construct a validated TargetDir by normalizing path via normalize_path() and validating syntax for role.
+    pub fn try_new(path: impl Into<PathBuf>, role: TargetRole) -> Result<Self, SyncError> {
+        let dir = Self(normalize_path(path.into()));
+        dir.validate(role)?;
+        Ok(dir)
+    }
+
     /// Construct TargetDir by normalizing path via normalize_path(). Infallible.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use TargetDir::try_new to enforce target syntax validation"
+    )]
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self(normalize_path(path.into()))
@@ -133,18 +144,21 @@ impl std::fmt::Display for TargetDir {
     }
 }
 
+#[allow(deprecated)]
 impl From<PathBuf> for TargetDir {
     fn from(p: PathBuf) -> Self {
         Self::new(p)
     }
 }
 
+#[allow(deprecated)]
 impl From<&Path> for TargetDir {
     fn from(p: &Path) -> Self {
         Self::new(p)
     }
 }
 
+#[allow(deprecated)]
 impl From<&str> for TargetDir {
     fn from(s: &str) -> Self {
         Self::new(s)
@@ -217,6 +231,7 @@ impl DestinationCollection {
     }
 
     /// Construct from legacy optional primary and additional destination paths.
+    #[allow(deprecated)]
     #[must_use]
     pub fn from_raw(primary: Option<PathBuf>, additional: Option<Vec<PathBuf>>) -> Self {
         let mut items = Vec::new();
@@ -290,5 +305,41 @@ impl<'a> IntoIterator for &'a DestinationCollection {
     type IntoIter = std::slice::Iter<'a, TargetDir>;
     fn into_iter(self) -> Self::IntoIter {
         self.destinations.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_target_dir_try_new_validation() {
+        // Valid Windows drive paths
+        assert!(TargetDir::try_new(r"C:\valid\source", TargetRole::Source).is_ok());
+        assert!(TargetDir::try_new(r"D:\valid\dest", TargetRole::Destination).is_ok());
+
+        // Valid UNC paths
+        assert!(TargetDir::try_new(r"\\server\share\data", TargetRole::Source).is_ok());
+        assert!(TargetDir::try_new(r"\\server\share\backup", TargetRole::Destination).is_ok());
+
+        // Relative path must fail validation
+        let err_rel = TargetDir::try_new("relative/path", TargetRole::Source).unwrap_err();
+        assert!(matches!(
+            err_rel,
+            crate::error::SyncError::Validation {
+                kind: crate::error::ValidationKind::Security,
+                ..
+            }
+        ));
+
+        // Invalid device syntax (\\.\ or \\?\) must fail validation
+        let err_dev = TargetDir::try_new(r"\\.\pipe\foo", TargetRole::Destination).unwrap_err();
+        assert!(matches!(
+            err_dev,
+            crate::error::SyncError::Validation {
+                kind: crate::error::ValidationKind::Security,
+                ..
+            }
+        ));
     }
 }

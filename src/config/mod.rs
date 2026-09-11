@@ -17,8 +17,7 @@ pub(crate) mod raw;
 use raw::RawConfig;
 
 pub mod target;
-pub(crate) use target::TargetRole;
-pub use target::{DestinationCollection, TargetDir, VerificationMode};
+pub use target::{DestinationCollection, TargetDir, TargetRole, VerificationMode};
 
 pub mod builder;
 pub use builder::{ConfigBuilder, TargetSyncConfigBuilder};
@@ -237,6 +236,7 @@ pub struct Config {
     retry_interval_seconds: u64,
 }
 
+#[allow(deprecated)]
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
         Self {
@@ -352,6 +352,10 @@ impl Config {
     }
 
     /// Extra destination directories getter.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use Config::destinations() or Config::resolved_dest_dirs() instead"
+    )]
     pub fn dest_dirs(&self) -> Option<Vec<PathBuf>> {
         if self.destinations.is_empty() {
             None
@@ -462,15 +466,7 @@ impl Config {
 
         for dest in self.destinations.iter() {
             dest.validate(TargetRole::Destination)?;
-            if is_same_or_descendant(self.source_dir.as_path(), dest.as_path())
-                || is_same_or_descendant(dest.as_path(), self.source_dir.as_path())
-            {
-                return Err(SyncError::validation_loop(format!(
-                    "Destination directory '{}' is identical to or nested within source directory '{}' (recursive sync loop)",
-                    dest.display(),
-                    self.source_dir.display()
-                )));
-            }
+            validation::validate_sync_boundaries(self.source_dir.as_path(), dest.as_path())?;
         }
 
         // Validate that no two destination directories overlap or nest within each other
