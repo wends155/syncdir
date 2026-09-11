@@ -7,7 +7,7 @@ use crate::config::{TargetSyncConfig, VerificationMode};
 use crate::db::FileRecord;
 use crate::error::SyncError;
 
-use super::types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
+use super::types::{FileSyncTask, RelativePath, safe_epoch_duration_millis, safe_modified_millis};
 
 /// RAII guard for temporary staging files during atomic small-file sync.
 /// Automatically removes the temporary file on drop unless disarmed.
@@ -187,12 +187,9 @@ impl SmallFileTransferEngine {
         fs::rename(&temp_path, task.dest_path)?;
         temp_guard.disarm();
 
-        let record = FileRecord::new(
-            task.rel_path.to_path_buf(),
-            total_bytes_copied,
-            task.src_mod,
-        )
-        .with_optional_id(task.cached_id);
+        let rel = RelativePath::new(task.rel_path)?;
+        let record =
+            FileRecord::new(rel, total_bytes_copied, task.src_mod).with_optional_id(task.cached_id);
         tracing::info!(
             path = %task.rel_path.display(),
             target = %task.dest_dir.display(),

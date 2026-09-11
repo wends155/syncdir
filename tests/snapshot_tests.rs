@@ -207,7 +207,9 @@ fn test_target_sync_config_debug_snapshot() {
 
 #[test]
 fn test_file_record_snapshot() {
-    let record = FileRecord::new(PathBuf::from("docs/readme.txt"), 8192, 1722470400).with_id(42);
+    let record = FileRecord::from_raw("docs/readme.txt", 8192, 1722470400)
+        .unwrap()
+        .with_id(42);
     assert_snapshot!(format!("{:#?}", record));
 }
 

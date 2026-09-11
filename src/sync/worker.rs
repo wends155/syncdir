@@ -774,7 +774,7 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
         match cmd {
             SyncCommand::FileModified(path) => {
                 self.state.reset_failure(&path);
-                if !self.queue.enqueue_sync(path, debounce_dur) {
+                if !self.queue.enqueue_sync(path.to_path_buf(), debounce_dur) {
                     tracing::error!(
                         target_index = target_index + 1,
                         "Debounce queue overflow on file modify; scheduling catchup scan"
@@ -785,7 +785,7 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
             }
             SyncCommand::FileDeleted(path) => {
                 self.state.reset_failure(&path);
-                if !self.queue.enqueue_delete(path, debounce_dur) {
+                if !self.queue.enqueue_delete(path.to_path_buf(), debounce_dur) {
                     tracing::error!(
                         target_index = target_index + 1,
                         "Debounce queue overflow on file delete; scheduling catchup scan"
@@ -1295,6 +1295,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, TargetSyncConfig};
     use crate::db::MockHashStore;
+    use crate::path_util::RelativePath;
     use crate::sync::engine::LocalSyncEngine;
     use crate::sync::mock::MockSyncEngine;
     use pretty_assertions::assert_eq;
@@ -1449,12 +1450,18 @@ mod tests {
         // Update source file and send rapid burst of interleaved modified/deleted events
         fs::write(source.join("storm.txt"), b"storm data").unwrap();
 
-        tx.send(SyncCommand::FileModified(PathBuf::from("storm.txt")))
-            .unwrap();
-        tx.send(SyncCommand::FileDeleted(PathBuf::from("storm.txt")))
-            .unwrap();
-        tx.send(SyncCommand::FileModified(PathBuf::from("storm.txt")))
-            .unwrap();
+        tx.send(SyncCommand::FileModified(
+            RelativePath::new("storm.txt").unwrap(),
+        ))
+        .unwrap();
+        tx.send(SyncCommand::FileDeleted(
+            RelativePath::new("storm.txt").unwrap(),
+        ))
+        .unwrap();
+        tx.send(SyncCommand::FileModified(
+            RelativePath::new("storm.txt").unwrap(),
+        ))
+        .unwrap();
 
         // Wait for debounce and sync to complete (debounce is 1s, allow up to 5s under load)
         let start = std::time::Instant::now();
@@ -1528,8 +1535,10 @@ mod tests {
         let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
         let _handle = start_sync_worker(context).unwrap();
 
-        tx.send(SyncCommand::FileDeleted(PathBuf::from("keep_me.txt")))
-            .unwrap();
+        tx.send(SyncCommand::FileDeleted(
+            RelativePath::new("keep_me.txt").unwrap(),
+        ))
+        .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(300));
 
@@ -1557,8 +1566,10 @@ mod tests {
         let _handle = start_sync_worker(context).unwrap();
 
         fs::write(source.join("file1.txt"), b"hello").unwrap();
-        tx.send(SyncCommand::FileModified(PathBuf::from("file1.txt")))
-            .unwrap();
+        tx.send(SyncCommand::FileModified(
+            RelativePath::new("file1.txt").unwrap(),
+        ))
+        .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!dest.exists());
@@ -1583,9 +1594,9 @@ mod tests {
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
         let handle = start_sync_worker(ctx).unwrap();
-        tx.send(SyncCommand::FileModified(PathBuf::from(
-            "unsafe/../file.txt",
-        )))
+        tx.send(SyncCommand::FileModified(
+            RelativePath::new("file.txt").unwrap(),
+        ))
         .unwrap();
         let start = Instant::now();
         while engine.failed_calls().is_empty()
@@ -1802,8 +1813,10 @@ mod tests {
         let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
         let handle = start_sync_worker(ctx).unwrap();
 
-        tx.send(SyncCommand::FileModified(PathBuf::from("data.txt")))
-            .unwrap();
+        tx.send(SyncCommand::FileModified(
+            RelativePath::new("data.txt").unwrap(),
+        ))
+        .unwrap();
 
         let start = Instant::now();
         while engine.synced_calls().is_empty()
@@ -1860,10 +1873,9 @@ mod tests {
 
         // Enqueue 10 distinct file paths to trigger queue overflow (capacity is 5)
         for i in 0..10 {
-            let _ = tx.send(SyncCommand::FileModified(PathBuf::from(format!(
-                "file_{}.txt",
-                i
-            ))));
+            let _ = tx.send(SyncCommand::FileModified(
+                RelativePath::new(format!("file_{}.txt", i)).unwrap(),
+            ));
         }
 
         // Wait for queue to drain and catchup scan to trigger
@@ -1910,10 +1922,14 @@ mod tests {
             .with_resolver(resolver);
         let handle = start_sync_worker(ctx).unwrap();
 
-        tx.send(SyncCommand::FileModified(PathBuf::from("doc.txt")))
-            .unwrap();
-        tx.send(SyncCommand::FileDeleted(PathBuf::from("old.txt")))
-            .unwrap();
+        tx.send(SyncCommand::FileModified(
+            RelativePath::new("doc.txt").unwrap(),
+        ))
+        .unwrap();
+        tx.send(SyncCommand::FileDeleted(
+            RelativePath::new("old.txt").unwrap(),
+        ))
+        .unwrap();
 
         let start = Instant::now();
         while (engine.synced_calls().is_empty() || engine.deleted_calls().is_empty())
@@ -1967,7 +1983,9 @@ mod tests {
         let mut runner = SyncWorkerRunner::new(ctx);
 
         let t0 = Instant::now();
-        runner.handle_command(SyncCommand::FileModified(PathBuf::from("test.txt")));
+        runner.handle_command(SyncCommand::FileModified(
+            RelativePath::new("test.txt").unwrap(),
+        ));
 
         // T0: Debounce has not elapsed (debounce_seconds = 2), so tick does not drain
         let outcome = runner.tick(t0).unwrap();
@@ -2009,7 +2027,9 @@ mod tests {
         // Configure mock engine to return a transient validation error
         engine.set_sync_error(|| SyncError::validation("temporary lock conflict"));
 
-        runner.handle_command(SyncCommand::FileModified(PathBuf::from("transient.txt")));
+        runner.handle_command(SyncCommand::FileModified(
+            RelativePath::new("transient.txt").unwrap(),
+        ));
         let t0 = Instant::now() + Duration::from_secs(2);
         let _ = runner.tick(t0).unwrap();
 
@@ -2021,7 +2041,9 @@ mod tests {
             SyncError::validation_security("Unsafe path traversal detected: ../secret")
         });
 
-        runner.handle_command(SyncCommand::FileModified(PathBuf::from("traversal.txt")));
+        runner.handle_command(SyncCommand::FileModified(
+            RelativePath::new("traversal.txt").unwrap(),
+        ));
         assert_eq!(runner.queue.pending_count(), 2);
 
         let t1 = t0 + Duration::from_secs(2);
@@ -2110,8 +2132,10 @@ mod tests {
         let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let ctx = SyncWorkerContext::new(0, target_cfg, engine, rx, None, source_online);
-        tx.send(SyncCommand::FileModified(PathBuf::from("first.txt")))
-            .unwrap();
+        tx.send(SyncCommand::FileModified(
+            RelativePath::new("first.txt").unwrap(),
+        ))
+        .unwrap();
         tx.send(SyncCommand::TriggerFullScan).unwrap();
 
         let handle = start_sync_worker(ctx).unwrap();

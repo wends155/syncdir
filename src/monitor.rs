@@ -5,6 +5,7 @@
 
 use crate::error::SyncError;
 pub use crate::error::WatcherError;
+use crate::path_util::RelativePath;
 use crate::sync::SyncCommand;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
@@ -105,22 +106,22 @@ impl DirectoryWatcher {
 
         if is_case_only_rename {
             if let Ok(to_rel) = to_res
-                && !to_rel.as_os_str().is_empty()
+                && let Ok(safe_to) = RelativePath::new(to_rel)
             {
-                return send(SyncCommand::FileModified(to_rel.to_path_buf()));
+                return send(SyncCommand::FileModified(safe_to));
             }
             return true;
         }
 
         if let Ok(from_rel) = from_res
-            && !from_rel.as_os_str().is_empty()
-            && !send(SyncCommand::FileDeleted(from_rel.to_path_buf()))
+            && let Ok(safe_from) = RelativePath::new(from_rel)
+            && !send(SyncCommand::FileDeleted(safe_from))
         {
             return false;
         }
         if let Ok(to_rel) = to_res
-            && !to_rel.as_os_str().is_empty()
-            && !send(SyncCommand::FileModified(to_rel.to_path_buf()))
+            && let Ok(safe_to) = RelativePath::new(to_rel)
+            && !send(SyncCommand::FileModified(safe_to))
         {
             return false;
         }
@@ -140,31 +141,51 @@ impl DirectoryWatcher {
                 true
             }
         };
+        let send_modified = |rel_path: &Path| -> bool {
+            match RelativePath::new(rel_path) {
+                Ok(safe_rel) => send(SyncCommand::FileModified(safe_rel)),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %rel_path.display(),
+                        error = %e,
+                        "Watcher observed unsafe or invalid relative path; skipping"
+                    );
+                    true
+                }
+            }
+        };
+        let send_deleted = |rel_path: &Path| -> bool {
+            match RelativePath::new(rel_path) {
+                Ok(safe_rel) => send(SyncCommand::FileDeleted(safe_rel)),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %rel_path.display(),
+                        error = %e,
+                        "Watcher observed unsafe or invalid relative path; skipping"
+                    );
+                    true
+                }
+            }
+        };
         match event.kind {
             EventKind::Create(_)
             | EventKind::Modify(notify::event::ModifyKind::Data(_))
             | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
             | EventKind::Modify(notify::event::ModifyKind::Any) => {
                 for path in event.paths {
-                    if let Ok(rel_path) = path.strip_prefix(source_root) {
-                        if rel_path.as_os_str().is_empty() {
-                            continue;
-                        }
-                        if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
-                            return;
-                        }
+                    if let Ok(rel_path) = path.strip_prefix(source_root)
+                        && !send_modified(rel_path)
+                    {
+                        return;
                     }
                 }
             }
             EventKind::Remove(_) => {
                 for path in event.paths {
-                    if let Ok(rel_path) = path.strip_prefix(source_root) {
-                        if rel_path.as_os_str().is_empty() {
-                            continue;
-                        }
-                        if !send(SyncCommand::FileDeleted(rel_path.to_path_buf())) {
-                            return;
-                        }
+                    if let Ok(rel_path) = path.strip_prefix(source_root)
+                        && !send_deleted(rel_path)
+                    {
+                        return;
                     }
                 }
             }
@@ -179,38 +200,29 @@ impl DirectoryWatcher {
                         );
                     } else {
                         for path in event.paths {
-                            if let Ok(rel_path) = path.strip_prefix(source_root) {
-                                if rel_path.as_os_str().is_empty() {
-                                    continue;
-                                }
-                                if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
-                                    return;
-                                }
+                            if let Ok(rel_path) = path.strip_prefix(source_root)
+                                && !send_modified(rel_path)
+                            {
+                                return;
                             }
                         }
                     }
                 }
                 notify::event::RenameMode::From => {
                     for path in event.paths {
-                        if let Ok(rel_path) = path.strip_prefix(source_root) {
-                            if rel_path.as_os_str().is_empty() {
-                                continue;
-                            }
-                            if !send(SyncCommand::FileDeleted(rel_path.to_path_buf())) {
-                                return;
-                            }
+                        if let Ok(rel_path) = path.strip_prefix(source_root)
+                            && !send_deleted(rel_path)
+                        {
+                            return;
                         }
                     }
                 }
                 notify::event::RenameMode::To => {
                     for path in event.paths {
-                        if let Ok(rel_path) = path.strip_prefix(source_root) {
-                            if rel_path.as_os_str().is_empty() {
-                                continue;
-                            }
-                            if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
-                                return;
-                            }
+                        if let Ok(rel_path) = path.strip_prefix(source_root)
+                            && !send_modified(rel_path)
+                        {
+                            return;
                         }
                     }
                 }
@@ -224,13 +236,10 @@ impl DirectoryWatcher {
                         );
                     } else {
                         for path in event.paths {
-                            if let Ok(rel_path) = path.strip_prefix(source_root) {
-                                if rel_path.as_os_str().is_empty() {
-                                    continue;
-                                }
-                                if !send(SyncCommand::FileModified(rel_path.to_path_buf())) {
-                                    return;
-                                }
+                            if let Ok(rel_path) = path.strip_prefix(source_root)
+                                && !send_modified(rel_path)
+                            {
+                                return;
                             }
                         }
                     }
@@ -344,7 +353,10 @@ mod tests {
         #[cfg(windows)]
         {
             let cmd = rx.try_recv().expect("Should have received a command");
-            assert_eq!(cmd, SyncCommand::FileModified(PathBuf::from("File.txt")));
+            assert_eq!(
+                cmd,
+                SyncCommand::FileModified(RelativePath::new("File.txt").unwrap())
+            );
             assert!(
                 rx.try_recv().is_err(),
                 "Should only dispatch one FileModified command"
@@ -353,9 +365,15 @@ mod tests {
         #[cfg(not(windows))]
         {
             let cmd1 = rx.try_recv().expect("Should have received first command");
-            assert_eq!(cmd1, SyncCommand::FileDeleted(PathBuf::from("file.txt")));
+            assert_eq!(
+                cmd1,
+                SyncCommand::FileDeleted(RelativePath::new("file.txt").unwrap())
+            );
             let cmd2 = rx.try_recv().expect("Should have received second command");
-            assert_eq!(cmd2, SyncCommand::FileModified(PathBuf::from("File.txt")));
+            assert_eq!(
+                cmd2,
+                SyncCommand::FileModified(RelativePath::new("File.txt").unwrap())
+            );
         }
     }
 

@@ -1,7 +1,7 @@
 use pretty_assertions::assert_eq;
-use std::path::PathBuf;
 use syncdir::config::{Config, TargetSyncConfig};
 use syncdir::db::{FileRecord, HashStore, SqliteHashStore, StoreConfig};
+use syncdir::path_util::RelativePath;
 use syncdir::sync::SyncCommand;
 use tempfile::{NamedTempFile, tempdir};
 
@@ -17,22 +17,23 @@ fn test_integration_config_db_sync_commands() {
 
     let config = Config::builder(source)
         .dest_dir(dest)
-        .debounce_seconds(5)
-        .propagate_deletions(false)
-        .block_sync_threshold_bytes(4096)
-        .block_size_bytes(1024)
+        .debounce_seconds(1)
+        .retry_interval_seconds(1)
         .build()
         .unwrap();
 
     assert!(config.validate().is_ok());
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let cmd = SyncCommand::FileModified(PathBuf::from("test.txt"));
+    let cmd = SyncCommand::FileModified(RelativePath::new("test.txt").unwrap());
     tx.send(cmd.clone()).unwrap();
 
     let received = rx.recv().unwrap();
     assert_eq!(received, cmd);
-    assert_eq!(cmd, SyncCommand::FileModified(PathBuf::from("test.txt")));
+    assert_eq!(
+        cmd,
+        SyncCommand::FileModified(RelativePath::new("test.txt").unwrap())
+    );
     assert_ne!(cmd, SyncCommand::TriggerFullScan);
 
     // Database round-trip
@@ -45,7 +46,7 @@ fn test_integration_config_db_sync_commands() {
         .unwrap(),
     )
     .unwrap();
-    let record = FileRecord::new(PathBuf::from("test_file.bin"), 4096, 99999);
+    let record = FileRecord::from_raw("test_file.bin", 4096, 99999).unwrap();
     let hashes = vec![[9u8; 32]; 4];
 
     store.save_file(&record, &hashes).unwrap();
@@ -237,12 +238,16 @@ fn test_watcher_rename_event() {
     }
 
     assert!(
-        received.contains(&SyncCommand::FileDeleted(PathBuf::from("old.txt"))),
+        received.contains(&SyncCommand::FileDeleted(
+            RelativePath::new("old.txt").unwrap()
+        )),
         "Should receive deletion command for renamed-from file, got: {:?}",
         received
     );
     assert!(
-        received.contains(&SyncCommand::FileModified(PathBuf::from("new.txt"))),
+        received.contains(&SyncCommand::FileModified(
+            RelativePath::new("new.txt").unwrap()
+        )),
         "Should receive modification command for renamed-to file, got: {:?}",
         received
     );
@@ -464,8 +469,10 @@ fn test_worker_reachability_and_offline_drain_guard() {
     let handle = start_sync_worker(context).unwrap();
 
     // Send a sync command while offline
-    tx.send(SyncCommand::FileModified(PathBuf::from("offline_test.txt")))
-        .unwrap();
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("offline_test.txt").unwrap(),
+    ))
+    .unwrap();
 
     // Sleep briefly to allow worker loop tick
     std::thread::sleep(Duration::from_millis(200));

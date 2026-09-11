@@ -4,30 +4,55 @@
 //! Enforces foreign key cascades and validates configuration consistency.
 
 use crate::error::SyncError;
+use crate::path_util::RelativePath;
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Metadata record for a tracked file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileRecord {
     id: Option<i64>,
-    relative_path: PathBuf,
+    relative_path: RelativePath,
     /// File size in bytes.
     file_size: u64,
     last_modified: i64,
 }
 
+impl std::fmt::Debug for FileRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileRecord")
+            .field("id", &self.id)
+            .field("relative_path", &self.relative_path.as_path())
+            .field("file_size", &self.file_size)
+            .field("last_modified", &self.last_modified)
+            .finish()
+    }
+}
+
 impl FileRecord {
     /// Create a new file record without a database surrogate ID.
-    pub fn new(relative_path: impl Into<PathBuf>, file_size: u64, last_modified: i64) -> Self {
+    pub fn new(relative_path: RelativePath, file_size: u64, last_modified: i64) -> Self {
         Self {
             id: None,
-            relative_path: relative_path.into(),
+            relative_path,
             file_size,
             last_modified,
         }
+    }
+
+    /// Construct a `FileRecord` validating raw path into a `RelativePath`.
+    ///
+    /// # Errors
+    /// Returns `SyncError::Validation` if `path` is not a valid relative path.
+    pub fn from_raw(
+        path: impl AsRef<Path>,
+        file_size: u64,
+        last_modified: i64,
+    ) -> Result<Self, SyncError> {
+        let rel = RelativePath::new(path)?;
+        Ok(Self::new(rel, file_size, last_modified))
     }
 
     /// Attach a surrogate database ID to the record.
@@ -58,7 +83,7 @@ impl FileRecord {
 
     /// Returns the relative path of the file.
     #[must_use]
-    pub fn relative_path(&self) -> &Path {
+    pub fn relative_path(&self) -> &RelativePath {
         &self.relative_path
     }
 
@@ -81,8 +106,9 @@ pub(crate) fn path_to_sqlite_key(path: &Path) -> Result<String, SyncError> {
     if s.is_empty() {
         return Err(SyncError::validation("Path cannot be empty"));
     }
+    let normalized = crate::path_util::normalize_superscripts_cow(&s);
     // Normalize any backslashes to forward slashes for cross-platform SQLite storage
-    let mut key = s.replace('\\', "/");
+    let mut key = normalized.replace('\\', "/");
     let trim_count = key.chars().take_while(|&c| c == '/').count();
     if trim_count == key.len() {
         return Err(SyncError::validation(
@@ -393,7 +419,7 @@ impl HashStore for SqliteHashStore {
             let size_i64: i64 = row.get(2)?;
             Ok(Some(FileRecord {
                 id: Some(row.get(0)?),
-                relative_path: PathBuf::from(path_str),
+                relative_path: RelativePath::from_sanitized_unchecked(PathBuf::from(path_str)),
                 file_size: size_i64.max(0) as u64,
                 last_modified: row.get(3)?,
             }))
@@ -403,7 +429,7 @@ impl HashStore for SqliteHashStore {
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
-        let key = path_to_sqlite_key(&record.relative_path)?;
+        let key = record.relative_path.to_sqlite_key();
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
@@ -445,7 +471,7 @@ impl HashStore for SqliteHashStore {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         for (record, hashes) in records {
-            let key = path_to_sqlite_key(&record.relative_path)?;
+            let key = record.relative_path.to_sqlite_key();
             let file_id: i64 = tx.query_row(
                 "INSERT INTO file_metadata (relative_path, file_size, last_modified) \
                  VALUES (?1, ?2, ?3) \
@@ -572,11 +598,12 @@ impl HashStore for SqliteHashStore {
             let file_size: i64 = row.get(2)?;
             let last_modified: i64 = row.get(3)?;
             let rel_path = PathBuf::from(rel_str);
+            let rel = RelativePath::from_sanitized_unchecked(rel_path.clone());
             map.insert(
-                rel_path.clone(),
+                rel_path,
                 FileRecord {
                     id: Some(id),
-                    relative_path: rel_path,
+                    relative_path: rel,
                     file_size: file_size.max(0) as u64,
                     last_modified,
                 },
@@ -664,7 +691,7 @@ impl HashStore for MockHashStore {
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
-        let key = path_to_sqlite_key(&record.relative_path)?.to_lowercase();
+        let key = record.relative_path.to_sqlite_key().to_lowercase();
         let mut inner = self
             .inner
             .write()
@@ -766,7 +793,7 @@ impl HashStore for MockHashStore {
         let map = inner
             .records
             .values()
-            .map(|r| (r.relative_path.clone(), r.clone()))
+            .map(|r| (r.relative_path.to_path_buf(), r.clone()))
             .collect();
         Ok(map)
     }
@@ -786,7 +813,7 @@ impl HashStore for MockHashStore {
         inner.batch_save_calls += 1;
 
         for (record, hashes) in records {
-            let key = path_to_sqlite_key(&record.relative_path)?.to_lowercase();
+            let key = record.relative_path.to_sqlite_key().to_lowercase();
             let id = if let Some(existing) = inner.records.get(&key) {
                 existing.id.unwrap_or(1)
             } else {
@@ -850,14 +877,35 @@ mod tests {
     #[test]
     fn test_file_record_encapsulation_and_getters() {
         use crate::db::FileRecord;
-        let rec = FileRecord::new("sub/doc.txt", 4096u64, 1690000000i64).with_id(99);
-        assert_eq!(rec.relative_path(), std::path::Path::new("sub/doc.txt"));
+        let rec = FileRecord::from_raw("sub/doc.txt", 4096u64, 1690000000i64)
+            .unwrap()
+            .with_id(99);
+        assert_eq!(rec.relative_path(), Path::new("sub/doc.txt"));
         assert_eq!(rec.file_size(), 4096u64);
         assert_eq!(rec.last_modified(), 1690000000i64);
         assert_eq!(rec.id(), Some(99));
 
-        let rec2 = FileRecord::new("test.bin", 0u64, 100i64).with_optional_id(None);
+        let rec2 = FileRecord::from_raw("test.bin", 0u64, 100i64)
+            .unwrap()
+            .with_optional_id(None);
         assert_eq!(rec2.id(), None);
+    }
+
+    #[test]
+    fn test_file_record_relative_path_encapsulation() {
+        use crate::path_util::RelativePath;
+        let rel = RelativePath::new("nested/doc.txt").unwrap();
+        let rec = FileRecord::new(rel.clone(), 1024, 1700000000);
+        assert_eq!(rec.relative_path(), &rel);
+        assert_eq!(rec.relative_path().as_path(), Path::new("nested/doc.txt"));
+
+        // Test from_raw constructor
+        let rec_raw = FileRecord::from_raw("raw/path.bin", 2048, 1700000001).unwrap();
+        assert_eq!(rec_raw.relative_path().as_path(), Path::new("raw/path.bin"));
+
+        // Test from_raw rejects invalid relative path
+        let err_raw = FileRecord::from_raw("../escape.txt", 100, 100);
+        assert!(err_raw.is_err());
     }
 
     #[test]
@@ -865,21 +913,16 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
         let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
 
-        let record = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("docs/spec.txt"),
-            file_size: 2048,
-            last_modified: 1234567890,
-        };
+        let record = FileRecord::from_raw("docs/spec.txt", 2048, 1234567890).unwrap();
         let hashes = vec![[1u8; 32], [2u8; 32]];
 
         store.save_file(&record, &hashes).unwrap();
 
         let fetched = store.get_file(Path::new("docs/spec.txt")).unwrap().unwrap();
-        let file_id = fetched.id.unwrap();
-        assert_eq!(fetched.relative_path, PathBuf::from("docs/spec.txt"));
-        assert_eq!(fetched.file_size, 2048);
-        assert_eq!(fetched.last_modified, 1234567890);
+        let file_id = fetched.id().unwrap();
+        assert_eq!(fetched.relative_path(), Path::new("docs/spec.txt"));
+        assert_eq!(fetched.file_size(), 2048);
+        assert_eq!(fetched.last_modified(), 1234567890);
 
         let fetched_hashes = store.get_block_hashes(Path::new("docs/spec.txt")).unwrap();
         assert_eq!(fetched_hashes.len(), 2);
@@ -913,31 +956,21 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
         let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
 
-        let record = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("test.bin"),
-            file_size: 100,
-            last_modified: 1000,
-        };
+        let record = FileRecord::from_raw("test.bin", 100, 1000).unwrap();
         store.save_file(&record, &[[1u8; 32]]).unwrap();
         let id1 = store
             .get_file(Path::new("test.bin"))
             .unwrap()
             .unwrap()
-            .id
+            .id()
             .unwrap();
 
         // Update same file — rowid should be preserved
-        let updated = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("test.bin"),
-            file_size: 200,
-            last_modified: 2000,
-        };
+        let updated = FileRecord::from_raw("test.bin", 200, 2000).unwrap();
         store.save_file(&updated, &[[2u8; 32], [3u8; 32]]).unwrap();
         let fetched = store.get_file(Path::new("test.bin")).unwrap().unwrap();
-        assert_eq!(fetched.id.unwrap(), id1); // Same rowid
-        assert_eq!(fetched.file_size, 200);
+        assert_eq!(fetched.id().unwrap(), id1); // Same rowid
+        assert_eq!(fetched.file_size(), 200);
 
         let hashes = store.get_block_hashes(Path::new("test.bin")).unwrap();
         assert_eq!(hashes.len(), 2);
@@ -950,12 +983,7 @@ mod tests {
         // Open with config A and save a file
         {
             let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
-            let record = FileRecord {
-                id: None,
-                relative_path: PathBuf::from("test.bin"),
-                file_size: 100,
-                last_modified: 9999,
-            };
+            let record = FileRecord::from_raw("test.bin", 100, 9999).unwrap();
             store.save_file(&record, &[[7u8; 32]]).unwrap();
             assert!(store.get_file(Path::new("test.bin")).unwrap().is_some());
         }
@@ -976,18 +1004,8 @@ mod tests {
         assert!(store.list_files().unwrap().is_empty());
 
         // Insert two files
-        let r1 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("b_second.txt"),
-            file_size: 100,
-            last_modified: 1000,
-        };
-        let r2 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("a_first.txt"),
-            file_size: 200,
-            last_modified: 2000,
-        };
+        let r1 = FileRecord::from_raw("b_second.txt", 100, 1000).unwrap();
+        let r2 = FileRecord::from_raw("a_first.txt", 200, 2000).unwrap();
         store.save_file(&r1, &[[1u8; 32]]).unwrap();
         store.save_file(&r2, &[[2u8; 32]]).unwrap();
 
@@ -1009,12 +1027,7 @@ mod tests {
 
         assert!(store.list_files().unwrap().is_empty());
 
-        let record = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("docs/readme.txt"),
-            file_size: 1024,
-            last_modified: 999,
-        };
+        let record = FileRecord::from_raw("docs/readme.txt", 1024, 999).unwrap();
         let hashes = vec![[0xAAu8; 32]];
         store.save_file(&record, &hashes).unwrap();
 
@@ -1022,7 +1035,7 @@ mod tests {
             .get_file(Path::new("docs/readme.txt"))
             .unwrap()
             .unwrap();
-        assert_eq!(fetched.file_size, 1024);
+        assert_eq!(fetched.file_size(), 1024);
 
         let block_hashes = store
             .get_block_hashes(Path::new("docs/readme.txt"))
@@ -1085,12 +1098,7 @@ mod tests {
     fn test_get_block_hashes_by_path_known_and_unknown() {
         let temp = NamedTempFile::new().unwrap();
         let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
-        let rec = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("data/sample.bin"),
-            file_size: 2048,
-            last_modified: 5000,
-        };
+        let rec = FileRecord::from_raw("data/sample.bin", 2048, 5000).unwrap();
         let hashes = vec![[0xAAu8; 32], [0xBBu8; 32]];
         store.save_file(&rec, &hashes).unwrap();
         let fetched = store
@@ -1108,18 +1116,8 @@ mod tests {
     fn test_mock_hash_store_list_all_records() {
         let store = MockHashStore::new();
         assert!(store.list_all_records().unwrap().is_empty());
-        let r1 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("b.txt"),
-            file_size: 200,
-            last_modified: 2000,
-        };
-        let r2 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("a.txt"),
-            file_size: 100,
-            last_modified: 1000,
-        };
+        let r1 = FileRecord::from_raw("b.txt", 200, 2000).unwrap();
+        let r2 = FileRecord::from_raw("a.txt", 100, 1000).unwrap();
         store.save_file(&r1, &[]).unwrap();
         store.save_file(&r2, &[]).unwrap();
         let records = store.list_all_records().unwrap();
@@ -1130,37 +1128,23 @@ mod tests {
     fn test_save_file_upsert_single_block_update() {
         let temp = NamedTempFile::new().unwrap();
         let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
-        let rec = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("delta.bin"),
-            file_size: 3072,
-            last_modified: 1000,
-        };
+        let rec = FileRecord::from_raw("delta.bin", 3072, 1000).unwrap();
         let initial = vec![[0x11u8; 32], [0x22u8; 32], [0x33u8; 32]];
         store.save_file(&rec, &initial).unwrap();
         let initial_id = store
             .get_file(Path::new("delta.bin"))
             .unwrap()
             .unwrap()
-            .id
+            .id()
             .unwrap();
         let updated = vec![[0x11u8; 32], [0xFAu8; 32], [0x33u8; 32]];
-        store
-            .save_file(
-                &FileRecord {
-                    id: None,
-                    relative_path: PathBuf::from("delta.bin"),
-                    file_size: 3072,
-                    last_modified: 2000,
-                },
-                &updated,
-            )
-            .unwrap();
+        let updated_rec = FileRecord::from_raw("delta.bin", 3072, 2000).unwrap();
+        store.save_file(&updated_rec, &updated).unwrap();
         let after_id = store
             .get_file(Path::new("delta.bin"))
             .unwrap()
             .unwrap()
-            .id
+            .id()
             .unwrap();
         assert_eq!(initial_id, after_id, "UPSERT must preserve stable row ID");
         let hashes = store.get_block_hashes(Path::new("delta.bin")).unwrap();
@@ -1172,24 +1156,9 @@ mod tests {
     fn test_delete_directory_cascades_child_records() {
         let temp = NamedTempFile::new().unwrap();
         let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
-        let r1 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("dir/sub/file1.txt"),
-            file_size: 100,
-            last_modified: 1000,
-        };
-        let r2 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("dir/file2.txt"),
-            file_size: 200,
-            last_modified: 2000,
-        };
-        let r3 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("other/file3.txt"),
-            file_size: 300,
-            last_modified: 3000,
-        };
+        let r1 = FileRecord::from_raw("dir/sub/file1.txt", 100, 1000).unwrap();
+        let r2 = FileRecord::from_raw("dir/file2.txt", 200, 2000).unwrap();
+        let r3 = FileRecord::from_raw("other/file3.txt", 300, 3000).unwrap();
         store.save_file(&r1, &[[1u8; 32]]).unwrap();
         store.save_file(&r2, &[[2u8; 32]]).unwrap();
         store.save_file(&r3, &[[3u8; 32]]).unwrap();
@@ -1219,30 +1188,10 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
         let store = SqliteHashStore::new(temp.path(), dummy_store_config(1024)).unwrap();
 
-        let r1 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("test_1/file.txt"),
-            file_size: 100,
-            last_modified: 1000,
-        };
-        let r2 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("test-1/file.txt"),
-            file_size: 200,
-            last_modified: 2000,
-        };
-        let r3 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("test%1/file.txt"),
-            file_size: 300,
-            last_modified: 3000,
-        };
-        let r4 = FileRecord {
-            id: None,
-            relative_path: PathBuf::from("test_1_extra/file.txt"),
-            file_size: 400,
-            last_modified: 4000,
-        };
+        let r1 = FileRecord::from_raw("test_1/file.txt", 100, 1000).unwrap();
+        let r2 = FileRecord::from_raw("test-1/file.txt", 200, 2000).unwrap();
+        let r3 = FileRecord::from_raw("test%1/file.txt", 300, 3000).unwrap();
+        let r4 = FileRecord::from_raw("test_1_extra/file.txt", 400, 4000).unwrap();
 
         store.save_file(&r1, &[[1u8; 32]]).unwrap();
         store.save_file(&r2, &[[2u8; 32]]).unwrap();
@@ -1291,9 +1240,9 @@ mod tests {
         )
         .unwrap();
         // Insert a file and its "child" directory file
-        let parent = FileRecord::new(PathBuf::from("docs"), 100, 1000);
-        let child = FileRecord::new(PathBuf::from("docs/readme.md"), 200, 2000);
-        let other = FileRecord::new(PathBuf::from("src/main.rs"), 50, 500);
+        let parent = FileRecord::from_raw("docs", 100, 1000).unwrap();
+        let child = FileRecord::from_raw("docs/readme.md", 200, 2000).unwrap();
+        let other = FileRecord::from_raw("src/main.rs", 50, 500).unwrap();
         store.save_file(&parent, &[]).unwrap();
         store.save_file(&child, &[]).unwrap();
         store.save_file(&other, &[]).unwrap();
@@ -1316,11 +1265,12 @@ mod tests {
         let records: Vec<(FileRecord, Vec<BlockHash>)> = (0..100)
             .map(|i| {
                 (
-                    FileRecord::new(
+                    FileRecord::from_raw(
                         format!("file_{}.txt", i),
                         (i as u64) * 100,
                         (i as i64) * 1000,
-                    ),
+                    )
+                    .unwrap(),
                     vec![],
                 )
             })
@@ -1358,11 +1308,12 @@ mod tests {
         )
         .unwrap();
         for i in 0..10 {
-            let record = FileRecord::new(
+            let record = FileRecord::from_raw(
                 format!("file_{}.txt", i),
                 (i as u64) * 100,
                 (i as i64) * 1000,
-            );
+            )
+            .unwrap();
             store.save_file(&record, &[]).unwrap();
         }
         assert_eq!(store.list_files().unwrap().len(), 10);
@@ -1388,7 +1339,7 @@ mod tests {
             StoreConfig::new(1_048_576, 10_485_760).unwrap(),
         )
         .unwrap();
-        let record = FileRecord::new("MyFile.TXT", 500, 1000);
+        let record = FileRecord::from_raw("MyFile.TXT", 500, 1000).unwrap();
         store.save_file(&record, &[]).unwrap();
 
         // Lookup with different case should find it
@@ -1404,7 +1355,7 @@ mod tests {
     #[test]
     fn test_mock_hash_store_case_folding_and_counters() {
         let store = MockHashStore::new();
-        let record = FileRecord::new(PathBuf::from("TestFolder/File.TXT"), 100, 123456);
+        let record = FileRecord::from_raw("TestFolder/File.TXT", 100, 123456).unwrap();
         store.save_file(&record, &[]).unwrap();
         assert_eq!(store.save_file_count(), 1);
         assert_eq!(store.batch_save_count(), 0);
@@ -1412,7 +1363,7 @@ mod tests {
         // Case-insensitive lookup (COLLATE NOCASE parity)
         let fetched = store.get_file(Path::new("testfolder/file.txt")).unwrap();
         assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().file_size, 100);
+        assert_eq!(fetched.unwrap().file_size(), 100);
 
         // Failure hook injection on list_all_records
         store.set_error_hook(Some(Box::new(|op| {

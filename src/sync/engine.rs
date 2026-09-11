@@ -14,15 +14,17 @@ use super::path_safety::{is_reparse_or_symlink_meta, is_safe_relative_path};
 use super::scanner::scan_dir;
 
 #[allow(unused_imports)]
-pub use super::types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
+pub use super::types::{
+    FileSyncTask, RelativePath, safe_epoch_duration_millis, safe_modified_millis,
+};
 
 /// Commands sent from the file watcher or tray UI to the sync worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncCommand {
     /// A file was created or modified at the given relative path.
-    FileModified(PathBuf),
+    FileModified(RelativePath),
     /// A file was deleted at the given relative path.
-    FileDeleted(PathBuf),
+    FileDeleted(RelativePath),
     /// Request a full directory scan and sync.
     TriggerFullScan,
 }
@@ -1105,7 +1107,9 @@ mod tests {
 
     #[test]
     fn test_is_metadata_up_to_date_raw() {
-        let record = crate::db::FileRecord::new(PathBuf::from("file.txt"), 100, 10_000).with_id(1);
+        let record = crate::db::FileRecord::from_raw("file.txt", 100, 10_000)
+            .unwrap()
+            .with_id(1);
         let snap = |size, millis| FileMetadataSnapshot::new(size, millis);
 
         // Exact match
@@ -1353,7 +1357,9 @@ mod tests {
         let src_size = meta.len() as i64;
         let src_mod = safe_modified_millis(&meta).unwrap();
 
-        let record = FileRecord::new(file_rel.to_path_buf(), src_size as u64, src_mod).with_id(42);
+        let record = FileRecord::from_raw(file_rel, src_size as u64, src_mod)
+            .unwrap()
+            .with_id(42);
 
         let config = Config::test_default(src, dst.clone());
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
@@ -1389,7 +1395,9 @@ mod tests {
         let src_size = meta.len() as i64;
         let src_mod = safe_modified_millis(&meta).unwrap();
 
-        let record = FileRecord::new(file_rel.to_path_buf(), src_size as u64, src_mod).with_id(99);
+        let record = FileRecord::from_raw(file_rel, src_size as u64, src_mod)
+            .unwrap()
+            .with_id(99);
         let config = Config::test_default(src, dst.clone());
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
@@ -1497,7 +1505,8 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
 
         // 1. Verify From<&FileRecord> for FileMetadataSnapshot
-        let rec = crate::db::FileRecord::new(PathBuf::from("rec.txt"), 1024, 1_700_000_000_000)
+        let rec = crate::db::FileRecord::from_raw("rec.txt", 1024, 1_700_000_000_000)
+            .unwrap()
             .with_id(42);
         let snap = FileMetadataSnapshot::from(&rec);
         assert_eq!(snap.size, 1024);
@@ -1969,7 +1978,7 @@ mod tests {
         // Case 1: Destination file exists but has an exclusive lock
         let locked_file = dst.join("locked.txt");
         std::fs::write(&locked_file, "secret").unwrap();
-        let rec1 = FileRecord::new(PathBuf::from("locked.txt"), 6, 100);
+        let rec1 = FileRecord::from_raw("locked.txt", 6, 100).unwrap();
         store.save_file(&rec1, &[]).unwrap();
 
         #[cfg(windows)]
@@ -1993,7 +2002,7 @@ mod tests {
         }
 
         // Case 2: Destination file is genuinely absent (NotFound)
-        let rec2 = FileRecord::new(PathBuf::from("absent.txt"), 10, 200);
+        let rec2 = FileRecord::from_raw("absent.txt", 10, 200).unwrap();
         store.save_file(&rec2, &[]).unwrap();
         assert!(store.get_file(Path::new("absent.txt")).unwrap().is_some());
 
@@ -2018,7 +2027,7 @@ mod tests {
         let target_cfg_no_prop =
             TargetSyncConfig::from_config(&config_no_prop, dst.clone()).unwrap();
         let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
-        let rec3 = FileRecord::new(PathBuf::from("unprop.txt"), 4, 300);
+        let rec3 = FileRecord::from_raw("unprop.txt", 4, 300).unwrap();
         store.save_file(&rec3, &[]).unwrap();
         assert!(store.get_file(Path::new("unprop.txt")).unwrap().is_some());
 
@@ -2231,7 +2240,9 @@ mod tests {
         std::fs::write(dst.join("README.TXT"), b"hello").unwrap();
 
         let db = MockHashStore::new();
-        let old_record = FileRecord::new(PathBuf::from("README.TXT"), 5, 1000).with_id(1);
+        let old_record = FileRecord::from_raw("README.TXT", 5, 1000)
+            .unwrap()
+            .with_id(1);
         db.save_file(&old_record, &[]).unwrap();
 
         let config = Config::builder(src.clone())
@@ -2260,11 +2271,12 @@ mod tests {
 
         let config = Config::test_default(src.clone(), dst.clone());
         let store = MockHashStore::new();
-        let rec = FileRecord::new(
-            PathBuf::from("nested/file.txt"),
+        let rec = FileRecord::from_raw(
+            "nested/file.txt",
             7,
             safe_modified_millis(&fs::metadata(&test_file).unwrap()).unwrap(),
         )
+        .unwrap()
         .with_id(1);
         store.save_file(&rec, &[]).unwrap();
 
@@ -2414,5 +2426,28 @@ mod tests {
         engine.flush_staged_syncs().unwrap();
         assert_eq!(store.batch_save_count(), 0);
         assert_eq!(store.save_file_count(), 2);
+    }
+
+    #[test]
+    fn test_sync_command_strongly_typed_relative_path() {
+        let rel = crate::path_util::RelativePath::new("valid/path.txt").unwrap();
+        let cmd_mod = SyncCommand::FileModified(rel.clone());
+        let cmd_del = SyncCommand::FileDeleted(rel.clone());
+
+        match &cmd_mod {
+            SyncCommand::FileModified(p) => {
+                let _: &crate::path_util::RelativePath = p;
+                assert_eq!(p.as_path(), Path::new("valid/path.txt"));
+            }
+            _ => panic!("Expected FileModified"),
+        }
+
+        match &cmd_del {
+            SyncCommand::FileDeleted(p) => {
+                let _: &crate::path_util::RelativePath = p;
+                assert_eq!(p.as_path(), Path::new("valid/path.txt"));
+            }
+            _ => panic!("Expected FileDeleted"),
+        }
     }
 }

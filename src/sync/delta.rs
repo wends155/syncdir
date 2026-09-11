@@ -8,7 +8,7 @@ use crate::db::{FileRecord, HashStore};
 use crate::error::SyncError;
 
 use super::engine::DirtyRangeLease;
-use super::types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
+use super::types::{FileSyncTask, RelativePath, safe_epoch_duration_millis, safe_modified_millis};
 
 /// Contiguous range of dirty blocks to coalesce delta writes and reduce seek overhead.
 #[derive(Debug)]
@@ -444,9 +444,9 @@ impl<S: HashStore> DeltaTransferEngine<S> {
                 );
             }
 
-            let record =
-                FileRecord::new(task.rel_path.to_path_buf(), total_bytes_read, task.src_mod)
-                    .with_optional_id(task.cached_id);
+            let rel = RelativePath::new(task.rel_path)?;
+            let record = FileRecord::new(rel, total_bytes_read, task.src_mod)
+                .with_optional_id(task.cached_id);
             tracing::info!(
                 path = %task.rel_path.display(),
                 target = %task.dest_dir.display(),
@@ -479,7 +479,7 @@ mod tests {
     use crate::config::{Config, TargetSyncConfig};
     use crate::db::{MockHashStore, SqliteHashStore};
     use crate::sync::LocalSyncEngine;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn test_config(source: std::path::PathBuf, dest: std::path::PathBuf) -> Config {
@@ -732,7 +732,7 @@ mod tests {
         let store = MockHashStore::new();
         let h0 = *blake3::hash(&[0xEE; 512]).as_bytes();
         let h1 = *blake3::hash(&[0xEE; 512]).as_bytes();
-        let rec = FileRecord::new(PathBuf::from("large.bin"), 1024, 100);
+        let rec = FileRecord::from_raw("large.bin", 1024, 100).unwrap();
         store.save_file(&rec, &[h0, h1]).unwrap();
 
         let dst_file_clone = dst_file.clone();
