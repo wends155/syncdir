@@ -41,6 +41,14 @@ impl Drop for TempFileGuard {
 /// Global atomic counter for unique temporary staging file generation across threads.
 static TEMP_FILE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[inline]
+pub(crate) fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
+}
+
 /// Dedicated collaborating engine for atomic small-file streaming and verification.
 #[derive(Debug, Clone)]
 pub(crate) struct SmallFileTransferEngine {
@@ -52,6 +60,27 @@ impl SmallFileTransferEngine {
         Self { config }
     }
 
+    fn copy_stream_and_hash(
+        src_file: &mut File,
+        temp_file: &mut File,
+        buf: &mut [u8],
+    ) -> Result<(u64, blake3::Hash), SyncError> {
+        let mut hasher = blake3::Hasher::new();
+        let mut total_bytes_copied: u64 = 0;
+        loop {
+            let n = match src_file.read(buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SyncError::Io(e)),
+            };
+            hasher.update(&buf[..n]);
+            temp_file.write_all(&buf[..n])?;
+            total_bytes_copied += n as u64;
+        }
+        Ok((total_bytes_copied, hasher.finalize()))
+    }
+
     pub(crate) fn sync_small_file_core(
         &self,
         task: &FileSyncTask<'_>,
@@ -61,25 +90,13 @@ impl SmallFileTransferEngine {
             fs::create_dir_all(parent)?;
         }
 
-        let mut nonce_hasher = blake3::Hasher::new();
-        nonce_hasher.update(&std::process::id().to_le_bytes());
-        nonce_hasher.update(
-            &SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_le_bytes(),
-        );
-        nonce_hasher.update(
-            &TEMP_FILE_NONCE
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                .to_le_bytes(),
-        );
-        let random_nonce = u64::from_le_bytes(
-            nonce_hasher.finalize().as_bytes()[..8]
-                .try_into()
-                .unwrap_or_default(),
-        );
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let counter = TEMP_FILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seed = (std::process::id() as u64) ^ nanos ^ counter;
+        let random_nonce = splitmix64(seed);
 
         let file_stem = task
             .dest_path
@@ -100,26 +117,12 @@ impl SmallFileTransferEngine {
             .create_new(true)
             .open(&temp_path)?;
 
-        let mut hasher = blake3::Hasher::new();
-        let mut total_bytes_copied: u64 = 0;
-        let mut stack_chunk = [0u8; 64 * 1024];
-        let buf: &mut [u8] = if scratch.len() >= 64 * 1024 {
-            &mut scratch[..64 * 1024]
+        let (total_bytes_copied, hash) = if scratch.len() >= 64 * 1024 {
+            Self::copy_stream_and_hash(&mut src_file, &mut temp_file, &mut scratch[..64 * 1024])?
         } else {
-            &mut stack_chunk[..]
+            let mut stack_chunk = [0u8; 64 * 1024];
+            Self::copy_stream_and_hash(&mut src_file, &mut temp_file, &mut stack_chunk)?
         };
-
-        loop {
-            let n = match src_file.read(buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(SyncError::Io(e)),
-            };
-            hasher.update(&buf[..n]);
-            temp_file.write_all(&buf[..n])?;
-            total_bytes_copied += n as u64;
-        }
 
         // Post-stream metadata re-verification (TOCTOU protection)
         let post_meta = src_file.metadata()?;
@@ -164,7 +167,7 @@ impl SmallFileTransferEngine {
                         Err(e) => return Err(SyncError::Io(e)),
                     };
                 }
-                if written_hasher.finalize() != hasher.finalize() {
+                if written_hasher.finalize() != hash {
                     return Err(SyncError::write_verification_failed(
                         task.dest_path.to_path_buf(),
                     ));
@@ -430,5 +433,64 @@ mod tests {
         assert_eq!(record.file_size(), content.len() as u64);
         assert!(hashes.is_empty());
         assert_eq!(fs::read(&dst_file).unwrap(), content);
+    }
+
+    #[test]
+    fn test_sync_small_file_staging_nonce_and_buffer_fallback() {
+        use std::fs;
+        use std::path::Path;
+        use tempfile::tempdir;
+        use crate::config::{TargetSyncConfig, VerificationMode};
+        use crate::sync::small_file::SmallFileTransferEngine;
+        use crate::sync::types::{FileSyncTask, safe_modified_millis};
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("source");
+        let dst = temp.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        let file_name = "payload.dat";
+        let src_file = src.join(file_name);
+        let test_data = vec![0x42u8; 128 * 1024];
+        fs::write(&src_file, &test_data).unwrap();
+
+        let meta = fs::metadata(&src_file).unwrap();
+        let src_mod = safe_modified_millis(&meta).unwrap();
+
+        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+            .verification_mode(VerificationMode::Full)
+            .build()
+            .unwrap();
+        let engine = SmallFileTransferEngine::new(target_cfg);
+
+        let dest_file = dst.join(file_name);
+        let task = FileSyncTask {
+            rel_path: Path::new(file_name),
+            src_path: &src_file,
+            dest_path: &dest_file,
+            dest_dir: &dst,
+            src_size: test_data.len() as u64,
+            src_mod,
+            cached_id: None,
+        };
+
+        let mut tiny_scratch = vec![0u8; 16];
+        let (rec, hashes) = engine
+            .sync_small_file_core(&task, &mut tiny_scratch)
+            .expect("Small file transfer must fall back to stack buffer when scratch buffer is undersized");
+
+        assert_eq!(rec.file_size(), test_data.len() as u64);
+        assert!(hashes.is_empty());
+
+        assert!(dest_file.exists());
+        assert_eq!(fs::read(&dest_file).unwrap(), test_data);
+
+        let lingering_tmp: Vec<_> = fs::read_dir(&dst)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|de| de.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.ends_with(".syncdir_tmp"))
+            .collect();
+        assert!(lingering_tmp.is_empty());
     }
 }
