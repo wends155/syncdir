@@ -739,6 +739,29 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Side-effecting logs in `safe_modified_millis`, `normalize_path`, and `TargetDir::validate` eliminated.
 >   - Redundant in-memory tracing buffer test harnesses consolidated into `src/test_support.rs`.
 
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Block 2: Worker Queue & State Resilience (`/build`, `/audit`)
+> * **Changes:**
+>   - **Transient Missing File Immediate Eviction (Finding 2, O1)**: Added source file existence verification (`!source_dir.join(&path).exists()`) upon `SyncError::Io(e)` with `ErrorKind::NotFound` in `SyncWorkerRunner::tick` (`src/sync/worker.rs`). Deleted transient files are evicted immediately with 0 retries, clearing failure tracking and preventing queue starvation.
+>   - **Generic I/O Retry Bound & Observer Notification (Finding 2, O2)**: Bounded generic `SyncError::Io` and `Err(e)` on both sync and delete loops to 10 attempts with exponential backoff before permanent eviction on attempt 11, resetting failure state and notifying `SyncStatusObserver::on_write_verification_failed`.
+>   - **Partial Failure Reachability Synchronization (Finding 3, O3)**: In `SyncWorkerRunner::handle_command`, explicitly called `self.reachability.mark_online(...)` on `ScanOutcome::PartialFailure`, unblocking queue processing and synchronizing tray UI state when individual file errors occur during full scans.
+>   - **Catch-Up Full Scan Exponential Backoff Throttling (Finding 4, O4)**: Added `catchup_scan_failures: u32` and `next_catchup_scan_attempt: Option<Instant>` to `SyncWorkerState`. `SyncWorkerRunner::tick` enforces backoff on failed catch-up full scans (starting at 10s base), preventing tight CPU spin-loops.
+>   - **Event-Driven Watcher Coordinator Shutdown & Structured Telemetry (Findings 30 & 33, O5)**: Replaced 100ms sleep polling loop in `SyncDaemon::spawn_watcher_coordinator` (`src/daemon.rs`) with channel timeout receiver `signal_rx.recv_timeout(retry_interval)`. Introduced `WatcherSignal::Shutdown` and wired `watcher_signal_tx` into `perform_shutdown`, achieving <50ms shutdown responsiveness and replacing string interpolations with structured key-value bindings.
+>   - **Test Support & Verification Double**: Implemented poison-safe `MockSyncStatusObserver` in `src/sync/mock.rs` and re-exported in `src/sync/mod.rs`.
+>   - **Quality Verification Gate**: 358 passing tests across workspace (347 all-targets + 11 doc-tests), zero clippy warnings under `-D warnings`, and 100% clean formatting.
+> * **New Constraints:**
+>   - `io::ErrorKind::NotFound` during worker sync must verify `!source_dir.join(&path).exists()` before evicting immediately without scheduling retries.
+>   - Generic I/O errors must be capped at 10 retry attempts with exponential backoff before permanent eviction and observer notification.
+>   - Catch-up full scans must throttle repeated failures via `SyncWorkerState.record_catchup_scan_failure` using exponential backoff.
+>   - Watcher coordinator thread must be event-driven via `WatcherSignal` and `recv_timeout` rather than active sleep polling.
+> * **Pruned:**
+>   - 100ms idle sleep polling loop in `spawn_watcher_coordinator` eliminated.
+>   - Infinite retry loops on transient missing files and damaged blocks eliminated.
+>   - Tight 50ms CPU spin-loop on catch-up scan failure eliminated.
+
+
 
 
 
