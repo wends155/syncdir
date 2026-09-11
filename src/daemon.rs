@@ -103,6 +103,12 @@ fn join_thread_and_log_panic(handle: std::thread::JoinHandle<()>, thread_name: &
     }
 }
 
+/// Single-purpose control signal for event-driven watcher coordinator lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatcherSignal {
+    Shutdown,
+}
+
 /// Orchestrator for syncdir background sync workers, file watcher, and central command broadcaster.
 #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
 pub struct SyncDaemon {
@@ -114,6 +120,7 @@ pub struct SyncDaemon {
     cancellation: Arc<AtomicBool>,
     command_tx: Sender<SyncCommand>,
     watcher_active: Arc<AtomicBool>,
+    watcher_signal_tx: Option<Sender<WatcherSignal>>,
 }
 
 impl SyncDaemon {
@@ -182,6 +189,7 @@ impl SyncDaemon {
     }
 
     /// Spawn the directory watcher coordinator thread.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_watcher_coordinator(
         config: Config,
         command_tx: Sender<SyncCommand>,
@@ -190,6 +198,7 @@ impl SyncDaemon {
         observer: Option<Arc<dyn SyncStatusObserver>>,
         watcher_factory: Arc<dyn crate::monitor::WatcherFactory>,
         watcher_active: Arc<AtomicBool>,
+        signal_rx: std::sync::mpsc::Receiver<WatcherSignal>,
     ) -> Result<JoinHandle<()>, SyncError> {
         let initial_online = config.source_dir().exists() && config.source_dir().is_dir();
         source_connectivity.set_online(initial_online);
@@ -202,7 +211,11 @@ impl SyncDaemon {
                     (Some(w), active)
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to start directory watcher");
+                    tracing::error!(
+                        source_dir = %config.source_dir().display(),
+                        error = %e,
+                        "Failed to start directory watcher"
+                    );
                     (None, false)
                 }
             }
@@ -236,15 +249,25 @@ impl SyncDaemon {
                 let mut last_sent_online = Some(initial_online);
                 let mut last_sent_active = Some(is_initially_active);
 
-                while !shutdown_flag.load(Ordering::Relaxed) {
-                    let check_interval = std::time::Duration::from_millis(100);
-                    let mut elapsed = std::time::Duration::ZERO;
-                    while elapsed < retry_interval {
-                        if shutdown_flag.load(Ordering::Relaxed) {
-                            return;
+                loop {
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        tracing::info!(
+                            source_dir = %config.source_dir().display(),
+                            "Watcher coordinator thread exiting on shutdown signal"
+                        );
+                        break;
+                    }
+
+                    match signal_rx.recv_timeout(retry_interval) {
+                        Ok(WatcherSignal::Shutdown)
+                        | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            tracing::info!(
+                                source_dir = %config.source_dir().display(),
+                                "Watcher coordinator thread exiting on shutdown signal"
+                            );
+                            break;
                         }
-                        std::thread::sleep(check_interval);
-                        elapsed += check_interval;
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     }
 
                     let current_source = config.source_dir();
@@ -255,6 +278,7 @@ impl SyncDaemon {
                     if is_online {
                         if watcher.is_none() {
                             tracing::info!(
+                                source_dir = %config.source_dir().display(),
                                 "Source directory online. Starting directory watcher..."
                             );
                             match watcher_factory
@@ -265,12 +289,17 @@ impl SyncDaemon {
                                     watcher = Some(w);
                                     // Trigger catch-up full scan on source reconnection
                                     tracing::info!(
+                                        source_dir = %config.source_dir().display(),
                                         "Triggering full scan after source directory came online."
                                     );
                                     let _ = command_tx.send(SyncCommand::TriggerFullScan);
                                 }
                                 Err(e) => {
-                                    tracing::error!(error = %e, "Failed to start directory watcher");
+                                    tracing::error!(
+                                        source_dir = %config.source_dir().display(),
+                                        error = %e,
+                                        "Failed to start directory watcher"
+                                    );
                                     active = false;
                                 }
                             }
@@ -279,6 +308,7 @@ impl SyncDaemon {
                         }
                     } else if watcher.is_some() {
                         tracing::warn!(
+                            source_dir = %config.source_dir().display(),
                             "Source directory went offline. Dropping directory watcher."
                         );
                         watcher = None;
@@ -553,6 +583,7 @@ impl SyncDaemon {
 
         // 2. Central coordination channels and threads
         let (tx, rx) = channel();
+        let (watcher_signal_tx, watcher_signal_rx) = channel();
 
         // Spawn central watcher coordinator thread
         let watcher_handle = Self::spawn_watcher_coordinator(
@@ -563,6 +594,7 @@ impl SyncDaemon {
             observer,
             watcher_factory,
             watcher_active.clone(),
+            watcher_signal_rx,
         )?;
 
         // Spawn central broadcaster thread
@@ -578,6 +610,7 @@ impl SyncDaemon {
             cancellation,
             command_tx: tx,
             watcher_active,
+            watcher_signal_tx: Some(watcher_signal_tx),
         })
     }
 
@@ -611,6 +644,10 @@ impl SyncDaemon {
             tracing::info!("Shutting down SyncDaemon and all worker threads...");
             // Signal cancellation token to all workers immediately
             self.cancellation.store(true, Ordering::Relaxed);
+            // Signal watcher coordinator to wake up and terminate immediately before thread join
+            if let Some(signal_tx) = self.watcher_signal_tx.take() {
+                let _ = signal_tx.send(WatcherSignal::Shutdown);
+            }
             // Step 1: Join watcher thread first so no new events are generated
             if let Some(handle) = self.watcher_handle.take() {
                 join_thread_and_log_panic(handle, "watcher-coordinator");
@@ -1004,6 +1041,55 @@ mod tests {
         assert!(
             log_output.contains("source_dir="),
             "Missing source_dir field: {log_output}"
+        );
+    }
+
+    #[test]
+    fn test_watcher_coordinator_shutdown_responsiveness_and_structured_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&dst).expect("dst");
+
+        let config = crate::config::Config::builder(&src)
+            .dest_dir(dst)
+            .retry_interval_seconds(10)
+            .build()
+            .expect("config");
+
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mock_watcher_factory = std::sync::Arc::new(DummyFactory(flag));
+        let mock_resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+
+        let (_, log_output) = crate::test_support::with_captured_tracing(|| {
+            let daemon = SyncDaemon::builder(config, dir.path())
+                .factory(MockEngineFactory)
+                .resolver(mock_resolver)
+                .watcher_factory(mock_watcher_factory)
+                .start()
+                .expect("daemon start");
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            let shutdown_start = std::time::Instant::now();
+            daemon.shutdown();
+            let shutdown_duration = shutdown_start.elapsed();
+
+            assert!(
+                shutdown_duration < std::time::Duration::from_millis(500),
+                "Watcher coordinator shutdown took too long ({:?}); must respond within 500ms",
+                shutdown_duration
+            );
+        });
+
+        assert!(
+            log_output.contains("watcher_coordinator"),
+            "Missing watcher_coordinator span in logs: {log_output}"
+        );
+        assert!(
+            log_output.contains("Watcher coordinator thread exiting on shutdown signal"),
+            "Missing structured shutdown exit log event in logs: {log_output}"
         );
     }
 }
