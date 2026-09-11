@@ -1,5 +1,5 @@
 use crate::error::SyncError;
-use crate::sync::engine::{ScanOutcome, SyncEngine};
+use crate::sync::engine::{ScanOutcome, SyncEngine, SyncStatusObserver};
 use std::path::{Path, PathBuf};
 
 type SyncErrorFactory = std::sync::Arc<dyn Fn() -> SyncError + Send + Sync>;
@@ -274,6 +274,76 @@ impl SyncEngine for MockSyncEngine {
     }
 }
 
+/// Thread-safe mock implementation of `SyncStatusObserver` for worker state machine testing.
+#[derive(Default, Clone)]
+pub struct MockSyncStatusObserver {
+    target_statuses: std::sync::Arc<std::sync::Mutex<Vec<(usize, crate::sync::ConnectivityState)>>>,
+    watcher_statuses: std::sync::Arc<
+        std::sync::Mutex<Vec<(crate::sync::ConnectivityState, crate::sync::WatcherState)>>,
+    >,
+    write_verification_failures: std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+}
+
+impl MockSyncStatusObserver {
+    /// Create a new empty `MockSyncStatusObserver`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return recorded target connectivity status transitions.
+    pub fn target_statuses(&self) -> Vec<(usize, crate::sync::ConnectivityState)> {
+        self.target_statuses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Return recorded watcher status transitions.
+    pub fn watcher_statuses(
+        &self,
+    ) -> Vec<(crate::sync::ConnectivityState, crate::sync::WatcherState)> {
+        self.watcher_statuses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Return recorded write verification failure paths.
+    pub fn write_verification_failures(&self) -> Vec<std::path::PathBuf> {
+        self.write_verification_failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+impl SyncStatusObserver for MockSyncStatusObserver {
+    fn on_target_status_change(&self, target_index: usize, state: crate::sync::ConnectivityState) {
+        self.target_statuses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((target_index, state));
+    }
+
+    fn on_watcher_status_change(
+        &self,
+        source: crate::sync::ConnectivityState,
+        watcher: crate::sync::WatcherState,
+    ) {
+        self.watcher_statuses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((source, watcher));
+    }
+
+    fn on_write_verification_failed(&self, path: &std::path::Path) {
+        self.write_verification_failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(path.to_path_buf());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +407,21 @@ mod tests {
         assert!(mock.prune_archive(d1).is_ok());
         assert_eq!(mock.prune_archive_calls(), vec![d1.to_path_buf()]);
         assert_eq!(mock.prune_calls(), vec![d1.to_path_buf()]);
+    }
+
+    #[test]
+    fn test_mock_sync_status_observer_recording() {
+        let observer = MockSyncStatusObserver::new();
+        observer.on_target_status_change(0, crate::sync::ConnectivityState::Online);
+        observer.on_write_verification_failed(std::path::Path::new("file.txt"));
+
+        assert_eq!(
+            observer.target_statuses(),
+            vec![(0, crate::sync::ConnectivityState::Online)]
+        );
+        assert_eq!(
+            observer.write_verification_failures(),
+            vec![PathBuf::from("file.txt")]
+        );
     }
 }

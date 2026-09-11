@@ -23,7 +23,7 @@ pub use engine::{
     ConnectivityState, FileMetadataSnapshot, LocalSyncEngine, ScanOutcome, SyncCommand, SyncEngine,
     SyncStatusObserver, WatcherState,
 };
-pub use mock::MockSyncEngine;
+pub use mock::{MockSyncEngine, MockSyncStatusObserver};
 pub use path_safety::is_safe_relative_path;
 pub use types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
 pub use worker::{
