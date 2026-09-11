@@ -365,6 +365,8 @@ pub(crate) struct SyncWorkerState {
     pub(crate) hourly_prune_interval: std::time::Duration,
     pub(crate) last_archive_prune: Instant,
     pub(crate) needs_catchup_scan: bool,
+    pub(crate) catchup_scan_failures: u32,
+    pub(crate) next_catchup_scan_attempt: Option<Instant>,
 }
 
 impl SyncWorkerState {
@@ -376,6 +378,8 @@ impl SyncWorkerState {
             hourly_prune_interval: std::time::Duration::from_secs(3600),
             last_archive_prune: Instant::now(),
             needs_catchup_scan: false,
+            catchup_scan_failures: 0,
+            next_catchup_scan_attempt: None,
         }
     }
 
@@ -406,9 +410,29 @@ impl SyncWorkerState {
         self.needs_catchup_scan = true;
     }
 
-    /// Clears the catch-up scan requirement flag.
-    pub fn clear_needs_catchup_scan(&mut self) {
+    /// Record a catch-up scan failure, incrementing failure count and setting the exponential backoff deadline.
+    pub fn record_catchup_scan_failure(&mut self, now: Instant, base_interval: Duration) {
+        self.catchup_scan_failures = self.catchup_scan_failures.saturating_add(1);
+        let backoff = calculate_exponential_backoff(self.catchup_scan_failures, base_interval);
+        self.next_catchup_scan_attempt = Some(now + backoff);
+        tracing::warn!(
+            attempts = self.catchup_scan_failures,
+            ?backoff,
+            "Catch-up scan failed; backoff scheduled"
+        );
+    }
+
+    /// Record a successful catch-up scan, clearing the pending flag and resetting backoff failure state.
+    pub fn record_catchup_scan_success(&mut self) {
         self.needs_catchup_scan = false;
+        self.catchup_scan_failures = 0;
+        self.next_catchup_scan_attempt = None;
+    }
+
+    /// Clears the catch-up scan requirement flag and resets failure backoff.
+    #[allow(dead_code)]
+    pub fn clear_needs_catchup_scan(&mut self) {
+        self.record_catchup_scan_success();
     }
 
     /// Whether a catch-up full scan is currently needed.
@@ -417,9 +441,10 @@ impl SyncWorkerState {
         self.needs_catchup_scan
     }
 
-    /// Determines if a catch-up scan should execute based on queue depth and connectivity.
+    /// Determines if a catch-up scan should execute based on queue depth, connectivity, and failure backoff timer.
     pub fn should_trigger_catchup_scan(
         &self,
+        now: Instant,
         queue_pending: usize,
         drain_threshold: usize,
         source_online: bool,
@@ -429,6 +454,9 @@ impl SyncWorkerState {
             && queue_pending <= drain_threshold
             && source_online
             && dest_online
+            && self
+                .next_catchup_scan_attempt
+                .is_none_or(|earliest| now >= earliest)
     }
 }
 
@@ -1223,6 +1251,7 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
         }
 
         if self.state.should_trigger_catchup_scan(
+            now,
             self.queue.pending_count(),
             self.drain_threshold,
             self.context.source_connectivity.is_online(),
@@ -1236,18 +1265,20 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                 self.reachability.active_dest(),
                 &self.context.cancellation,
             ) {
-                Ok(ScanOutcome::Success { .. }) | Ok(ScanOutcome::PartialFailure { .. }) => {
-                    self.state.clear_needs_catchup_scan();
+                Ok(ScanOutcome::Success { .. } | ScanOutcome::PartialFailure { .. }) => {
+                    self.state.record_catchup_scan_success();
                 }
                 Ok(ScanOutcome::DestinationUnreachable) => {
                     self.reachability
                         .mark_offline(self.context.observer.as_ref());
+                    self.state.record_catchup_scan_failure(now, retry_dur);
                 }
                 Err(SyncError::Cancelled) => {
                     return Ok(WorkerTickOutcome::ShutdownRequested);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Catch-up scan after queue overflow failed");
+                    self.state.record_catchup_scan_failure(now, retry_dur);
                 }
             }
         }
@@ -1788,10 +1819,11 @@ mod tests {
         assert!(!state.needs_catchup_scan());
         state.mark_needs_catchup_scan();
         assert!(state.needs_catchup_scan());
-        assert!(!state.should_trigger_catchup_scan(100, 50, true, true));
-        assert!(!state.should_trigger_catchup_scan(50, 50, false, true));
-        assert!(!state.should_trigger_catchup_scan(50, 50, true, false));
-        assert!(state.should_trigger_catchup_scan(50, 50, true, true));
+        let now = Instant::now();
+        assert!(!state.should_trigger_catchup_scan(now, 100, 50, true, true));
+        assert!(!state.should_trigger_catchup_scan(now, 50, 50, false, true));
+        assert!(!state.should_trigger_catchup_scan(now, 50, 50, true, false));
+        assert!(state.should_trigger_catchup_scan(now, 50, 50, true, true));
         state.clear_needs_catchup_scan();
         assert!(!state.needs_catchup_scan());
     }
@@ -2480,5 +2512,71 @@ mod tests {
                 .target_statuses()
                 .contains(&(0, crate::sync::ConnectivityState::Online))
         );
+    }
+
+    #[test]
+    fn test_sync_worker_catchup_scan_failure_applies_backoff() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source)
+            .dest_dir(dest)
+            .retry_interval_seconds(10)
+            .debounce_seconds(1)
+            .build_unvalidated();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = MockSyncEngine::new();
+        engine.set_sync_error(|| SyncError::Io(std::io::Error::other("full scan failure")));
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+        let mut runner = SyncWorkerRunner::new(ctx);
+
+        runner.reachability.mark_online(None);
+        runner.state.mark_needs_catchup_scan();
+
+        let t0 = Instant::now();
+        assert!(runner.state.should_trigger_catchup_scan(
+            t0,
+            0,
+            runner.drain_threshold,
+            true,
+            true
+        ));
+
+        let outcome = runner.tick(t0).unwrap();
+        assert_eq!(outcome, WorkerTickOutcome::Continue);
+        assert_eq!(engine.full_scans_count(), 1);
+        assert!(runner.state.needs_catchup_scan());
+
+        // Mid-backoff (5s < 10s backoff): should_trigger_catchup_scan must return false
+        let t_mid = t0 + Duration::from_secs(5);
+        assert!(!runner.state.should_trigger_catchup_scan(
+            t_mid,
+            0,
+            runner.drain_threshold,
+            true,
+            true
+        ));
+        let outcome_mid = runner.tick(t_mid).unwrap();
+        assert_eq!(outcome_mid, WorkerTickOutcome::Continue);
+        assert_eq!(engine.full_scans_count(), 1);
+
+        // Expired backoff (11s > 10s): should_trigger_catchup_scan re-enables
+        let t_expired = t0 + Duration::from_secs(11);
+        assert!(runner.state.should_trigger_catchup_scan(
+            t_expired,
+            0,
+            runner.drain_threshold,
+            true,
+            true
+        ));
+        let outcome_expired = runner.tick(t_expired).unwrap();
+        assert_eq!(outcome_expired, WorkerTickOutcome::Continue);
+        assert_eq!(engine.full_scans_count(), 2);
     }
 }
