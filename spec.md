@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 96f1765
+> Last verified against: 9fa32e6
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 0.1.13 |
-| **Last Updated** | 2026-09-10 |
+| **Last Updated** | 2026-09-11 |
 
 ---
 
@@ -14,7 +14,7 @@
 
 ### 1. Config Module
  
-> Handles configuration file loading, path sanitization, domain type modeling, and invariant validation. Decomposed into `src/config/{mod, target, validation, raw, builder, tests}.rs`.
+> Handles configuration file loading, path sanitization, domain type modeling, boundary validation, and invariant validation. Decomposed into `src/config/{mod, target, validation, raw, builder, tests}.rs`.
  
 #### Public API
  
@@ -26,6 +26,7 @@
 | `Config::resolved_source_dir` | `(&self) -> &Path` | `&Path` | — (deprecated in favor of `source_dir`) |
 | `Config::destinations` | `(&self) -> &[TargetDir]` | `&[TargetDir]` | — (zero-copy canonical destination slice) |
 | `Config::resolved_dest_dirs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
+| `Config::dest_dirs` | `(&self) -> Option<Vec<PathBuf>>` | `Option<Vec<PathBuf>>` | — (deprecated in favor of `destinations()` or `resolved_dest_dirs()`) |
 | `Config::target_configs` | `(&self) -> Vec<TargetSyncConfig>` | `Vec<TargetSyncConfig>` | — |
 | `Config::builder` | `(source_dir: impl Into<PathBuf>) -> ConfigBuilder` | `ConfigBuilder` | — |
 | `ConfigBuilder::new` | `(source_dir: impl Into<PathBuf>) -> Self` | `ConfigBuilder` | — |
@@ -35,7 +36,8 @@
 | `ConfigBuilder::build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` (validates all configuration invariants) |
 | `ConfigBuilder::build_unvalidated` | `(self) -> Config` | `Config` | — (bypasses invariant validation; test fixtures only) |
 | `ConfigBuilder::try_build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` (alias for `build`) |
-| `TargetDir::new` | `(path: impl Into<PathBuf>) -> Self` | `TargetDir` | — |
+| `TargetDir::try_new` | `(path: impl Into<PathBuf>, role: TargetRole) -> Result<Self, SyncError>` | `TargetDir` | `SyncError::Validation` (validates syntax, drive root, or UNC format) |
+| `TargetDir::new` | `(path: impl Into<PathBuf>) -> Self` | `TargetDir` | — (deprecated in favor of `TargetDir::try_new`) |
 | `TargetDir::validate` | `(&self, role: &str) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid drive or UNC syntax) |
 | `TargetDir::as_path` | `(&self) -> &Path` | `&Path` | — |
 | `TargetDir::to_path_buf` | `(&self) -> PathBuf` | `PathBuf` | — |
@@ -47,11 +49,14 @@
 | `DestinationCollection::to_path_bufs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `TargetSyncConfig::from_config` | `(config: &Config, dest_dir: impl Into<TargetDir>) -> Result<Self, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` (validates invariants via builder) |
 | `TargetSyncConfig::builder` | `(source_dir: impl Into<PathBuf>, dest_dir: impl Into<PathBuf>) -> TargetSyncConfigBuilder` | `TargetSyncConfigBuilder` | — |
+| `TargetSyncConfig::source_dir` | `(&self) -> &Path` | `&Path` | — (returns path reference to validated source TargetDir) |
+| `TargetSyncConfig::source_target_dir` | `(&self) -> &TargetDir` | `&TargetDir` | — (returns borrowed reference to underlying TargetDir) |
 | `TargetSyncConfig::block_size_nonzero` | `(&self) -> std::num::NonZeroU64` | `NonZeroU64` | — (safely defaults to 64KB on zero) |
 | `TargetSyncConfig::with_verify_writes` | `(mut self, verify_writes: bool) -> Self` | `Self` | — (mutation helper for test fixtures) |
 | `TargetSyncConfigBuilder::build` | `(self) -> Result<TargetSyncConfig, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` |
 | `StoreConfig::try_from` | `(config: &Config) -> Result<StoreConfig, SyncError>` | `StoreConfig` | `SyncError::Validation` |
 | `StoreConfig::try_from` | `(target_config: &TargetSyncConfig) -> Result<StoreConfig, SyncError>` | `StoreConfig` | `SyncError::Validation` |
+| `validate_sync_boundaries` | `(source: &Path, dest: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (rejects identical or nested source/dest) |
 | `preprocess_config_toml` | `(raw_toml: &str) -> String` | `String` | — (preserves multi-line arrays and quotes) |
 
 #### Behavioral Scenarios
@@ -119,14 +124,19 @@ AND construction fails immediately
  
 #### Public API
  
-| Function | Signature | Returns | Notes |
-|----------|-----------|---------|-------|
+| Function / Struct | Signature | Returns | Notes |
+|-------------------|-----------|---------|-------|
+| `RelativePath::new` | `(path: impl Into<PathBuf>) -> Result<Self, SyncError>` | `RelativePath` | Enforces path safety, `/` normalization, rejects traversal/devices/ADS/whitespace |
+| `RelativePath::as_path` | `(&self) -> &Path` | `&Path` | Returns borrowed `&Path` slice |
+| `RelativePath::as_str` | `(&self) -> &str` | `&str` | Returns canonical forward-slash string slice |
+| `RelativePath::to_path_buf` | `(&self) -> PathBuf` | `PathBuf` | Converts to owned PathBuf |
 | `normalize_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | Replaces `/` with `\`, normalizes root backslashes, collapses `.` |
 | `parse_unc_host_and_share` | `(path: impl AsRef<Path>) -> Option<(&str, &str)>` | `Option<(&str, &str)>` | Extracts host and share from UNC paths |
 | `collapse_components` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | Lexically resolves `..` parent segments without disk I/O |
 | `is_same_or_descendant` | `(base: &Path, target: &Path) -> bool` | `bool` | Evaluates path hierarchy without I/O or canonicalization |
-| `system_root` | `() -> PathBuf` | `PathBuf` | Resolves Windows `%SystemRoot%` with fallback to `C:\Windows` |
-| `open_path` | `(path: &Path) -> std::io::Result<()>` | `std::io::Result<()>` | Launches system default application / Explorer |
+| `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | Validates relative path safety against traversal, devices, ADS, and root prefixes |
+| `normalize_superscripts_cow` | `(s: &str) -> Cow<'_, str>` | `Cow<'_, str>` | Zero-allocation superscript normalization (allocates only if superscripts present) |
+| `open_path` | `(path: &Path) -> std::io::Result<()>` | `std::io::Result<()>` | Deprecated; forwards to `syncdir::tray::open_path` |
 
 #### Behavioral Scenarios
 
@@ -159,10 +169,19 @@ AND unrelated paths return `false`
 
 #### Public API
 
-| Function / Trait | Signature | Returns | Errors |
-|------------------|-----------|---------|--------|
+| Function / Struct | Signature | Returns | Errors |
+|-------------------|-----------|---------|--------|
+| `FileRecord::new` | `(relative_path: impl Into<RelativePath>, file_size: u64, last_modified: i64) -> Self` | `FileRecord` | — (strictly encapsulated with private fields) |
+| `FileRecord::with_id` | `(mut self, id: i64) -> Self` | `Self` | — |
+| `FileRecord::with_optional_id` | `(mut self, id: Option<i64>) -> Self` | `Self` | — |
+| `FileRecord::relative_path` | `(&self) -> &RelativePath` | `&RelativePath` | — |
+| `FileRecord::file_size` | `(&self) -> u64` | `u64` | — (unsigned file size in bytes) |
+| `FileRecord::last_modified` | `(&self) -> i64` | `i64` | — (epoch milliseconds) |
+| `FileRecord::id` | `(&self) -> Option<i64>` | `Option<i64>` | — |
+| `FileRecord::is_tracked` | `(&self) -> bool` | `bool` | — (`id.is_some()`) |
 | `HashStore::get_file` | `(&self, path: &Path) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `SyncError::Db` |
 | `HashStore::save_file` | `(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
+| `HashStore::save_files_batch` | `(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError>` | `()` | `SyncError::Db` (batch atomic UPSERT) |
 | `HashStore::get_block_hashes` | `(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError>` | `Vec<BlockHash>` | `SyncError::Db` |
 | `HashStore::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
 | `HashStore::list_files` | `(&self) -> Result<Vec<PathBuf>, SyncError>` | `Vec<PathBuf>` | `SyncError::Db` |
@@ -203,6 +222,8 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `SyncEngine::sync_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db`, `SyncError::WriteVerificationFailed` |
 | `SyncEngine::sync_file_buffered` | `(&self, path: &Path, scratch: &mut [u8]) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db`, `SyncError::WriteVerificationFailed` |
 | `SyncEngine::sync_file_to_dest_buffered` | `(&self, path: &Path, dest_dir: &Path, scratch: &mut [u8]) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db`, `SyncError::WriteVerificationFailed` |
+| `SyncEngine::sync_file_to_dest_staged` | `(&self, path: &RelativePath, dest_dir: &Path, scratch: &mut [u8]) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `SyncError::Io`, `SyncError::WriteVerificationFailed` (stages transfer for batch SQLite commit) |
+| `SyncEngine::flush_staged_syncs` | `(&self, staged: &[FileRecord]) -> Result<(), SyncError>` | `()` | `SyncError::Db` (commits batch with single-record fallback) |
 | `SyncEngine::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
 | `SyncEngine::delete_file_from_dest` | `(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
 | `SyncEngine::prune_archive` | `(&self, dest_dir: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
@@ -213,30 +234,31 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `SyncWorkerRunner::handle_command` | `(&mut self, cmd: SyncCommand) -> bool` | `bool` | — (false indicates shutdown requested) |
 | `SyncWorkerRunner::tick` | `(&mut self, now: Instant) -> Result<WorkerTickOutcome, SyncError>` | `WorkerTickOutcome` | `SyncError` |
 | `SyncWorkerContext::builder` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, source_conn: impl Into<SourceConnectivityTracker>) -> SyncWorkerContextBuilder<E>` | `SyncWorkerContextBuilder<E>` | — (entrypoint for builder construction) |
-| `SyncWorkerContext::new` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, observer: Option<Arc<dyn SyncStatusObserver>>, source_connectivity: impl Into<SourceConnectivityTracker>) -> Self` | `SyncWorkerContext<E>` | — (direct constructor with default Win32 resolver) |
-| `SyncWorkerContext::with_resolver` | `(mut self, resolver: Arc<dyn NetworkResolver>) -> Self` | `Self` | — (fluent setter) |
-| `SyncWorkerContext::with_cancellation` | `(mut self, cancellation: Arc<AtomicBool>) -> Self` | `Self` | — (fluent setter) |
-| `SyncWorkerContext::with_max_pending_queue` | `(mut self, max: usize) -> Self` | `Self` | — (fluent setter) |
-| `SyncWorkerContextBuilder::new` | `(...) -> Self` | `SyncWorkerContextBuilder<E>` | — |
 | `SyncWorkerContextBuilder::build` | `(self) -> Result<SyncWorkerContext<E>, SyncError>` | `SyncWorkerContext<E>` | `SyncError::Validation` (requires `max_pending_queue > 0`) |
-| `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — (composes 4 collaborating transfer/scan engines; fields private) |
+| `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — (composes collaborating transfer/scan engines; fields private) |
 | `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (pub(crate) reusable scratch buffer lease for zero-lock streaming) |
 | `LocalSyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (clears reparse cache) |
 | `LocalSyncEngine::evict_verified_dir` | `(&self, dir: &Path)` | `()` | — (evicts dir and descendants from cache) |
+| `FullScanCoordinator::new` | `(engine: &'a LocalSyncEngine<S>, dest_dir: &'a Path, cancel: &'a AtomicBool) -> Self` | `FullScanCoordinator<'a, S>` | — (decomposed pipeline coordinator for full directory scans) |
+| `FullScanCoordinator::run` | `(self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
+| `ReparseCache::new` | `(shallow_capacity: usize, deep_capacity: usize) -> Self` | `ReparseCache` | — (two-tier relative-depth ancestor cache under RwLock) |
+| `ReparseCache::contains` | `(&self, path: &Path) -> bool` | `bool` | — |
+| `ReparseCache::insert_ancestor` | `(&self, path: PathBuf, depth: usize)` | `()` | — |
+| `ReparseCache::evict_dir` | `(&self, dir: &Path)` | `()` | — |
+| `ReparseCache::clear` | `(&self)` | `()` | — |
 | `SmallFileTransferEngine::new` | `(config: TargetSyncConfig) -> Self` | `SmallFileTransferEngine` | — (pub(crate) atomic small-file streaming) |
 | `DeltaTransferEngine::new` | `(db: S, config: TargetSyncConfig) -> Self` | `DeltaTransferEngine<S>` | — (pub(crate) in-place delta sync with chunk hashing) |
-| `ArchiveManager::new` | `(config: TargetSyncConfig) -> Self` | `ArchiveManager` | — (pub(crate) timestamped backup management and safe pruning) |
+| `ArchiveManager::new` | `(config: TargetSyncConfig, reparse_cache: Arc<ReparseCache>) -> Self` | `ArchiveManager` | — (pub(crate) timestamped backup management and safe pruning with ReparseCache) |
 | `DirectoryScanner::new` | `(config: TargetSyncConfig) -> Self` | `DirectoryScanner` | — (pub(crate) directory recursion and batch record saves) |
 | `DirtyBlockRange::new` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (infallible zero-panic constructor) |
-| `DirtyBlockRange::new_nonzero` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (alias for `new`) |
 | `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` (if `block_size == 0`) |
-| `DirtyBlockRange::block_size_nonzero` | `(&self) -> NonZeroU64` | `NonZeroU64` | — |
-| `FileMetadataSnapshot::from` | `(record: &FileRecord) -> Self` | `FileMetadataSnapshot` | — (converts database record to metadata snapshot) |
-| `MockSyncEngine::new` | `() -> Self` | `MockSyncEngine` | — (zero-panic mutex locking with `unwrap_or_else`) |
-| `SourceConnectivityTracker::new` | `(initial: bool) -> Self` | `SourceConnectivityTracker` | — |
-| `is_metadata_up_to_date_raw` | `(record_mod: i64, record_size: i64, src_mod: i64, src_size: i64, dest_mod: i64, dest_size: i64) -> bool` | `bool` | Evaluates SMB ±2000ms timestamp tolerance |
-| `verify_destination_not_reparse` | `(dest_dir: &Path, rel_path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (rejects directory junctions in path) |
-| `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | — (rejects `..`, ADS, drive letters, reserved names) |
+| `FileMetadataSnapshot::is_up_to_date` | `(&self, dest: &FileMetadataSnapshot, record: Option<&FileRecord>) -> bool` | `bool` | Evaluates SMB ±2000ms timestamp tolerance |
+| `is_metadata_up_to_date_raw` | `(dest: &FileMetadataSnapshot, src: &FileMetadataSnapshot, record: Option<&FileRecord>) -> bool` | `bool` | Deprecated in favor of `FileMetadataSnapshot::is_up_to_date` |
+| `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | `SyncError::Validation` (cached ancestor junction verification) |
+| `verify_source_not_reparse_cached` | `(source_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (cached source ancestor validation) |
+| `FileSyncTask<'a>` | `struct` | — | Borrowed task bundle defined in leaf `src/sync/types.rs` |
+| `safe_modified_millis` | `(metadata: &std::fs::Metadata) -> Result<i64, SyncError>` | `i64` | `SyncError::Io` (safely extracts epoch millis) |
+| `safe_epoch_duration_millis` | `(millis: i64) -> std::time::Duration` | `Duration` | Clamps negative millis to zero Duration |
  
 #### Behavioral Scenarios
 
@@ -380,9 +402,13 @@ THEN operations are executed against the active resolved UNC share path
  
 #### Public API
  
-| Function | Signature | Returns | Errors |
-|----------|-----------|---------|--------|
-| `DirectoryWatcher::start` | `(source_path: impl AsRef<Path>, tx: Sender<SyncCommand>) -> Result<DirectoryWatcher, SyncError>` | `DirectoryWatcher` | `SyncError::Watcher` (failed to set up watcher) |
+| Function / Trait | Signature | Returns | Errors |
+|------------------|-----------|---------|--------|
+| `DirectoryWatcher::start` | `(source_path: impl AsRef<Path>, tx: Sender<SyncCommand>) -> Result<DirectoryWatcher, WatcherError>` | `DirectoryWatcher` | `WatcherError` (failed to set up OS hook or path missing) |
+| `trait FileWatcher` | `Send + 'static` | — | Abstraction for directory watchers (`is_watching(&self) -> bool`) |
+| `trait WatcherFactory` | `Send + Sync + 'static` | — | Factory interface for creating mockable `FileWatcher` instances |
+| `RecommendedWatcherFactory` | `struct` | `RecommendedWatcherFactory` | Production `WatcherFactory` creating `DirectoryWatcher` |
+| `WatcherError` | `enum: Notify, PathNotFound, ChannelDisconnected, Other` | `WatcherError` | Strongly-typed watcher failure domain enum |
 
 #### Behavioral Scenarios
 
@@ -414,6 +440,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `TrayState::set_scan_notice` | `(&mut self, notice: Option<String>) -> bool` | `bool` | — |
 | `TrayState::overall_status` | `(&self) -> EngineStatus` | `EngineStatus` | — |
 | `TrayState::tooltip_text` | `(&self) -> String` | `String` | — |
+| `open_path` | `(path: &Path) -> std::io::Result<()>` | `()` | Launches default Windows shell application via `%SystemRoot%\explorer.exe` |
 
 ---
 
@@ -425,13 +452,19 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 
 | Function / Struct | Signature | Returns | Errors |
 |-------------------|-----------|---------|--------|
-| `SyncDaemon::start` | `(config: Config, app_dir: &Path, observer: Option<Arc<dyn SyncStatusObserver>>) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError::Db`, `SyncError::Validation` |
-| `SyncDaemon::start_with_factory` | `<F: SyncEngineFactory + 'static>(config: Config, app_dir: &Path, observer: Option<Arc<dyn SyncStatusObserver>>, factory: F) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError::Db`, `SyncError::Validation` |
+| `SyncDaemon::builder` | `(config: Config, app_dir: impl Into<PathBuf>) -> SyncDaemonBuilder` | `SyncDaemonBuilder` | — (fluent constructor entrypoint) |
+| `SyncDaemon::start` | `(config: Config, app_dir: &Path, observer: Option<Arc<dyn SyncStatusObserver>>) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError::Db`, `SyncError::Validation` (delegates to builder) |
+| `SyncDaemon::start_with_services` | `(...) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError` (deprecated in favor of `SyncDaemon::builder`) |
 | `SyncDaemon::validate_target_loops` | `(config: &Config, resolver: &dyn NetworkResolver) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (non-blocking loop detection using `try_resolve_unc_path`) |
-| `SyncDaemon::command_tx` | `(&self) -> Sender<SyncCommand>` | `Sender<SyncCommand>` | — |
 | `SyncDaemon::config` | `(&self) -> &Config` | `&Config` | — |
 | `SyncDaemon::handle` | `(&self) -> DaemonHandle` | `DaemonHandle` | — |
 | `SyncDaemon::shutdown` | `(mut self)` | `()` | — |
+| `SyncDaemonBuilder::new` | `(config: Config, app_dir: impl Into<PathBuf>) -> Self` | `SyncDaemonBuilder` | — |
+| `SyncDaemonBuilder::with_factory` | `(self, factory: F2) -> SyncDaemonBuilder<F2>` | `SyncDaemonBuilder` | — |
+| `SyncDaemonBuilder::with_resolver` | `(mut self, resolver: Arc<dyn NetworkResolver>) -> Self` | `Self` | — |
+| `SyncDaemonBuilder::with_watcher_factory` | `(mut self, factory: Arc<dyn WatcherFactory>) -> Self` | `Self` | — |
+| `SyncDaemonBuilder::with_observer` | `(mut self, observer: Arc<dyn SyncStatusObserver>) -> Self` | `Self` | — |
+| `SyncDaemonBuilder::start` | `(self) -> Result<SyncDaemon, SyncError>` | `SyncDaemon` | `SyncError` |
 | `DaemonHandle::new` | `(command_tx: Sender<SyncCommand>) -> Self` | `DaemonHandle` | — |
 | `DaemonHandle::trigger_full_scan` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Tray` |
 
@@ -467,7 +500,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `ValidationKind` | `enum: Security, ReparsePoint, RecursiveLoop, Invariant, Transient` | Typed validation classification with `is_permanent(&self) -> bool` |
 | `SyncError::WriteVerificationFailed` | `{ path: PathBuf }` | Distinct retryable write integrity failure |
 | `SyncError::LockPoison` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Mutex poisoning errors |
-| `SyncError::Watcher` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Directory watcher errors |
+| `SyncError::Watcher` | `(#[from] WatcherError)` | Directory watcher errors wrapping strongly typed `WatcherError` |
 | `SyncError::Tray` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | GUI / Tray notification errors |
 | `SyncError::Registry` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Windows registry errors |
 | `SyncError::validation` | `(msg: impl Into<String>) -> Self` | Semantic validation error constructor (default Invariant) |
@@ -496,7 +529,7 @@ AND transient errors return `false`, preserving exponential backoff retries
 Represents the runtime parameters loaded from `config.toml`. Fields are private and accessed via getters.
 - `source_dir`: PathBuf (validated to exist and be a directory)
 - `dest_dir`: Option<PathBuf> (optional primary destination directory)
-- `dest_dirs`: Option<Vec<PathBuf>> (optional additional destination directories)
+- `dest_dirs`: Option<Vec<PathBuf>> (optional additional destination directories; deprecated)
 - `debounce_seconds`: u64 (must be > 0)
 - `retry_interval_seconds`: u64 (must be > 0)
 - `propagate_deletions`: bool
@@ -506,14 +539,33 @@ Represents the runtime parameters loaded from `config.toml`. Fields are private 
 
 ### TargetSyncConfig
 Isolated target sync configuration for an individual worker with private fields and public getters.
-- `source_dir`: PathBuf
-- `dest_dir`: PathBuf
+- `source_dir`: TargetDir
+- `dest_dir`: TargetDir
 - `block_size_bytes`: u64
 - `block_sync_threshold_bytes`: u64
 - `verify_writes`: bool
 - `debounce_seconds`: u64
 - `retry_interval_seconds`: u64
 - `propagate_deletions`: bool
+
+### RelativePath
+Domain newtype representing a validated, safe, canonicalized relative path.
+- Invariants: Normalized to forward slashes (`/`), non-empty, no leading/trailing whitespace, no parent traversal (`..`), no Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`), no NTFS Alternate Data Streams (`:`), and no drive letter/UNC roots.
+- Implements `AsRef<Path>`, `Deref<Target = Path>`, `Display`, and Serde `try_from = "String"`.
+
+### FileRecord
+Database record representing indexed file state in SQLite signature cache.
+- `id`: Option<i64> (row ID in database, `None` if untracked)
+- `relative_path`: RelativePath
+- `file_size`: u64 (unsigned byte count)
+- `last_modified`: i64 (epoch milliseconds)
+
+### SyncCommand
+Strongly-typed IPC command dispatched between watcher, daemon, and worker threads.
+- `SyncFile(RelativePath)`: Requests synchronization of a specific relative path.
+- `DeleteFile(RelativePath)`: Requests archival or deletion of a specific relative path.
+- `TriggerFullScan`: Forces a complete filesystem reconciliation pass.
+- `Shutdown`: Requests graceful termination of the worker thread loop.
 
 ### ConnectivityState
 Explicit domain enum representing connection reachability.

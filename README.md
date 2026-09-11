@@ -110,15 +110,16 @@ When configuring Windows paths in `config.toml`, choose one of the three support
 ## API Surface
 
 For integration details, refer to the library crate modules:
-- `syncdir::config`: Configuration parsing, validation models, and `ConfigBuilder`.
-- `syncdir::daemon`: `SyncDaemon` orchestrator, background thread management, and `DaemonTrayHandler`.
-- `syncdir::db`: Local SQLite signature caching database, `HashStore` trait, and `StoreConfig`.
-- `syncdir::error`: Structured error types and causal error chaining with `SyncError`.
-- `syncdir::monitor`: Filesystem event debouncer and monitoring worker (`DirectoryWatcher`).
-- `syncdir::net`: Win32 UNC and SMB connection resolution (`try_resolve_alternate_path`).
+- `syncdir::config`: Configuration parsing, validation models, `TargetDir`, and `ConfigBuilder`.
+- `syncdir::daemon`: `SyncDaemon` orchestrator, `SyncDaemonBuilder`, and `DaemonHandle`.
+- `syncdir::db`: Local SQLite signature caching database, `HashStore` trait, `FileRecord`, and `StoreConfig`.
+- `syncdir::error`: Structured error types and causal error chaining with `SyncError` and `WatcherError`.
+- `syncdir::monitor`: Filesystem event debouncer, `FileWatcher` & `WatcherFactory` traits, and `DirectoryWatcher`.
+- `syncdir::net`: Win32 UNC and SMB connection resolution (`NetworkResolver`).
+- `syncdir::path_util`: Lexical path canonicalization, slash normalization, and `RelativePath` domain newtype.
 - `syncdir::startup`: Platform-specific Startup Registry configuration (`StartupRegistry`).
-- `syncdir::sync`: Delta synchronization engine, `DirtyBlockRange` batching, and worker routines.
-- `syncdir::tray`: Tray-icon menus, tooltip state machine (`TrayState`), and event loops.
+- `syncdir::sync`: Delta synchronization engine, `FullScanCoordinator`, `ReparseCache`, `DirtyBlockRange` batching, and worker routines.
+- `syncdir::tray`: Tray-icon menus, tooltip state machine (`TrayState`), `TrayEventLoop`, and default shell app execution (`open_path`).
 
 ## Architecture
 
