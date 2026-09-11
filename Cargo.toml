@@ -19,7 +19,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 blake3 = "1.5"
 notify = "6.1.1"
 thiserror = "1.0"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 tray-icon = "0.14"
