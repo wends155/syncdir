@@ -660,6 +660,29 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Dead `command_tx` method on `SyncDaemon` eliminated.
 >   - Raw panic leaks during daemon thread shutdown eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Phase 3: Performance & Caching Refactoring (`review_report.md` Findings 12, 13, 14, 15, 17)
+> * **Changes:**
+>   - **Relative-Depth Aware ReparseCache (O1)**: Implemented `ReparseCache` in `src/sync/path_safety.rs` under a single `std::sync::RwLock` separating shallow ancestors (relative depth $\le 3$ retained up to 50,000 entries) and deep ancestors (retained up to 10,000 entries with automatic oldest eviction). Added descendant prefix eviction `evict_dir`.
+>   - **Zero-Allocation Superscript Normalization (O2)**: Implemented `normalize_superscripts_cow` returning `Cow::Borrowed` on ASCII paths and allocating `Cow::Owned` only when unicode superscripts exist. Integrated into `is_safe_relative_path`, eliminating 10 unconditional string allocations per path component.
+>   - **Engine Shared Caching (O3)**: Integrated `&ReparseCache` across `verify_destination_not_reparse_cached` and `verify_source_not_reparse_cached`. Replaced `verified_dirs` in `LocalSyncEngine` with shared `Arc<ReparseCache>`, caching source path reparse validation in `sync_file_to_dest_core`.
+>   - **Bounded Candidate Scanning in Archive Pruning (O4)**: Capped candidate traversal in `prune_archive` to `MAX_ARCHIVE_PRUNE_CANDIDATES = 5000` files to bound filesystem traversal memory and I/O.
+>   - **Worker Debounce Batching & Fallback (O5)**: Added `SyncEngine::sync_file_to_dest_staged` and `flush_staged_syncs`. Updated `SyncWorkerRunner::tick` to stage up to 500 file transfers per debounce cycle. Enhanced `LocalSyncEngine::flush_record_batch` to fall back to individual `save_file` calls upon SQLite batch failure.
+>   - **Periodic Archive Prune Telemetry (O6)**: Added structured `tracing::warn!` logging on periodic archive prune failures in `SyncWorkerRunner::tick`.
+>   - **Quality Verification Gate**: 329 passing tests (zero failures, 1 ignored), zero clippy warnings, and clean formatting check. Commit `720213f`.
+> * **New Constraints:**
+>   - All reparse point ancestor checks must reuse the shared `ReparseCache`.
+>   - Worker file sync transfers must stage updates via `sync_file_to_dest_staged` and batch commits via `flush_staged_syncs`.
+>   - SQLite batch saves must always fall back to individual record saves on failure.
+> * **Pruned:**
+>   - Unbounded memory consumption in `verified_dirs` cache eliminated.
+>   - Unconditional per-component string allocations in `is_safe_relative_path` eliminated.
+>   - Per-file individual SQLite disk transaction overhead in worker debounce loop eliminated.
+>   - Unbounded candidate discovery in archive pruning eliminated.
+
+
 
 
 
