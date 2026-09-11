@@ -5,7 +5,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use syncdir::config::Config;
 use syncdir::daemon::{DaemonHandle, SyncDaemon};
 use syncdir::error::SyncError;
@@ -15,9 +16,13 @@ use syncdir::sync::ConnectivityState;
 use syncdir::tray::{
     DestinationState, TrayActionHandler, TrayEventLoop, TrayExitReason, open_path,
 };
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+static LOG_WORKER_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
+static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 fn try_main(app_dir: PathBuf) -> Result<TrayExitReason, SyncError> {
     let log_dir = app_dir.join("logs");
@@ -317,6 +322,51 @@ impl SystemDiagnosticInfo {
     }
 }
 
+fn pseudonymize_identifier(raw: &str) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("syncdir telemetry pseudonymization v1");
+    hasher.update(raw.as_bytes());
+    let hash = hasher.finalize();
+    let hex_prefix = &hash.to_hex()[..12];
+    format!("anon-{}", hex_prefix)
+}
+
+fn log_system_environment(sys_info: &SystemDiagnosticInfo) {
+    let anon_user = pseudonymize_identifier(&sys_info.username);
+    let anon_host = pseudonymize_identifier(&sys_info.hostname);
+    tracing::info!(
+        version = %sys_info.app_version,
+        os = %sys_info.os_version,
+        arch = %sys_info.arch,
+        anon_user = %anon_user,
+        anon_host = %anon_host,
+        "System diagnostic environment information"
+    );
+}
+
+fn write_emergency_panic_log(log_dir: &std::path::Path, location: &str, message: &str) {
+    let crash_file = log_dir.join("crash.log");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    let report = format!("[{timestamp}] PANIC at {location}: {message}\n");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&crash_file)
+    {
+        use std::io::Write;
+        let _ = file.write_all(report.as_bytes());
+        let _ = file.flush();
+    }
+}
+
+fn handle_panic_diagnostic_core(log_dir: &std::path::Path, location: &str, message: &str) {
+    eprintln!("Daemon panic at {location}: {message}");
+    write_emergency_panic_log(log_dir, location, message);
+    tracing::error!("Daemon panic at {location}: {message}");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -420,7 +470,10 @@ fn main() {
         }
     };
 
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    if let Ok(mut g) = LOG_WORKER_GUARD.lock() {
+        *g = Some(guard);
+    }
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -440,14 +493,9 @@ fn main() {
         .init();
 
     let sys_info = SystemDiagnosticInfo::collect();
-    let _host_span = tracing::info_span!("syncdir", host = %sys_info.hostname).entered();
-    tracing::info!(
-        version = %sys_info.app_version,
-        os = %sys_info.os_version,
-        arch = %sys_info.arch,
-        user = %sys_info.username,
-        "System environment"
-    );
+    let anon_host = pseudonymize_identifier(&sys_info.hostname);
+    let _host_span = tracing::info_span!("syncdir", host = %anon_host).entered();
+    log_system_environment(&sys_info);
 
     if args.iter().any(|a| a == "--autostart") {
         tracing::info!("syncdir initialized (Trigger: Windows Auto-Start)");
@@ -456,7 +504,13 @@ fn main() {
     }
 
     // Register panic hook to capture crash/panics
-    std::panic::set_hook(Box::new(|panic_info| {
+    let log_dir_for_panic = log_dir.clone();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        if PANIC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+            eprintln!("Double panic detected in syncdir; aborting immediately.");
+            std::process::exit(1);
+        }
+
         let payload = panic_info.payload();
         let message = if let Some(s) = payload.downcast_ref::<&str>() {
             *s
@@ -470,7 +524,17 @@ fn main() {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown location".to_string());
 
-        tracing::error!("Daemon panic at {location}: {message}");
+        handle_panic_diagnostic_core(&log_dir_for_panic, &location, message);
+
+        // Prevent self-join deadlock if the logger thread itself panics
+        let is_logger_thread = std::thread::current().name() == Some("tracing-appender");
+        if !is_logger_thread
+            && let Ok(mut guard_slot) = LOG_WORKER_GUARD.try_lock()
+            && let Some(guard) = guard_slot.take()
+        {
+            drop(guard); // Flushes queued logs to disk
+        }
+
         std::process::exit(1);
     }));
 
@@ -478,9 +542,15 @@ fn main() {
         Ok(exit_reason) => match exit_reason {
             TrayExitReason::UserExit => {
                 tracing::info!("syncdir daemon shut down cleanly.");
+                if let Ok(mut guard_slot) = LOG_WORKER_GUARD.lock() {
+                    let _ = guard_slot.take();
+                }
             }
             TrayExitReason::Restart => {
                 tracing::info!("Restarting syncdir daemon...");
+                if let Ok(mut guard_slot) = LOG_WORKER_GUARD.lock() {
+                    let _ = guard_slot.take();
+                }
                 // Drop the mutex guard BEFORE spawning so the new instance can acquire it immediately.
                 drop(_mutex_guard);
                 if let Ok(exe) = std::env::current_exe() {
@@ -497,6 +567,9 @@ fn main() {
         },
         Err(e) => {
             tracing::error!("Fatal error: {e}");
+            if let Ok(mut guard_slot) = LOG_WORKER_GUARD.lock() {
+                let _ = guard_slot.take();
+            }
             std::process::exit(1);
         }
     }
@@ -626,5 +699,82 @@ verify_writes = true
         assert!(!info.hostname.is_empty(), "hostname should not be empty");
         assert!(!info.username.is_empty(), "username should not be empty");
         assert_eq!(info.app_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn test_anonymize_username_variants() {
+        let user1 = "alice";
+        let user2 = "bob";
+        let anon1 = pseudonymize_identifier(user1);
+        let anon2 = pseudonymize_identifier(user2);
+
+        assert!(!anon1.contains("alice"));
+        assert!(!anon2.contains("bob"));
+        assert!(anon1.starts_with("anon-"));
+        assert_eq!(
+            anon1,
+            pseudonymize_identifier(user1),
+            "Pseudonymization must be deterministic"
+        );
+        assert_ne!(
+            anon1, anon2,
+            "Different usernames must yield different pseudonyms"
+        );
+    }
+
+    #[test]
+    fn test_system_environment_log_does_not_expose_raw_username() {
+        let raw_user = "SecretAdminUser123";
+        let raw_host = "ConfidentialHost456";
+        let sys_info = SystemDiagnosticInfo {
+            os_version: "Windows 11 Pro".to_string(),
+            arch: "x86_64".to_string(),
+            hostname: raw_host.to_string(),
+            username: raw_user.to_string(),
+            app_version: "0.1.13".to_string(),
+        };
+
+        let (_result, log_output) = syncdir::test_support::with_captured_tracing(|| {
+            log_system_environment(&sys_info);
+        });
+
+        assert!(
+            !log_output.contains(raw_user),
+            "Plaintext username must not be logged"
+        );
+        assert!(
+            !log_output.contains(raw_host),
+            "Plaintext hostname must not be logged"
+        );
+        assert!(
+            log_output.contains("anon-"),
+            "Pseudonymized identifier prefix must be present"
+        );
+    }
+
+    #[test]
+    fn test_panic_hook_flushes_diagnostics_without_buffer_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_dir = temp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let location = "src/sync/worker.rs:125:10";
+        let message = "simulated worker thread critical panic";
+
+        let (_result, log_output) = syncdir::test_support::with_captured_tracing(|| {
+            handle_panic_diagnostic_core(&log_dir, location, message);
+        });
+
+        assert!(log_output.contains("Daemon panic at src/sync/worker.rs:125:10"));
+        assert!(log_output.contains("simulated worker thread critical panic"));
+
+        let emergency_crash_log = log_dir.join("crash.log");
+        assert!(
+            emergency_crash_log.exists(),
+            "crash.log must be created as emergency fallback"
+        );
+        let crash_content = std::fs::read_to_string(&emergency_crash_log).unwrap();
+        assert!(crash_content.contains(location));
+        assert!(crash_content.contains(message));
     }
 }
