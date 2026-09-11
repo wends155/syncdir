@@ -761,6 +761,35 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Infinite retry loops on transient missing files and damaged blocks eliminated.
 >   - Tight 50ms CPU spin-loop on catch-up scan failure eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Block 3: Engine Casing, Security & Performance (`/build`, `/audit`)
+> * **Changes:**
+>   - **On-Disk & DB Casing Alignment (Finding 5, O1)**: Implemented `align_dest_file_casing_if_needed` to inspect on-disk directory entries for casing divergence and perform atomic two-step renames on Windows (`*.syncdir_casetmp_*`). In `sync_file_to_dest_core`, updated SQLite record with `relative_path = excluded.relative_path` and preserved existing 1MB block signatures from `get_block_hashes`, eliminating unnecessary re-hashing. Delimiter normalization in `RelativePath` avoids false casing mismatch triggers on Windows backslashes.
+>   - **Symmetrical ReparseCache Eviction (Finding 7 / CWE-59, O2)**: In `delete_file_from_dest`, added symmetrical eviction for `source_path.parent()` alongside `dest_path.parent()`, preventing reparse junction traversal bypasses following file deletion.
+>   - **Batch Statement Hoisting & Hash Pre-Allocation (Findings 9 & 19, O3)**: Hoisted prepared cached statements in `SqliteHashStore::save_files_batch` outside the 500-record batch loop and explicitly dropped them prior to `tx.commit()`. Pre-allocated `Vec::with_capacity(64)` in `get_block_hashes`, preventing incremental vector re-allocations on multi-block files.
+>   - **Zero-Allocation Full Scan Lookup (Finding 10, O4)**: Refactored `FullScanCoordinator::build_cache_lookup` to return `HashMap<NormalizedCaseFoldedPath<'b>, &'b FileRecord>` referencing borrowed paths from file records, eliminating 50,000+ heap `PathBuf` allocations during startup scans.
+>   - **Scanner Path Allocation & Zero-Syscall Junction Checks (Findings 11 & 16, O5)**: Allocated `let path = entry.path()` once per entry in `DirectoryScanner::scan_dir_cancellable`, checking `is_reparse_or_symlink(&entry, &path)` across both directories and files. On Windows, `is_reparse_or_symlink` inspects cached `entry.metadata()?.file_attributes() & 0x400` first, eliminating extra syscalls while reliably detecting junctions.
+>   - **Zero-Allocation Path Safety Traversal (Finding 17, O5)**: Replaced `rel_path.components().collect::<Vec<_>>()` with a zero-allocation `peekable()` iterator traversal in `verify_destination_not_reparse_cached` across Windows and Unix. Pruned redundant pre-creation reparse check in `archive_dest_file_only`.
+>   - **Fast Nonce, Lazy Stack Buffer & Stream Verification (Finding 18, O5)**: Added `splitmix64` bit mixer (<2ns vs ~100ns Blake3 hashing) for staging nonces. Avoided 64KB stack buffer zeroing when worker scratch buffer is provided via `copy_stream_and_hash`, and verified streamed writes against the computed hash.
+>   - **Pruned Redundant Metadata Check (Finding 35, O5)**: Removed duplicate `is_metadata_up_to_date` call in `sync_file_to_dest_core`, consolidating evaluation in a single branch.
+>   - **Hardened Watcher Rename Pairs (O6)**: In `DirectoryWatcher::handle_rename_pair`, parsed paths as `Option<RelativePath>` to preserve cross-boundary move events and handled case-only renames via `eq_ignore_ascii_case`.
+>   - **Quality Verification Gate (O7)**: 356 passing tests across all targets, zero clippy warnings under `-D warnings`, and 100% clean formatting.
+> * **New Constraints:**
+>   - On-disk destination casing divergence must be resolved via atomic two-step rename (`align_dest_file_casing_if_needed`).
+>   - Casing updates in SQLite must preserve existing block hashes without triggering full file re-reads.
+>   - Deleting files from destination must symmetrically evict both destination and source parent paths from `ReparseCache`.
+>   - Temporary file staging nonces must use `splitmix64` bit mixing instead of cryptographic hashing.
+>   - Directory traversals must inspect reparse attributes on cached `DirEntry.metadata()` before issuing filesystem syscalls.
+> * **Pruned:**
+>   - Monolithic 50,000-entry `PathBuf` heap allocations during full scan cache lookups eliminated.
+>   - Per-batch SQLite statement recompilation within 500-record batch loops eliminated.
+>   - Redundant duplicate metadata check in `sync_file_to_dest_core` eliminated.
+>   - Redundant pre-creation reparse check in `archive_dest_file_only` eliminated.
+>   - 64KB stack zeroing per small file sync when scratch buffer is available eliminated.
+
+
 
 
 
