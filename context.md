@@ -707,6 +707,17 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Duplicate sync loop boundary validation algorithms eliminated.
 >   - Telescoping constructors on `SyncDaemon` and unchecked `for_test` worker context eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-11):**
+> * **Feature:** Post-Phase 4 Documentation Synchronization & Architecture Audit (`/update-doc`, `/architecture`)
+> * **Changes:**
+>   - **`spec.md` Behavioral Synchronization**: Realigned all behavioral contracts against verified commit `9fa32e6` (`> Last verified against: 9fa32e6`). Documented contracts for `TargetDir::try_new`, `DestinationCollection`, `RelativePath` domain invariants, `FileRecord` encapsulation, `FullScanCoordinator`, `ReparseCache`, `SafeModifiedMillis`, `SyncDaemonBuilder`, and `WatcherFactory`.
+>   - **`README.md` API Surface Update**: Updated API surface listing to reflect all modern module exports (`TargetDir`, `SyncDaemonBuilder`, `FileRecord`, `WatcherFactory`, `RelativePath`, `ReparseCache`, `FullScanCoordinator`).
+>   - **Architecture Audit & Recommendations Report**: Conducted a comprehensive audit of `architecture.md` against the 16 required sections in `.agents/rules/architecture-rules.md`. Generated `architecture_recommendations_report.md` documenting layout tree synchronization, dependency rule reconciliation for `monitor` and `startup`, `WatcherError` documentation, test metric updates (343 passing tests), and Mermaid diagram adjustments.
+>   - **Quality Verification Gate**: 343 passing tests (zero failures, 1 ignored), zero clippy warnings (`-D warnings`), and clean formatting check. Committed as `23f34d4`.
+
+
 
 
 
