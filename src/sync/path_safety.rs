@@ -122,6 +122,7 @@ impl ReparseCache {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn verify_destination_not_reparse(
     dest_dir: &Path,
     rel_path: &Path,
@@ -155,6 +156,7 @@ pub(crate) fn verify_destination_not_reparse(
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub(crate) fn verify_destination_not_reparse(
     dest_dir: &Path,
     rel_path: &Path,

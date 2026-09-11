@@ -385,21 +385,24 @@ impl<S: HashStore> LocalSyncEngine<S> {
     pub fn new(db: S, config: impl Into<TargetSyncConfig>) -> Self {
         let config = config.into();
         let db = std::sync::Arc::new(db);
+        let reparse_cache =
+            std::sync::Arc::new(crate::sync::path_safety::ReparseCache::new(50_000, 10_000));
         let small_file_engine =
             crate::sync::small_file::SmallFileTransferEngine::new(config.clone());
         let delta_engine = crate::sync::delta::DeltaTransferEngine::new(
             std::sync::Arc::clone(&db),
             config.clone(),
         );
-        let archive_manager = crate::sync::archive::ArchiveManager::new(config.clone());
+        let archive_manager = crate::sync::archive::ArchiveManager::new(
+            config.clone(),
+            std::sync::Arc::clone(&reparse_cache),
+        );
         let scanner = crate::sync::scanner::DirectoryScanner::new(config.clone());
         Self {
             db,
             config,
             resolved_dest: None,
-            reparse_cache: std::sync::Arc::new(crate::sync::path_safety::ReparseCache::new(
-                50_000, 10_000,
-            )),
+            reparse_cache,
             small_file_engine,
             delta_engine,
             archive_manager,

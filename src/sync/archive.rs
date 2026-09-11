@@ -1,10 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::path_safety::{
-    is_reparse_or_symlink, is_reparse_or_symlink_meta, is_safe_relative_path,
-    verify_destination_not_reparse,
+    ReparseCache, is_reparse_or_symlink, is_reparse_or_symlink_meta, is_safe_relative_path,
+    verify_destination_not_reparse_cached,
 };
 use crate::config::TargetSyncConfig;
 use crate::error::SyncError;
@@ -138,11 +139,15 @@ pub(crate) fn prune_archive(
 #[derive(Debug, Clone)]
 pub(crate) struct ArchiveManager {
     config: TargetSyncConfig,
+    reparse_cache: Arc<ReparseCache>,
 }
 
 impl ArchiveManager {
-    pub(crate) fn new(config: TargetSyncConfig) -> Self {
-        Self { config }
+    pub(crate) fn new(config: TargetSyncConfig, reparse_cache: Arc<ReparseCache>) -> Self {
+        Self {
+            config,
+            reparse_cache,
+        }
     }
 
     /// Build the archive path: `<dest>/.syncdir_archive/<ts>_<relative_path>`.
@@ -185,13 +190,17 @@ impl ArchiveManager {
         }
 
         // Verify destination path does not traverse reparse points
-        verify_destination_not_reparse(dest_dir, rel_path)?;
+        verify_destination_not_reparse_cached(dest_dir, rel_path, &self.reparse_cache)?;
 
         match fs::metadata(&dest_path) {
             Ok(_) => {
                 if self.config.propagate_deletions() {
                     let archive_dir = dest_dir.join(".syncdir_archive");
-                    verify_destination_not_reparse(&archive_dir, Path::new(""))?;
+                    verify_destination_not_reparse_cached(
+                        &archive_dir,
+                        Path::new(""),
+                        &self.reparse_cache,
+                    )?;
 
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -218,12 +227,20 @@ impl ArchiveManager {
                     let archive_rel = archive_path
                         .strip_prefix(&archive_dir)
                         .map_err(|e| SyncError::validation_security(e.to_string()))?;
-                    verify_destination_not_reparse(&archive_dir, archive_rel)?;
+                    verify_destination_not_reparse_cached(
+                        &archive_dir,
+                        archive_rel,
+                        &self.reparse_cache,
+                    )?;
 
                     if let Some(parent) = archive_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    verify_destination_not_reparse(&archive_dir, archive_rel)?;
+                    verify_destination_not_reparse_cached(
+                        &archive_dir,
+                        archive_rel,
+                        &self.reparse_cache,
+                    )?;
                     fs::rename(&dest_path, &archive_path)?;
                 }
             }
@@ -244,6 +261,7 @@ impl ArchiveManager {
 
 #[cfg(test)]
 mod tests {
+    use super::super::path_safety::verify_destination_not_reparse;
     use super::*;
     use crate::config::{Config, TargetSyncConfig};
     use tempfile::tempdir;
@@ -347,7 +365,8 @@ mod tests {
             .build()
             .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let archive_manager = std::sync::Arc::new(ArchiveManager::new(target_cfg));
+        let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
+        let archive_manager = Arc::new(ArchiveManager::new(target_cfg, reparse_cache));
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(50));
         let mut handles = Vec::new();
@@ -534,7 +553,8 @@ mod tests {
             .build()
             .unwrap();
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
-        let archive_manager = ArchiveManager::new(target_cfg);
+        let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
+        let archive_manager = ArchiveManager::new(target_cfg, reparse_cache);
 
         let file = dst.join("victim.txt");
         std::fs::write(&file, "payload").unwrap();
@@ -582,7 +602,8 @@ mod tests {
 
         let cfg = test_config(source.clone(), dest.clone());
         let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
-        let manager = ArchiveManager::new(target_cfg);
+        let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
+        let manager = ArchiveManager::new(target_cfg, reparse_cache);
 
         let p = manager
             .get_archive_path(&dest, Path::new("sub/doc.txt"), "20260910")
@@ -659,5 +680,36 @@ mod tests {
         assert!(prune_archive(&archive_dir, 0, 0).is_ok());
         let remaining = fs::read_dir(&archive_dir).unwrap().count();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_archive_dest_file_only_queries_reparse_cache() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let cfg = test_config(source, dest.clone());
+        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
+        assert!(reparse_cache.is_empty());
+
+        let manager = ArchiveManager::new(target_cfg, Arc::clone(&reparse_cache));
+
+        let file = dest.join("victim.txt");
+        fs::write(&file, b"content").unwrap();
+        manager
+            .archive_dest_file_only(Path::new("victim.txt"), &dest)
+            .unwrap();
+
+        assert!(
+            !reparse_cache.is_empty(),
+            "ReparseCache must be populated during archive_dest_file_only"
+        );
+        assert!(
+            reparse_cache.contains(&dest),
+            "ReparseCache must contain destination root"
+        );
     }
 }
