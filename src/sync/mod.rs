@@ -6,12 +6,15 @@
 pub(crate) mod archive;
 pub(crate) mod delta;
 pub(crate) mod engine;
+pub(crate) mod full_scan;
 pub(crate) mod mock;
 pub(crate) mod path_safety;
 pub(crate) mod scanner;
 pub(crate) mod small_file;
 pub mod types;
 pub(crate) mod worker;
+
+pub(crate) use full_scan::FullScanCoordinator;
 
 pub use delta::DirtyBlockRange;
 pub use engine::{

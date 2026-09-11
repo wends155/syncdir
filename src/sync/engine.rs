@@ -1,9 +1,9 @@
 //! Core sync engine trait, commands, status types, and LocalSyncEngine coordination.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::config::TargetSyncConfig;
 use crate::db::{FileRecord, HashStore};
@@ -463,6 +463,18 @@ impl<S: HashStore> LocalSyncEngine<S> {
         self.resolved_dest.as_deref()
     }
 
+    pub(crate) fn db(&self) -> &S {
+        &self.db
+    }
+
+    pub(crate) fn config(&self) -> &TargetSyncConfig {
+        &self.config
+    }
+
+    pub(crate) fn scanner(&self) -> &crate::sync::scanner::DirectoryScanner {
+        &self.scanner
+    }
+
     /// Perform a full directory scan on default or pre-resolved destination.
     pub fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
         static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
@@ -704,216 +716,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         dest_dir: &Path,
         cancel: &AtomicBool,
     ) -> Result<ScanOutcome, SyncError> {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(SyncError::Cancelled);
-        }
-
-        let resolved_source = self.config.source_dir();
-        if !resolved_source.exists() {
-            return Err(SyncError::validation("Source directory does not exist"));
-        }
-
-        let active_dest = if let Some(ref pre_resolved) = self.resolved_dest {
-            if pre_resolved.exists() && pre_resolved.is_dir() {
-                pre_resolved.clone()
-            } else {
-                dest_dir.to_path_buf()
-            }
-        } else {
-            dest_dir.to_path_buf()
-        };
-
-        if !active_dest.exists() || !active_dest.is_dir() {
-            tracing::warn!(
-                target = %active_dest.display(),
-                "Target destination directory does not exist or is unreachable. Skipping full scan."
-            );
-            return Ok(ScanOutcome::DestinationUnreachable);
-        }
-
-        let mut source_files: HashSet<PathBuf> = HashSet::new();
-        let mut scan_complete = true;
-        self.scanner.scan_dir_cancellable(
-            resolved_source,
-            &mut source_files,
-            &mut scan_complete,
-            cancel,
-        )?;
-
-        let cached_records = self.db.list_all_records()?;
-        let cached_lookup: HashMap<PathBuf, &FileRecord> = cached_records
-            .values()
-            .map(|rec| (crate::path_util::normalize_path(rec.relative_path()), rec))
-            .collect();
-
-        // Sync all source files
-        let mut synced_count = 0usize;
-        let mut failed_count = 0usize;
-        let mut sync_skip_count = 0usize;
-        let mut scratch = vec![0u8; self.config.block_size_bytes() as usize];
-        let mut batch: Vec<(FileRecord, Vec<crate::db::BlockHash>)> = Vec::with_capacity(500);
-        for rel_path in &source_files {
-            if cancel.load(Ordering::Relaxed) {
-                self.flush_record_batch(&mut batch)?;
-                return Err(SyncError::Cancelled);
-            }
-            match self.sync_file_to_dest_core(
-                rel_path,
-                &active_dest,
-                &mut scratch,
-                cached_lookup.get(rel_path).copied(),
-            ) {
-                Ok(Some((record, hashes))) => {
-                    synced_count += 1;
-                    batch.push((record, hashes));
-                    if batch.len() >= 500 {
-                        self.flush_record_batch(&mut batch)?;
-                    }
-                }
-                Ok(None) => {
-                    synced_count += 1;
-                }
-                Err(e) => {
-                    failed_count += 1;
-                    let os_code = match &e {
-                        SyncError::Io(io_err) => io_err.raw_os_error(),
-                        _ => None,
-                    };
-                    if e.is_network_offline() {
-                        tracing::warn!(
-                            path = %rel_path.display(),
-                            target = %active_dest.display(),
-                            error = %e,
-                            os_error = ?os_code,
-                            remaining = calculate_remaining_files(source_files.len(), synced_count, failed_count),
-                            "Target unreachable during full scan, skipping remaining files"
-                        );
-                        sync_skip_count = source_files.len();
-                        break;
-                    }
-                    tracing::warn!(
-                        path = %rel_path.display(),
-                        target = %active_dest.display(),
-                        error = %e,
-                        os_error = ?os_code,
-                        "Skipped file during full scan"
-                    );
-                    sync_skip_count += 1;
-                }
-            }
-        }
-        self.flush_record_batch(&mut batch)?;
-        if sync_skip_count > 0 {
-            tracing::warn!(
-                skipped = sync_skip_count,
-                total = source_files.len(),
-                target = %active_dest.display(),
-                "Full scan completed with sync errors"
-            );
-        }
-
-        // If 100% of files failed to sync (and there were files to sync), destination is inaccessible
-        if !source_files.is_empty() && sync_skip_count == source_files.len() {
-            return Ok(ScanOutcome::DestinationUnreachable);
-        }
-
-        // Detect deletions: files in DB but missing from source
-        let mut delete_skip_count = 0usize;
-        if self.config.propagate_deletions() {
-            if !scan_complete {
-                tracing::warn!(
-                    "Full scan was incomplete due to inaccessible directories or errors; skipping deletion propagation to prevent data loss"
-                );
-            } else if source_files.is_empty() && !cached_records.is_empty() {
-                tracing::warn!(
-                    tracked_count = cached_records.len(),
-                    "Source directory is empty but cache contains tracked files. Skipping deletion propagation to prevent accidental target wipe."
-                );
-                return Ok(ScanOutcome::Success { synced: 0 });
-            } else {
-                #[cfg(windows)]
-                let source_lookup: HashSet<String> = source_files
-                    .iter()
-                    .map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase())
-                    .collect();
-
-                let mut missing_to_delete: Vec<&Path> = Vec::new();
-                for tracked_path in cached_records.keys() {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err(SyncError::Cancelled);
-                    }
-                    #[cfg(windows)]
-                    let is_present = source_lookup.contains(
-                        &tracked_path
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                            .to_lowercase(),
-                    );
-                    #[cfg(not(windows))]
-                    let is_present = source_files.contains(tracked_path);
-
-                    if !is_present {
-                        if let Err(e) = self.archive_dest_file_only(tracked_path, &active_dest) {
-                            let os_code = match &e {
-                                SyncError::Io(io_err) => io_err.raw_os_error(),
-                                _ => None,
-                            };
-                            if e.is_network_offline() {
-                                tracing::warn!(
-                                    path = %tracked_path.display(),
-                                    target = %active_dest.display(),
-                                    error = %e,
-                                    os_error = ?os_code,
-                                    "Target unreachable during deletion phase of full scan, aborting deletion pass"
-                                );
-                                delete_skip_count += 1;
-                                break;
-                            }
-                            tracing::warn!(
-                                path = %tracked_path.display(),
-                                target = %active_dest.display(),
-                                error = %e,
-                                os_error = ?os_code,
-                                "Skipped deletion during full scan"
-                            );
-                            delete_skip_count += 1;
-                        } else {
-                            missing_to_delete.push(tracked_path.as_path());
-                        }
-                    }
-                }
-                if !missing_to_delete.is_empty() {
-                    self.db.delete_files_batch(&missing_to_delete)?;
-                }
-                if delete_skip_count > 0 {
-                    tracing::warn!(
-                        skipped = delete_skip_count,
-                        target = %active_dest.display(),
-                        "Full scan completed with deletion errors"
-                    );
-                }
-            }
-        }
-
-        if let Err(e) = self.prune_destination_archive(&active_dest) {
-            tracing::warn!(
-                target = %active_dest.display(),
-                error = %e,
-                "Failed to prune destination archive after full scan"
-            );
-        }
-
-        if failed_count > 0 || delete_skip_count > 0 {
-            Ok(ScanOutcome::PartialFailure {
-                synced: synced_count,
-                failed: failed_count,
-                delete_failed: delete_skip_count,
-            })
-        } else {
-            Ok(ScanOutcome::Success {
-                synced: synced_count,
-            })
-        }
+        crate::sync::FullScanCoordinator::new(self, dest_dir, cancel).run()
     }
 
     /// Archive or remove a file on destination filesystem without updating the database.
