@@ -792,11 +792,14 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                             failed,
                             delete_failed,
                         }) => {
+                            self.reachability
+                                .mark_online(self.context.observer.as_ref());
                             tracing::warn!(
+                                target_index = self.context.target_index + 1,
                                 synced,
                                 failed,
                                 delete_failed,
-                                "Full scan completed with failures"
+                                "Full scan completed with partial failure (destination reachable)"
                             );
                         }
                         Ok(ScanOutcome::DestinationUnreachable) => {
@@ -2430,5 +2433,52 @@ mod tests {
         let failures = observer.write_verification_failures();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0], PathBuf::from("damaged_block.txt"));
+    }
+
+    #[test]
+    fn test_sync_worker_partial_failure_marks_destination_online() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let dest = dir.path().join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let config = Config::builder(source).dest_dir(dest).build_unvalidated();
+        let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = MockSyncEngine::new();
+        engine.set_scan_outcome(Some(ScanOutcome::PartialFailure {
+            synced: 1,
+            failed: 1,
+            delete_failed: 0,
+        }));
+
+        let mock_observer = std::sync::Arc::new(crate::sync::mock::MockSyncStatusObserver::new());
+        let observer: std::sync::Arc<dyn SyncStatusObserver> = mock_observer.clone();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctx = SyncWorkerContext::new(
+            0,
+            target_config,
+            engine,
+            rx,
+            Some(observer.clone()),
+            source_online,
+        );
+        let mut runner = SyncWorkerRunner::new(ctx);
+
+        // Explicitly mark destination offline
+        runner.reachability.mark_offline(Some(&observer));
+        assert!(!runner.reachability.is_dest_online());
+
+        // Trigger full scan command
+        runner.handle_command(SyncCommand::TriggerFullScan);
+
+        // Invariant: PartialFailure indicates destination is responsive; reachability must be Online
+        assert!(runner.reachability.is_dest_online());
+        assert!(
+            mock_observer
+                .target_statuses()
+                .contains(&(0, crate::sync::ConnectivityState::Online))
+        );
     }
 }
