@@ -72,10 +72,12 @@ syncdir/
     │   ├── archive.rs    # Deletion archiving and archive retention pruning (ArchiveManager)
     │   ├── delta.rs      # Blake3 block hashing and delta sync logic (DeltaTransferEngine)
     │   ├── engine.rs     # Core SyncEngine trait implementation and file operations (LocalSyncEngine)
+    │   ├── full_scan.rs  # Decomposed multi-stage full directory synchronization (FullScanCoordinator)
     │   ├── mock.rs       # In-memory MockSyncEngine for unit and integration testing
-    │   ├── path_safety.rs# Reparse point and path traversal security checks
+    │   ├── path_safety.rs# Reparse point, ReparseCache, and path traversal security checks
     │   ├── scanner.rs    # Recursive directory scanning and change detection (DirectoryScanner)
     │   ├── small_file.rs # Fast path small file copying and verification (SmallFileTransferEngine)
+    │   ├── types.rs      # Standalone FileSyncTask and safe timestamp normalization helpers
     │   └── worker.rs     # Worker thread lifecycle, SyncWorkerContextBuilder, debouncing, and retry queues
     ├── tray.rs           # System tray icon event loop, menus, and process execution
     └── tray/
@@ -171,10 +173,10 @@ syncdir/
 | `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `path_util`, `error` | `main`, `tray`, `startup` |
 | `tray` | `sync`, `config`, `error`, `startup` (trait), `path_util`, `tray::assets` | `db` (direct), `main`, `daemon` |
 | `tray::assets` | `EngineStatus` (super), `error`, `tray-icon` | All other modules |
-| `monitor` | `sync`, `error` | `config`, `db`, `tray`, `main`, `daemon` |
+| `monitor` | `sync`, `path_util`, `error` | `config`, `db`, `tray`, `main`, `daemon` |
 | `sync` | `db` (trait), `config`, `net`, `path_util`, `error` | `monitor`, `tray`, `main`, `daemon` |
 | `db` | `path_util`, `error` | `config`, `sync`, `monitor`, `tray`, `main`, `daemon` |
-| `startup` | `config`, `error` | `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
+| `startup` | `error` | `config`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
 | `net` | `path_util`, `error` | `config`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
 | `config` | `path_util`, `db` (types only), `error` | `net`, `sync`, `monitor`, `tray`, `main`, `daemon` |
 | `path_util` | `error` | All other internal modules |
@@ -202,6 +204,7 @@ syncdir/
 * **Network Disconnect Classification**: `SyncError::is_network_offline()` inspects `std::io::Error::raw_os_error()` for Win32 SMB disconnect codes (53 `ERROR_BAD_NETPATH`, 59 `ERROR_UNEXP_NET_ERR`, 64 `ERROR_NETNAME_DELETED`, 67 `ERROR_BAD_NET_NAME`).
 * **Panic-Free Architecture**: Production code contains zero `.unwrap()` or `.expect()` calls. Worker threads return `Result<JoinHandle<()>, SyncError>` and worker execution loops handle errors gracefully with retry queues.
 * **Timestamp Safety**: File modification timestamps are normalized via `safe_modified_millis()` (clamping pre-1970 timestamps to 0 with warning logs) and restored via `safe_epoch_duration_millis()` (preventing wrapping integer underflow on `src_mod as u64`).
+* **Domain Subsystem Error Isolation**: Specialized leaf modules define dedicated domain error enums rather than polluting crate-wide error variants. For example, `WatcherError` (`src/error.rs`, re-exported in `src/monitor.rs`) models `notify::Error`, `PathNotFound`, `ChannelDisconnected`, and `Other`, wrapped transparently in `SyncError::Watcher(#[from] WatcherError)` to preserve typed error downcasting and causal inspection.
 * **Permanent Validation Failure Classification**: `SyncError::Validation { kind: ValidationKind, message: String }` categorizes errors via the strongly-typed `ValidationKind` enum (`Security`, `ReparsePoint`, `RecursiveLoop`, `Invariant`, `Transient`). `SyncError::is_permanent_validation_failure()` inspects `kind.is_permanent()` using pattern matching rather than fragile substring comparisons. Permanent security and invariant violations (path traversal, reserved DOS device names, reparse point junctions, recursive sync loops) trigger immediate eviction from worker retry queues without retry exhaustion, while transient errors preserve exponential backoff retries.
 
 
@@ -213,7 +216,7 @@ syncdir/
 * **Log Levels**: `INFO` for file copy telemetry and target reachability, `WARN` for recoverable errors/unreachable targets, `ERROR` for crashes/network loss, `DEBUG` for file block comparisons.
 
 ## 10. Testing Strategy
-* **Test Suite Metrics**: 320 total automated tests passing with zero regressions and zero warnings across all targets (265 unit tests in `src/lib.rs`, 4 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, and 11 doc-tests).
+* **Test Suite Metrics**: 343 total automated tests passing with zero regressions and zero warnings across all targets (288 unit tests in `src/lib.rs`, 4 in `src/main.rs`, 12 integration tests, 8 property tests, 20 snapshot tests, 11 doc-tests, and 1 ignored).
 * **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing, hierarchy comparison, system root detection), `src/startup.rs`, `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), `src/monitor.rs` (watcher buffer overflow recovery and event dispatching), and the decomposed `src/sync/` submodules:
   * `src/sync/engine.rs`: Composed `LocalSyncEngine` end-to-end regression, metadata timestamp tolerances, TOCTOU size protection, directory creation, destination file truncation repair, two-phase lock release, and reparse cache invalidation.
   * `src/sync/delta.rs`: Standalone `DeltaTransferEngine` Blake3 chunk hashing, delta sync dirty block updates, and read-back verification.
@@ -228,10 +231,11 @@ syncdir/
 * **Property-Based Tests**: `tests/property_tests.rs` (8 tests) using `proptest` (v1) for invariant validation (block boundary division, TOML round-tripping, `is_metadata_up_to_date_raw` timestamp delta evaluation across ±10000ms, `DirtyBlockRange` chunk coalescing, path traversal safety wired directly to `is_safe_relative_path`, sync idempotency, and delta sync single-block isolation).
 * **Assertions & Structural Diffing**: `pretty_assertions` (v1) for colorized diff output on test failure assertions across all test modules.
 * **Shared Test Fixtures**: `Config::test_default()` helper for consistent test configuration across unit and integration tests.
-* **Comprehensive In-Memory Mocks**: Four isolated mock implementations providing 100% test isolation:
+* **Comprehensive In-Memory Mocks**: Five isolated mock implementations providing 100% test isolation:
   * `MockHashStore` (`src/db.rs`): In-memory signature store without SQLite I/O.
   * `MockStartupRegistry` (`src/startup.rs`): In-memory registry backend without HKCU mutation.
   * `MockNetworkResolver` (`src/net.rs`): In-memory drive/UNC translator and SMB failure simulator.
+  * `MockWatcherFactory` & `MockFileWatcher` (`src/monitor.rs`): In-memory directory watcher and factory without Win32 OS threads.
   * `MockSyncEngine` (`src/sync/mock.rs`): Thread-safe recording sync engine with dynamic handler injection.
 
 ## 11. Documentation Conventions
@@ -267,9 +271,9 @@ graph TD
     daemon --> config & net & monitor & sync & path_util & error
     daemon -.->|via factory| db
     tray --> sync & config & path_util & startup & error
-    monitor --> sync & error
+    monitor --> sync & path_util & error
     sync --> db & config & net & path_util & error
-    db --> error
+    db --> path_util & error
     config --> path_util & db & error
     net --> path_util & error
     startup --> error
