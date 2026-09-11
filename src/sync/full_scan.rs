@@ -139,10 +139,10 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
     pub(crate) fn build_cache_lookup<'b>(
         &self,
         cached_records: &'b HashMap<PathBuf, FileRecord>,
-    ) -> HashMap<PathBuf, &'b FileRecord> {
+    ) -> HashMap<NormalizedCaseFoldedPath<'b>, &'b FileRecord> {
         cached_records
             .values()
-            .map(|rec| (crate::path_util::normalize_path(rec.relative_path()), rec))
+            .map(|rec| (NormalizedCaseFoldedPath(rec.relative_path().as_path()), rec))
             .collect()
     }
 
@@ -151,7 +151,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
         &self,
         active_dest: &Path,
         source_files: &HashSet<PathBuf>,
-        cached_lookup: &HashMap<PathBuf, &FileRecord>,
+        cached_lookup: &HashMap<NormalizedCaseFoldedPath<'_>, &FileRecord>,
     ) -> Result<SyncStats, SyncError> {
         let mut stats = SyncStats::default();
         let mut scratch = vec![0u8; self.engine.config().block_size_bytes() as usize];
@@ -167,7 +167,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
                 rel_path,
                 active_dest,
                 &mut scratch,
-                cached_lookup.get(rel_path).copied(),
+                cached_lookup.get(&NormalizedCaseFoldedPath(rel_path)).copied(),
             ) {
                 Ok(Some((record, hashes))) => {
                     stats.synced += 1;
@@ -499,5 +499,47 @@ mod tests {
         // keep.txt must remain
         assert!(store.get_file(Path::new("keep.txt")).unwrap().is_some());
         assert!(dst.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn test_case_folded_zero_allocation_cache_lookup() {
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::AtomicBool;
+        use tempfile::tempdir;
+        use crate::config::{Config, TargetSyncConfig};
+        use crate::db::{FileRecord, MockHashStore};
+        use crate::sync::engine::LocalSyncEngine;
+        use crate::sync::full_scan::{FullScanCoordinator, NormalizedCaseFoldedPath};
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let config = Config::test_default(src, dst.clone());
+        let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+        let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
+        let cancel = AtomicBool::new(false);
+        let coordinator = FullScanCoordinator::new(&engine, &dst, &cancel);
+
+        let mut cached_records = HashMap::new();
+        let rec1 = FileRecord::from_raw("Docs/Architecture.md", 2048, 1000).unwrap().with_id(1);
+        let rec2 = FileRecord::from_raw(r"Assets\Icons\Logo.PNG", 4096, 2000).unwrap().with_id(2);
+        cached_records.insert(PathBuf::from("Docs/Architecture.md"), rec1);
+        cached_records.insert(PathBuf::from(r"Assets\Icons\Logo.PNG"), rec2);
+
+        let lookup = coordinator.build_cache_lookup(&cached_records);
+
+        let hit1 = lookup.get(&NormalizedCaseFoldedPath(Path::new("docs/architecture.md")));
+        assert!(hit1.is_some());
+        assert_eq!(hit1.unwrap().id(), Some(1));
+
+        let hit2 = lookup.get(&NormalizedCaseFoldedPath(Path::new("assets/icons/logo.png")));
+        assert!(hit2.is_some());
+        assert_eq!(hit2.unwrap().id(), Some(2));
+
+        let hit3 = lookup.get(&NormalizedCaseFoldedPath(Path::new("DOCS/ARCHITECTURE.MD")));
+        assert!(hit3.is_some());
+
+        assert!(lookup.get(&NormalizedCaseFoldedPath(Path::new("docs/specification.md"))).is_none());
     }
 }
