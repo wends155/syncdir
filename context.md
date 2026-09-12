@@ -852,6 +852,28 @@ This file documents the chronological history, design decisions, and rules conte
 >   - All file deletions in `SqliteHashStore` must execute within explicit transaction boundaries.
 >   - `FileRecord` field encapsulation must be respected across submodules via public accessors (`relative_path()`, `file_size()`, `last_modified()`, `id()`).
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 3 — Configuration & Path Domain Layer (`src/config/`, `src/path_util.rs`, `src/db/`)
+> * **Changes:**
+>   - **`TargetDir` Fallible Conversions & Coherence Resolution (Finding 20)**: Implemented `TryFrom<PathBuf>`, `TryFrom<&Path>`, and `TryFrom<&str>` on `TargetDir` with syntax validation (drive roots `R:\`, UNC prefixes `\\`, forward slash normalization); removed unvalidated `From` implementations to prevent Rust trait coherence collision `E0119` with Serde transparent proxy; migrated all internal test call sites to `TargetDir::from_validated` or `TargetDir::try_from(...).unwrap()`.
+>   - **Submodule Encapsulation (Finding 22)**: Retracted submodules `target` and `builder` in `src/config/mod.rs` from `pub mod` to `pub(crate) mod`. Exported domain types exclusively through the `syncdir::config` facade.
+>   - **Configuration Decoupling from Storage Subsystem (Finding 23)**: Removed `TryFrom<&Config> for StoreConfig` and `TryFrom<&TargetSyncConfig> for StoreConfig` bridges from `src/config/mod.rs`. Replaced coupling tests in `src/config/tests.rs` with `test_config_block_parameters_for_storage`. Confirmed 0 occurrences of `crate::db` in `src/config/`.
+>   - **Builder & Domain Query Ergonomics (Finding 34)**: Applied struct-level `#[must_use = "..."]` to `ConfigBuilder` and `TargetSyncConfigBuilder`. Applied `#[must_use]` to all pure query getters on `Config` and `TargetSyncConfig`, `DestinationCollection` queries (`len`, `is_empty`, `as_slice`), and `RelativePath` queries (`as_path`, `as_forward_slash_str`, `to_storage_key`, `to_ascii_lowercase`). Scoped attributes to prevent clippy `double_must_use` warnings.
+>   - **Zero-Allocation `RelativePath` & Storage Decoupling (Finding 35)**: Implemented zero-allocation `RelativePath::as_forward_slash_str(&self) -> &str` and storage-agnostic owned string key `to_storage_key(&self) -> String`. Deprecated `to_sqlite_key` with backward-compatible forward shim. Migrated cache lookup and binding callers in `src/db/sqlite.rs` and `src/db/mock.rs`.
+>   - **Test Suite Expansion & Quality Verification Gate**: Expanded automated test suite from 386 to 392 tests (332 lib unit, 7 bin unit, 13 integration, 8 property, 20 snapshot, 12 doc-tests) with 0 failures. 100% `rustfmt`, zero clippy warnings under `-D warnings`, zero AST-grep violations, and zero circular imports.
+> * **New Constraints:**
+>   - `src/config/` MUST remain completely free of storage dependencies (`crate::db`).
+>   - `TargetDir` conversions MUST remain fallible (`TryFrom`) to enforce path syntax validation at boundaries; unvalidated `From` implementations remain prohibited.
+>   - SQLite query parameter binding MUST use borrowed `RelativePath::as_forward_slash_str()` to avoid unnecessary string allocations.
+>   - Builders (`ConfigBuilder`, `TargetSyncConfigBuilder`) MUST retain struct-level `#[must_use]`.
+> * **Pruned:**
+>   - Bidirectional coupling between `config` and `db` eliminated.
+>   - Redundant heap allocations in `to_sqlite_key()` query binding paths eliminated.
+>   - Unvalidated path ingestion via `From` on `TargetDir` eliminated.
+
+
 
 
 
