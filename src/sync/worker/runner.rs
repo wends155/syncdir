@@ -1,4 +1,4 @@
-use crate::error::{SyncError, is_network_offline_io};
+use crate::error::SyncError;
 use crate::sync::engine::{ScanOutcome, SyncCommand, SyncEngine};
 use crate::sync::worker::context::SyncWorkerContext;
 use crate::sync::worker::queue::DebounceQueue;
@@ -125,6 +125,8 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                             tracing::info!(synced, "Full scan completed successfully");
                             self.reachability
                                 .mark_online(self.context.observer.as_ref());
+                            self.state.record_catchup_scan_success();
+                            self.state.clear_failures();
                         }
                         Ok(ScanOutcome::PartialFailure {
                             synced,
@@ -133,6 +135,8 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                         }) => {
                             self.reachability
                                 .mark_online(self.context.observer.as_ref());
+                            self.state.record_catchup_scan_success();
+                            self.state.clear_failures();
                             tracing::warn!(
                                 target_index = self.context.target_index + 1,
                                 synced,
@@ -238,7 +242,12 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                             self.reachability
                                 .mark_offline(self.context.observer.as_ref());
                         }
-                        Ok(_) => {}
+                        Ok(ScanOutcome::Success { .. } | ScanOutcome::PartialFailure { .. }) => {
+                            self.reachability
+                                .mark_online(self.context.observer.as_ref());
+                            self.state.record_catchup_scan_success();
+                            self.state.clear_failures();
+                        }
                         Err(SyncError::Cancelled) => {
                             tracing::info!("Catch-up scan cancelled");
                             return Ok(WorkerTickOutcome::ShutdownRequested);
@@ -385,17 +394,6 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                         self.state.reset_failure(&path);
                     }
                     Err(SyncError::Io(e)) => {
-                        if is_network_offline_io(&e) {
-                            tracing::warn!(
-                                target_index = self.context.target_index + 1,
-                                path = %path.display(),
-                                error = %e,
-                                "Network offline I/O error detected during file sync; rescheduling retry"
-                            );
-                            network_offline_detected = true;
-                            self.reachability
-                                .mark_offline(self.context.observer.as_ref());
-                        }
                         let attempts = self.state.record_failure(&path);
                         if attempts <= 10 {
                             let backoff = calculate_exponential_backoff(attempts, retry_dur);
@@ -509,11 +507,6 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
                             self.queue.requeue_delete_retry(path, retry_dur);
                         }
                         Err(SyncError::Io(e)) => {
-                            if is_network_offline_io(&e) {
-                                network_offline_detected = true;
-                                self.reachability
-                                    .mark_offline(self.context.observer.as_ref());
-                            }
                             let attempts = self.state.record_failure(&path);
                             if attempts <= 10 {
                                 let backoff = calculate_exponential_backoff(attempts, retry_dur);
@@ -577,6 +570,7 @@ impl<E: SyncEngine> SyncWorkerRunner<E> {
             ) {
                 Ok(ScanOutcome::Success { .. } | ScanOutcome::PartialFailure { .. }) => {
                     self.state.record_catchup_scan_success();
+                    self.state.clear_failures();
                 }
                 Ok(ScanOutcome::DestinationUnreachable) => {
                     self.reachability

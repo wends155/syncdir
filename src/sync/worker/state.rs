@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 /// Tracks per-path sync failure counts with bounded capacity.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct FailureTracker {
     capacity: usize,
     counts: HashMap<PathBuf, u32>,
@@ -14,17 +13,35 @@ pub(crate) struct FailureTracker {
 #[allow(dead_code)]
 impl FailureTracker {
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            capacity: capacity.max(1),
-            counts: HashMap::new(),
-            order: VecDeque::new(),
+            capacity,
+            counts: HashMap::with_capacity(capacity.min(5000)),
+            order: VecDeque::with_capacity(capacity.min(5000)),
         }
     }
 
     pub fn record_failure(&mut self, path: &Path) -> u32 {
-        let entry = self.counts.entry(path.to_path_buf()).or_insert(0);
-        *entry += 1;
-        *entry
+        if let Some(count) = self.counts.get_mut(path) {
+            *count += 1;
+            return *count;
+        }
+
+        if self.counts.len() >= self.capacity {
+            while let Some(oldest) = self.order.pop_front() {
+                if self.counts.remove(&oldest).is_some() {
+                    break;
+                }
+            }
+        }
+
+        self.counts.insert(path.to_path_buf(), 1);
+        self.order.push_back(path.to_path_buf());
+
+        if self.order.len() > self.capacity * 2 {
+            self.order.retain(|p| self.counts.contains_key(p));
+        }
+        1
     }
 
     pub fn reset_failure(&mut self, path: &Path) {
@@ -36,8 +53,8 @@ impl FailureTracker {
         self.order.clear();
     }
 
-    pub fn get(&self, path: &Path) -> Option<u32> {
-        self.counts.get(path).copied()
+    pub fn get(&self, path: &Path) -> Option<&u32> {
+        self.counts.get(path)
     }
 
     pub fn contains_key(&self, path: &Path) -> bool {

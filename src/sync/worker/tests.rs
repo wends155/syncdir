@@ -1200,3 +1200,276 @@ fn test_sync_worker_catchup_scan_failure_applies_backoff() {
     assert_eq!(outcome_expired, WorkerTickOutcome::Continue);
     assert_eq!(engine.full_scans_count(), 2);
 }
+
+#[test]
+fn test_sync_worker_trigger_full_scan_clears_needs_catchup_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(2)
+        .retry_interval_seconds(5)
+        .build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mock_resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+
+    let ctx = SyncWorkerContext::builder(0, target_config, engine.clone(), rx, source_online)
+        .resolver(mock_resolver)
+        .build()
+        .unwrap();
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    runner.state.mark_needs_catchup_scan();
+    runner
+        .state
+        .record_catchup_scan_failure(Instant::now(), Duration::from_secs(5));
+    assert!(runner.state.needs_catchup_scan());
+
+    let cont = runner.handle_command(SyncCommand::TriggerFullScan);
+    assert!(cont);
+    assert_eq!(engine.full_scans_count(), 1);
+
+    assert!(
+        !runner.state.needs_catchup_scan(),
+        "needs_catchup_scan must be cleared to false following successful TriggerFullScan"
+    );
+    assert_eq!(
+        runner.state.catchup_scan_failures, 0,
+        "catchup_scan_failures must be reset to zero upon successful TriggerFullScan"
+    );
+    assert!(
+        runner.state.next_catchup_scan_attempt.is_none(),
+        "next_catchup_scan_attempt deadline must be reset to None upon successful TriggerFullScan"
+    );
+}
+
+#[test]
+fn test_sync_worker_destination_reconnect_clears_needs_catchup_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(2)
+        .retry_interval_seconds(1)
+        .build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mock_resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+
+    let ctx = SyncWorkerContext::builder(0, target_config, engine.clone(), rx, source_online)
+        .resolver(mock_resolver)
+        .build()
+        .unwrap();
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    runner.reachability.mark_offline(None);
+    assert!(!runner.reachability.is_dest_online());
+    runner.state.mark_needs_catchup_scan();
+    runner
+        .state
+        .record_catchup_scan_failure(Instant::now(), Duration::from_secs(5));
+    assert!(runner.state.needs_catchup_scan());
+
+    let t_reconnect = Instant::now() + Duration::from_secs(10);
+    let outcome = runner.tick(t_reconnect).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+    assert!(runner.reachability.is_dest_online());
+    assert_eq!(engine.full_scans_count(), 1);
+
+    assert!(
+        !runner.state.needs_catchup_scan(),
+        "needs_catchup_scan must be cleared to false following successful destination reconnect scan"
+    );
+    assert_eq!(
+        runner.state.catchup_scan_failures, 0,
+        "catchup_scan_failures must be reset to zero upon successful destination reconnect scan"
+    );
+    assert!(
+        runner.state.next_catchup_scan_attempt.is_none(),
+        "next_catchup_scan_attempt must be cleared to None upon successful reconnect scan"
+    );
+}
+
+#[test]
+fn test_failure_tracker_bounded_capacity_and_oldest_eviction() {
+    let mut tracker = FailureTracker::new(5);
+    for i in 0..5 {
+        let p = PathBuf::from(format!("file_{}.txt", i));
+        assert_eq!(tracker.record_failure(&p), 1);
+    }
+    assert_eq!(tracker.len(), 5);
+
+    let p_new = PathBuf::from("file_5.txt");
+    assert_eq!(tracker.record_failure(&p_new), 1);
+    assert_eq!(tracker.len(), 5);
+    assert_eq!(
+        tracker.get(Path::new("file_0.txt")),
+        None,
+        "Oldest entry file_0.txt must be evicted when capacity exceeds 5"
+    );
+    assert_eq!(
+        tracker.get(Path::new("file_5.txt")),
+        Some(&1),
+        "Newest entry file_5.txt must be present in tracker"
+    );
+
+    let mut prod_tracker = FailureTracker::new(5000);
+    for i in 0..5000 {
+        let p = PathBuf::from(format!("batch/item_{}.bin", i));
+        prod_tracker.record_failure(&p);
+    }
+    assert_eq!(prod_tracker.len(), 5000);
+
+    let p_overflow = PathBuf::from("batch/item_overflow.bin");
+    prod_tracker.record_failure(&p_overflow);
+    assert_eq!(prod_tracker.len(), 5000);
+    assert_eq!(
+        prod_tracker.get(Path::new("batch/item_0.bin")),
+        None,
+        "batch/item_0.bin must be evicted at 5,000 capacity boundary"
+    );
+    assert_eq!(
+        prod_tracker.get(Path::new("batch/item_overflow.bin")),
+        Some(&1)
+    );
+}
+
+#[test]
+fn test_failure_tracker_cleared_on_full_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(1)
+        .retry_interval_seconds(5)
+        .build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mock_resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+
+    let ctx = SyncWorkerContext::builder(0, target_config, engine.clone(), rx, source_online)
+        .resolver(mock_resolver)
+        .build()
+        .unwrap();
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    runner.state.record_failure(Path::new("err1.txt"));
+    runner.state.record_failure(Path::new("err2.txt"));
+    runner.state.record_failure(Path::new("err3.txt"));
+    assert_eq!(runner.state.failure_tracker.len(), 3);
+
+    runner.handle_command(SyncCommand::TriggerFullScan);
+    assert_eq!(engine.full_scans_count(), 1);
+
+    assert!(
+        runner.state.failure_tracker.is_empty(),
+        "failure_tracker must be completely emptied upon successful full scan execution"
+    );
+}
+
+#[test]
+fn test_failure_tracker_reset_on_successful_sync() {
+    let mut tracker = FailureTracker::new(5000);
+    let p = PathBuf::from("data.txt");
+
+    tracker.record_failure(&p);
+    tracker.record_failure(&p);
+    assert_eq!(tracker.get(&p), Some(&2));
+
+    tracker.reset_failure(&p);
+    assert_eq!(tracker.get(&p), None);
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn test_sync_worker_network_offline_io_routed_to_network_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(1)
+        .retry_interval_seconds(2)
+        .build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    engine.set_sync_error(|| SyncError::Io(std::io::Error::from_raw_os_error(64)));
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mock_resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+
+    let ctx = SyncWorkerContext::builder(0, target_config, engine.clone(), rx, source_online)
+        .resolver(mock_resolver)
+        .build()
+        .unwrap();
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    runner.handle_command(SyncCommand::FileModified(
+        crate::path_util::RelativePath::new("test.txt").unwrap(),
+    ));
+
+    let t0 = Instant::now() + Duration::from_secs(2);
+    let outcome = runner.tick(t0).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+
+    assert!(
+        !runner.reachability.is_dest_online(),
+        "Destination must be marked offline by network offline handler"
+    );
+    assert_eq!(
+        runner.state.failure_tracker.get(Path::new("test.txt")),
+        None,
+        "Network offline errors must be requeued without incrementing generic IO failure attempts"
+    );
+}
+
+#[test]
+fn test_sync_worker_context_builder_accepts_injected_resolver() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::builder(dir.path().join("src"))
+        .dest_dir(dir.path().join("dst"))
+        .build_unvalidated();
+    let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mock_resolver: std::sync::Arc<dyn crate::net::NetworkResolver> =
+        std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+
+    let ctx = SyncWorkerContext::builder(0, target_cfg, engine, rx, source_online)
+        .resolver(mock_resolver.clone())
+        .build()
+        .expect("Context builder with injected resolver must succeed");
+
+    assert!(
+        std::sync::Arc::ptr_eq(ctx.resolver(), &mock_resolver),
+        "Injected network resolver must be preserved on SyncWorkerContext"
+    );
+}
