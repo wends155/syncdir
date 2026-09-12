@@ -1,3 +1,49 @@
+//! Windows Resource Compilation and SDK Discovery Build Script for `syncdir`.
+//!
+//! # Purpose & Architecture
+//! This build script embeds the application icon (`syncdir.ico`) and PE application
+//! manifest into `syncdir.exe` when targeting Windows. Embedding the application manifest
+//! ensures explicit execution identity (`asInvoker`), preventing legacy Windows UAC File and
+//! Registry Virtualization (CWE-390 / CWE-250) where filesystem writes might otherwise be
+//! redirected silently to `%LocalAppData%\VirtualStore`.
+//!
+//! # 4-Tier Dynamic SDK Discovery Precedence
+//! Rather than relying solely on ambient Windows registry keys (which fail in portable MSVC
+//! or non-administrator developer environments with OS error 3), this script evaluates a
+//! deterministic 4-tier discovery hierarchy:
+//!
+//! 1. **Tier 1 (`WINRES_TOOLKIT_PATH`):** Direct toolkit folder override containing `rc.exe`
+//!    or `windres.exe`.
+//! 2. **Tier 2 (`RC_PATH`):** Direct path pointing either to the `rc.exe` / `windres.exe` binary
+//!    or to the enclosing directory containing the compiler.
+//! 3. **Tier 3 (`WINDOWS_SDK_PATH`):** Root directory of a Windows SDK / Kits installation.
+//!    Probes deterministic candidate paths: `bin/x64/rc.exe`, `bin/x86/rc.exe`, `bin/rc.exe`, `rc.exe`.
+//! 4. **Tier 4 (Ambient Auto-Discovery):** Returns `None` to delegate to `winres` default
+//!    registry probing (`HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`) and system PATH.
+//!
+//! # Defensive Asset Validation
+//! Prior to invoking `winres`, `syncdir.ico` is inspected via single-handle file metadata:
+//! - File presence and regular file verification (`is_file`).
+//! - Bounded size check: `0 < size <= 524,288` bytes (512 KB maximum to accommodate multi-res DIB).
+//! - 6-byte ICO header validation: `reserved == 0`, `resource_type == 1` (ICO), and `image_count >= 1`.
+//!
+//! # Path Safety & Subprocess Confinement (CWE-426 / CWE-427)
+//! All user-supplied directory paths from environment variables are validated by `validate_path_safety`
+//! to ensure they contain no null bytes, control characters, or unescaped quotes.
+//!
+//! # Error Policy & CI Escape Hatch
+//! - **Release Builds (`PROFILE == "release"`):** Fail-closed policy. Compilation failures print an
+//!   actionable 5-point remediation box to `stderr` and terminate with `std::process::exit(1)`.
+//!   Raw `panic!` is strictly avoided to maintain compliance with repository quality gates.
+//! - **Debug Builds (`PROFILE == "debug"`):** Permissive policy. Emits actionable `cargo:warning`.
+//! - **CI Escape Hatch (`SYNCDIR_ALLOW_MISSING_ICON=1`):** Overrides fail-closed behavior on release
+//!   builds in headless or minimal container environments lacking the Windows SDK.
+//!
+//! # Invalidation Directives
+//! Cargo is notified to re-evaluate this script whenever `syncdir.ico` is modified or any of the
+//! configuration environment variables (`WINRES_TOOLKIT_PATH`, `RC_PATH`, `WINDOWS_SDK_PATH`,
+//! `SYNCDIR_ALLOW_MISSING_ICON`) change.
+
 use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq)]
