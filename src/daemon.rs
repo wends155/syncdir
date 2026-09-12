@@ -12,20 +12,26 @@ use crate::sync::{
     start_sync_worker,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 /// Handle for dispatching asynchronous control commands to a running `SyncDaemon`.
 #[derive(Clone)]
 pub struct DaemonHandle {
-    command_tx: Sender<SyncCommand>,
+    command_tx: Arc<Mutex<Option<Sender<SyncCommand>>>>,
 }
 
 impl DaemonHandle {
     /// Create a new daemon handle wrapping the given command sender.
     pub fn new(command_tx: Sender<SyncCommand>) -> Self {
+        Self {
+            command_tx: Arc::new(Mutex::new(Some(command_tx))),
+        }
+    }
+
+    pub(crate) fn from_shared(command_tx: Arc<Mutex<Option<Sender<SyncCommand>>>>) -> Self {
         Self { command_tx }
     }
 
@@ -35,9 +41,16 @@ impl DaemonHandle {
     ///
     /// Returns [`SyncError::Tray`] if the internal worker channel has disconnected.
     pub fn trigger_full_scan(&self) -> Result<(), SyncError> {
-        self.command_tx
-            .send(SyncCommand::TriggerFullScan)
-            .map_err(|e| SyncError::tray_with_source("Sync worker channel disconnected", e))
+        let slot = self
+            .command_tx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match slot.as_ref() {
+            Some(tx) => tx
+                .send(SyncCommand::TriggerFullScan)
+                .map_err(|e| SyncError::tray_with_source("Sync worker channel disconnected", e)),
+            None => Err(SyncError::tray("Sync worker channel disconnected")),
+        }
     }
 }
 
@@ -118,7 +131,7 @@ pub struct SyncDaemon {
     worker_handles: Vec<JoinHandle<()>>,
     shutdown_flag: Arc<AtomicBool>,
     cancellation: Arc<AtomicBool>,
-    command_tx: Sender<SyncCommand>,
+    handle_slot: Arc<Mutex<Option<Sender<SyncCommand>>>>,
     watcher_active: Arc<AtomicBool>,
     watcher_signal_tx: Option<Sender<WatcherSignal>>,
 }
@@ -332,7 +345,6 @@ impl SyncDaemon {
     fn spawn_command_broadcaster(
         command_rx: std::sync::mpsc::Receiver<SyncCommand>,
         mut worker_senders: Vec<Sender<SyncCommand>>,
-        shutdown_flag: Arc<AtomicBool>,
     ) -> Result<JoinHandle<()>, SyncError> {
         let parent_span = tracing::Span::current();
         let broadcaster_span = tracing::info_span!(
@@ -346,32 +358,25 @@ impl SyncDaemon {
             .spawn(move || {
                 let _dispatch_guard = tracing::dispatcher::set_default(&dispatcher);
                 let _span_guard = broadcaster_span.entered();
-                while !shutdown_flag.load(Ordering::Relaxed) {
-                    match command_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                        Ok(mut cmd) => {
-                            let count = worker_senders.len();
-                            let mut failed = Vec::new();
-                            for (i, tx) in worker_senders.iter().enumerate() {
-                                let to_send = if i + 1 == count {
-                                    std::mem::replace(&mut cmd, SyncCommand::TriggerFullScan)
-                                } else {
-                                    cmd.clone()
-                                };
-                                if tx.send(to_send).is_err() {
-                                    tracing::warn!(
-                                        "Sync worker channel disconnected. Removing sender."
-                                    );
-                                    failed.push(i);
-                                }
-                            }
-                            for &i in failed.iter().rev() {
-                                worker_senders.swap_remove(i);
-                            }
+                while let Ok(mut cmd) = command_rx.recv() {
+                    let count = worker_senders.len();
+                    let mut failed = Vec::new();
+                    for (i, tx) in worker_senders.iter().enumerate() {
+                        let to_send = if i + 1 == count {
+                            std::mem::replace(&mut cmd, SyncCommand::TriggerFullScan)
+                        } else {
+                            cmd.clone()
+                        };
+                        if tx.send(to_send).is_err() {
+                            tracing::warn!("Sync worker channel disconnected. Removing sender.");
+                            failed.push(i);
                         }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    for &i in failed.iter().rev() {
+                        worker_senders.swap_remove(i);
                     }
                 }
+                tracing::info!("Command broadcaster exiting (all senders disconnected).");
             })
             .map_err(SyncError::Io)
     }
@@ -599,9 +604,10 @@ impl SyncDaemon {
             watcher_signal_rx,
         )?;
 
+        let handle_slot = Arc::new(Mutex::new(Some(tx)));
+
         // Spawn central broadcaster thread
-        let broadcaster_handle =
-            Self::spawn_command_broadcaster(rx, worker_txs, shutdown_flag.clone())?;
+        let broadcaster_handle = Self::spawn_command_broadcaster(rx, worker_txs)?;
 
         Ok(Self {
             config,
@@ -610,7 +616,7 @@ impl SyncDaemon {
             worker_handles,
             shutdown_flag,
             cancellation,
-            command_tx: tx,
+            handle_slot,
             watcher_active,
             watcher_signal_tx: Some(watcher_signal_tx),
         })
@@ -618,7 +624,7 @@ impl SyncDaemon {
 
     /// Create a handle for dispatching commands to this daemon.
     pub fn handle(&self) -> DaemonHandle {
-        DaemonHandle::new(self.command_tx.clone())
+        DaemonHandle::from_shared(self.handle_slot.clone())
     }
 
     /// Trigger an immediate full synchronization scan across all targets.
@@ -650,11 +656,19 @@ impl SyncDaemon {
             if let Some(signal_tx) = self.watcher_signal_tx.take() {
                 let _ = signal_tx.send(WatcherSignal::Shutdown);
             }
+            // Invalidate sender slot BEFORE joining broadcaster so all senders drop and recv() exits
+            {
+                let mut slot = self
+                    .handle_slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let _ = slot.take();
+            }
             // Step 1: Join watcher thread first so no new events are generated
             if let Some(handle) = self.watcher_handle.take() {
                 join_thread_and_log_panic(handle, "watcher-coordinator");
             }
-            // Step 2: Join broadcaster thread so in-flight commands are distributed
+            // Step 2: Join broadcaster thread (now unblocked on channel disconnect)
             if let Some(handle) = self.broadcaster_handle.take() {
                 join_thread_and_log_panic(handle, "command-broadcaster");
             }
@@ -1107,5 +1121,66 @@ mod tests {
             log_output.contains("Watcher coordinator thread exiting on shutdown signal"),
             "Missing structured shutdown exit log event in logs: {log_output}"
         );
+    }
+
+    #[test]
+    fn test_spawn_command_broadcaster_event_driven_distribution_and_termination() {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (w1_tx, w1_rx) = std::sync::mpsc::channel();
+        let (w2_tx, w2_rx) = std::sync::mpsc::channel();
+
+        let handle = SyncDaemon::spawn_command_broadcaster(cmd_rx, vec![w1_tx, w2_tx])
+            .expect("Broadcaster thread must spawn successfully");
+
+        // 1. Event-driven immediate command distribution (zero artificial sleep)
+        let test_cmd =
+            SyncCommand::FileModified(crate::path_util::RelativePath::new("event.txt").unwrap());
+        let t_start = std::time::Instant::now();
+        cmd_tx.send(test_cmd.clone()).unwrap();
+
+        let r1 = w1_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .expect("w1 receives command immediately");
+        let r2 = w2_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .expect("w2 receives command immediately");
+        assert!(
+            t_start.elapsed() < std::time::Duration::from_millis(50),
+            "Command broadcast must be event-driven with sub-50ms distribution latency"
+        );
+        assert_eq!(r1, test_cmd);
+        assert_eq!(r2, test_cmd);
+
+        // 2. Channel closure terminates thread immediately without waiting for timeouts
+        let t_close = std::time::Instant::now();
+        drop(cmd_tx);
+
+        handle
+            .join()
+            .expect("Broadcaster thread must join cleanly without panicking");
+        let elapsed = t_close.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "Broadcaster thread must terminate immediately upon channel closure, took: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_daemon_handle_invalidation_on_shutdown() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let config = Config::builder(src).dest_dir(dst).build().unwrap();
+        let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
+        let handle = daemon.handle();
+
+        assert!(handle.trigger_full_scan().is_ok());
+
+        daemon.shutdown();
+
+        assert!(handle.trigger_full_scan().is_err());
     }
 }
