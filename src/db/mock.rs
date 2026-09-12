@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 /// Type alias for error hook injected into `MockHashStore`.
+#[doc(hidden)]
 pub type MockStoreErrorHook = Box<dyn Fn(&str) -> Option<SyncError> + Send + Sync>;
 
 #[derive(Default)]
@@ -37,6 +38,7 @@ impl std::fmt::Debug for MockStoreInner {
 }
 
 /// In-memory implementation of `HashStore` for fast, isolated unit testing.
+#[doc(hidden)]
 #[derive(Debug, Default, Clone)]
 pub struct MockHashStore {
     inner: Arc<RwLock<MockStoreInner>>,

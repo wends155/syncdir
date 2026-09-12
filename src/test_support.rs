@@ -1,6 +1,15 @@
-//! Shared test support utilities for tracing capture and verification.
+//! Shared test support utilities and canonical in-memory test doubles.
 
 use std::sync::{Arc, Mutex};
+
+#[doc(hidden)]
+pub use crate::db::{MockHashStore, MockStoreErrorHook};
+#[doc(hidden)]
+pub use crate::net::MockNetworkResolver;
+#[doc(hidden)]
+pub use crate::startup::MockStartupRegistry;
+#[doc(hidden)]
+pub use crate::sync::{MockSyncEngine, MockSyncStatusObserver};
 
 /// In-memory thread-safe buffer capturing tracing subscriber output.
 #[doc(hidden)]
@@ -66,4 +75,38 @@ where
 
     let result = tracing::subscriber::with_default(subscriber, f);
     (result, buffer.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::traits::HashStore;
+    use crate::net::NetworkResolver;
+    use crate::startup::RegistryBackend;
+    use std::path::Path;
+
+    #[test]
+    fn test_mock_hash_store_export_and_initialization() {
+        let store = MockHashStore::new();
+        let files = store.list_files().expect("mock store list files");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_mock_sync_engine_export_and_initialization() {
+        let engine = MockSyncEngine::new();
+        assert_eq!(engine.synced_calls().len(), 0);
+    }
+
+    #[test]
+    fn test_mock_network_resolver_export_and_initialization() {
+        let resolver = MockNetworkResolver::new();
+        assert!(resolver.is_destination_accessible(Path::new(r"\\server\share")));
+    }
+
+    #[test]
+    fn test_mock_startup_registry_export_and_initialization() {
+        let registry = MockStartupRegistry::new(false);
+        assert!(!registry.is_registered().expect("registry check"));
+    }
 }

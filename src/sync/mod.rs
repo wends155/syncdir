@@ -20,6 +20,7 @@ pub use full_scan::{FullScanCoordinator, FullScanDriver};
 
 pub use delta::DirtyBlockRange;
 pub use engine::{LocalSyncEngine, SyncCommand};
+#[doc(hidden)]
 pub use mock::{MockSyncEngine, MockSyncStatusObserver};
 pub use path_safety::{ReparseCache, is_safe_relative_path};
 #[allow(deprecated)]

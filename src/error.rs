@@ -45,6 +45,7 @@ impl ValidationKind {
 }
 
 /// Subsystem error type for directory watching and filesystem notification failures.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum WatcherError {
     /// Failure originated from the underlying `notify` watcher.
@@ -435,11 +436,12 @@ impl SyncError {
         }
     }
 
-    /// Returns `true` if the error represents an I/O `NotFound` condition.
+    /// Returns `true` if the error represents an I/O or watched path `NotFound` condition.
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         match self {
             SyncError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+            SyncError::Watcher(WatcherError::PathNotFound(_)) => true,
             _ => false,
         }
     }
@@ -762,5 +764,36 @@ mod tests {
 
         let config_err = SyncError::config("bad config");
         assert!(!config_err.is_not_found());
+    }
+
+    #[test]
+    fn test_watcher_error_non_exhaustive_and_construction() {
+        let err_path =
+            WatcherError::PathNotFound(std::path::PathBuf::from(r"C:\Missing\WatchedDir"));
+        let err_chan = WatcherError::ChannelDisconnected("Worker channel closed".to_string());
+        let err_other = WatcherError::Other("General watch failure".to_string(), None);
+
+        #[allow(unreachable_patterns)]
+        let desc = match &err_path {
+            WatcherError::Notify(_) => "notify",
+            WatcherError::PathNotFound(p) => {
+                assert_eq!(p, &std::path::PathBuf::from(r"C:\Missing\WatchedDir"));
+                "not_found"
+            }
+            WatcherError::ChannelDisconnected(_) => "disconnected",
+            WatcherError::Other(msg, _) => {
+                assert!(!msg.is_empty());
+                "other"
+            }
+            _ => "future_variant",
+        };
+        assert_eq!(desc, "not_found");
+
+        assert!(format!("{}", err_chan).contains("Watcher channel disconnected"));
+        assert!(format!("{}", err_other).contains("Watcher error"));
+
+        let sync_err: SyncError = err_path.into();
+        assert!(sync_err.is_not_found());
+        assert!(format!("{}", sync_err).contains("Watched path not found"));
     }
 }

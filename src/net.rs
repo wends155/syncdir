@@ -69,6 +69,7 @@ impl Default for MockNetworkInner {
 }
 
 /// In-memory mock network resolver for testing without network dependencies.
+#[doc(hidden)]
 #[derive(Debug, Default, Clone)]
 pub struct MockNetworkResolver {
     inner: std::sync::Arc<std::sync::Mutex<MockNetworkInner>>,

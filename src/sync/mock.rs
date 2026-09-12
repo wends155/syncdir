@@ -9,6 +9,7 @@ type SyncErrorFactory = std::sync::Arc<dyn Fn() -> SyncError + Send + Sync>;
 type SyncHandler = std::sync::Arc<dyn Fn(&Path) -> Result<(), SyncError> + Send + Sync>;
 
 /// Thread-safe mock implementation of `SyncEngine` for isolated unit testing.
+#[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct MockSyncEngine {
     synced_calls: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
@@ -351,6 +352,7 @@ impl ArchiveEngine for MockSyncEngine {
 impl SyncEngine for MockSyncEngine {}
 
 /// Thread-safe mock implementation of `SyncStatusObserver` for worker state machine testing.
+#[doc(hidden)]
 #[derive(Default, Clone)]
 pub struct MockSyncStatusObserver {
     target_statuses: std::sync::Arc<std::sync::Mutex<Vec<(usize, crate::sync::ConnectivityState)>>>,

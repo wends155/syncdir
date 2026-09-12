@@ -130,6 +130,7 @@ pub trait RegistryBackend {
 }
 
 /// In-memory mock startup registry for cross-platform unit testing.
+#[doc(hidden)]
 #[derive(Debug, Default, Clone)]
 pub struct MockStartupRegistry {
     registered: std::sync::Arc<std::sync::Mutex<bool>>,

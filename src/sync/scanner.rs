@@ -21,14 +21,14 @@ pub(crate) fn scan_dir_cancellable(
     }
     const MAX_DEPTH: usize = 64;
     if depth > MAX_DEPTH {
-        tracing::warn!(path = %dir.display(), "Max directory depth exceeded, skipping");
+        tracing::warn!(path = ?dir, "Max directory depth exceeded, skipping");
         *scan_complete = false;
         return Ok(());
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::warn!(path = %dir.display(), error = %e, "Permission denied scanning directory; skipping");
+            tracing::warn!(path = ?dir, error = %e, "Permission denied scanning directory; skipping");
             *scan_complete = false;
             return Ok(());
         }
@@ -50,7 +50,7 @@ pub(crate) fn scan_dir_cancellable(
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::warn!(dir = %dir.display(), error = %e, "Permission denied querying file type; skipping");
+                tracing::warn!(dir = ?dir, error = %e, "Permission denied querying file type; skipping");
                 *scan_complete = false;
                 continue;
             }
@@ -62,12 +62,12 @@ pub(crate) fn scan_dir_cancellable(
         let path = entry.path();
         match is_reparse_or_symlink(&entry, &path) {
             Ok(true) => {
-                tracing::debug!(path = %path.display(), "Skipping reparse point or symlink in scan");
+                tracing::debug!(path = ?path, "Skipping reparse point or symlink in scan");
                 continue;
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "Failed checking reparse point; skipping entry and marking scan incomplete");
+                tracing::warn!(path = ?path, error = %e, "Failed checking reparse point; skipping entry and marking scan incomplete");
                 *scan_complete = false;
                 continue;
             }
@@ -119,7 +119,7 @@ impl DirectoryScanner {
     /// Perform a cancellable scan of the source directory, populating `files` with relative paths.
     #[tracing::instrument(
         skip(self, files, scan_complete, cancel),
-        fields(source_root = %source_root.display()),
+        fields(source_root = ?source_root),
         level = "debug"
     )]
     pub(crate) fn scan_dir_cancellable(
@@ -295,6 +295,31 @@ mod tests {
                 .iter()
                 .any(|p| p.to_string_lossy().contains("secret_data")),
             "Directory scanner must strictly ignore files located behind reparse junctions"
+        );
+    }
+
+    #[test]
+    fn test_scanner_logs_use_debug_path_formatting_cwe_117() {
+        use crate::test_support::with_captured_tracing;
+        use std::collections::HashSet;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut files = HashSet::new();
+        let mut scan_complete = true;
+
+        let (_, logs) = with_captured_tracing(|| {
+            // Depth 65 exceeds MAX_DEPTH (64) triggering depth warning
+            let _ = scan_dir(temp.path(), temp.path(), &mut files, &mut scan_complete, 65);
+        });
+
+        assert!(
+            logs.contains("path = \"") || logs.contains("path=\""),
+            "Scanner logs must format path using Debug (?dir / ?path) to quote and escape CRLF injection, got: {}",
+            logs
+        );
+        assert!(
+            !logs.contains("\r\n"),
+            "Logs must not contain unescaped CRLF line breaks"
         );
     }
 }

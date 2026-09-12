@@ -26,6 +26,63 @@ fn parse_archive_timestamp(name: &str) -> Option<SystemTime> {
 /// Maximum candidate files evaluated per archive pruning cycle to bound memory and I/O.
 pub(crate) const MAX_ARCHIVE_PRUNE_CANDIDATES: usize = 5000;
 
+pub(crate) fn collect_files(
+    dir: &Path,
+    files: &mut Vec<(PathBuf, u64, SystemTime)>,
+    total_bytes: &mut u64,
+    inherited_time: Option<SystemTime>,
+    depth: usize,
+) -> std::io::Result<()> {
+    const MAX_ARCHIVE_DEPTH: usize = 32;
+    if depth > MAX_ARCHIVE_DEPTH || files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
+        if depth > MAX_ARCHIVE_DEPTH {
+            tracing::warn!(path = ?dir, "Max archive directory depth exceeded, skipping");
+        }
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        if files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
+            break;
+        }
+        let entry = entry?;
+        let path = entry.path();
+        match is_reparse_or_symlink(&entry, &path) {
+            Ok(true) => {
+                tracing::debug!(path = ?path, "Skipping reparse point or symlink in archive");
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(path = ?path, error = %e, "Failed checking reparse point; skipping");
+                continue;
+            }
+        }
+        let ft = entry.file_type()?;
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        let parsed_time = parse_archive_timestamp(&name_str);
+
+        if ft.is_dir() {
+            let next_inherited = parsed_time.or(inherited_time);
+            collect_files(&path, files, total_bytes, next_inherited, depth + 1)?;
+            if files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
+                break;
+            }
+        } else if ft.is_file()
+            && let Ok(meta) = entry.metadata()
+        {
+            let len = meta.len();
+            let archive_time = parsed_time
+                .or(inherited_time)
+                .or_else(|| meta.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            *total_bytes += len;
+            files.push((path, len, archive_time));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn prune_archive(
     archive_dir: &Path,
     max_age_days: u64,
@@ -47,63 +104,6 @@ pub(crate) fn prune_archive(
 
     let mut files = Vec::new();
     let mut total_bytes = 0u64;
-
-    fn collect_files(
-        dir: &Path,
-        files: &mut Vec<(PathBuf, u64, SystemTime)>,
-        total_bytes: &mut u64,
-        inherited_time: Option<SystemTime>,
-        depth: usize,
-    ) -> std::io::Result<()> {
-        const MAX_ARCHIVE_DEPTH: usize = 32;
-        if depth > MAX_ARCHIVE_DEPTH || files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
-            if depth > MAX_ARCHIVE_DEPTH {
-                tracing::warn!(path = %dir.display(), "Max archive directory depth exceeded, skipping");
-            }
-            return Ok(());
-        }
-        for entry in fs::read_dir(dir)? {
-            if files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
-                break;
-            }
-            let entry = entry?;
-            let path = entry.path();
-            match is_reparse_or_symlink(&entry, &path) {
-                Ok(true) => {
-                    tracing::debug!(path = %path.display(), "Skipping reparse point or symlink in archive");
-                    continue;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Failed checking reparse point; skipping");
-                    continue;
-                }
-            }
-            let ft = entry.file_type()?;
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-            let parsed_time = parse_archive_timestamp(&name_str);
-
-            if ft.is_dir() {
-                let next_inherited = parsed_time.or(inherited_time);
-                collect_files(&path, files, total_bytes, next_inherited, depth + 1)?;
-                if files.len() >= MAX_ARCHIVE_PRUNE_CANDIDATES {
-                    break;
-                }
-            } else if ft.is_file()
-                && let Ok(meta) = entry.metadata()
-            {
-                let len = meta.len();
-                let archive_time = parsed_time
-                    .or(inherited_time)
-                    .or_else(|| meta.modified().ok())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                *total_bytes += len;
-                files.push((path, len, archive_time));
-            }
-        }
-        Ok(())
-    }
 
     let _ = collect_files(archive_dir, &mut files, &mut total_bytes, None, 0);
 
@@ -256,7 +256,7 @@ impl ArchiveManager {
     /// Prune old and excess files in the destination archive.
     #[tracing::instrument(
         skip(self),
-        fields(dest_dir = %dest_dir.display()),
+        fields(dest_dir = ?dest_dir),
         level = "debug"
     )]
     pub(crate) fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
@@ -736,5 +736,29 @@ mod tests {
         let res = prune_archive(&archive_dir, 0, 1024 * 1024);
         assert!(res.is_ok());
         assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_archive_logs_use_debug_path_formatting_cwe_117() {
+        use crate::test_support::with_captured_tracing;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut files = Vec::new();
+        let mut total_bytes = 0u64;
+
+        let (_, logs) = with_captured_tracing(|| {
+            // Depth 33 exceeds MAX_ARCHIVE_DEPTH (32) triggering depth warning
+            let _ = collect_files(temp.path(), &mut files, &mut total_bytes, None, 33);
+        });
+
+        assert!(
+            logs.contains("path = \"") || logs.contains("path=\""),
+            "Archive logs must format path using Debug (?dir / ?path) to quote and escape CRLF injection, got: {}",
+            logs
+        );
+        assert!(
+            !logs.contains("\r\n"),
+            "Logs must not contain unescaped CRLF line breaks"
+        );
     }
 }
