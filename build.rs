@@ -31,7 +31,35 @@ impl std::fmt::Display for BuildResourceError {
 
 impl std::error::Error for BuildResourceError {}
 
-pub fn validate_icon_bytes(_bytes: &[u8]) -> Result<(), BuildResourceError> {
+pub fn validate_icon_bytes(bytes: &[u8]) -> Result<(), BuildResourceError> {
+    if bytes.len() < 6 {
+        return Err(BuildResourceError::IconInvalid(format!(
+            "Icon header too short: expected 6 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let reserved = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if reserved != 0 {
+        return Err(BuildResourceError::IconInvalid(format!(
+            "Invalid ICO reserved word: expected 0, got {reserved}"
+        )));
+    }
+    let res_type = u16::from_le_bytes([bytes[2], bytes[3]]);
+    if res_type != 1 {
+        return Err(BuildResourceError::IconInvalid(format!(
+            "Invalid ICO resource type: expected 1, got {res_type}"
+        )));
+    }
+    let image_count = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if image_count == 0 {
+        return Err(BuildResourceError::IconInvalid(
+            "Invalid ICO file: image directory contains zero images".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_icon_asset(_path: &std::path::Path) -> Result<(), BuildResourceError> {
     Err(BuildResourceError::IconInvalid("Stub".into()))
 }
 

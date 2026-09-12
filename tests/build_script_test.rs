@@ -45,3 +45,37 @@ fn test_validate_icon_bytes_zero_images() {
         Err(BuildResourceError::IconInvalid(_))
     ));
 }
+
+use build_script::validate_icon_asset;
+use std::io::Write;
+
+#[test]
+fn test_validate_icon_asset_not_found() {
+    let non_existent = std::path::PathBuf::from("non_existent_path_12345.ico");
+    assert_eq!(
+        validate_icon_asset(&non_existent),
+        Err(BuildResourceError::IconNotFound(non_existent))
+    );
+}
+
+#[test]
+fn test_validate_icon_asset_valid_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test_icon.ico");
+    let mut file = std::fs::File::create(&file_path).unwrap();
+    file.write_all(&[0x00, 0x00, 0x01, 0x00, 0x01, 0x00]).unwrap();
+    assert_eq!(validate_icon_asset(&file_path), Ok(()));
+}
+
+#[test]
+fn test_validate_icon_asset_too_large() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("large_icon.ico");
+    let mut file = std::fs::File::create(&file_path).unwrap();
+    let large_buf = vec![0u8; 524_289]; // 512KB + 1 byte
+    file.write_all(&large_buf).unwrap();
+    assert!(matches!(
+        validate_icon_asset(&file_path),
+        Err(BuildResourceError::IconInvalid(_))
+    ));
+}
