@@ -181,11 +181,100 @@ impl ResourceBuildConfig {
         self.resolve_toolkit_dir_with(|p| p.exists())
     }
 
-    pub fn resolve_toolkit_dir_with<F>(&self, _checker: F) -> Result<Option<std::path::PathBuf>, BuildResourceError>
+    pub fn resolve_toolkit_dir_with<F>(
+        &self,
+        checker: F,
+    ) -> Result<Option<std::path::PathBuf>, BuildResourceError>
     where
         F: Fn(&std::path::Path) -> bool,
     {
+        // Tier 1: Explicit toolkit directory override
+        if let Some(ref path) = self.winres_toolkit_path {
+            validate_path_safety(path)?;
+            if checker(path) {
+                return Ok(Some(path.clone()));
+            }
+            println!(
+                "cargo:warning=WINRES_TOOLKIT_PATH ('{}') does not exist or is invalid; falling back.",
+                path.display()
+            );
+        }
+
+        // Tier 2: Explicit resource compiler executable or enclosing directory
+        if let Some(ref path) = self.rc_path {
+            validate_path_safety(path)?;
+            if let Some(resolved) = Self::resolve_rc_path_with(path, &checker) {
+                return Ok(Some(resolved));
+            }
+            println!(
+                "cargo:warning=RC_PATH ('{}') does not exist or is invalid; falling back.",
+                path.display()
+            );
+        }
+
+        // Tier 3: Windows SDK root probing
+        if let Some(ref root) = self.windows_sdk_path {
+            validate_path_safety(root)?;
+            if let Some(bin_dir) = Self::probe_sdk_bin_with(root, &checker) {
+                return Ok(Some(bin_dir));
+            }
+            if checker(root) {
+                return Ok(Some(root.clone()));
+            }
+            println!(
+                "cargo:warning=WINDOWS_SDK_PATH ('{}') is invalid or contains no resource compiler; falling back.",
+                root.display()
+            );
+        }
+
+        // Tier 4: Fall back to winres built-in registry / PATH discovery
         Ok(None)
+    }
+
+    fn resolve_rc_path_with<F>(path: &std::path::Path, checker: &F) -> Option<std::path::PathBuf>
+    where
+        F: Fn(&std::path::Path) -> bool,
+    {
+        // If the path itself is a directory containing rc.exe or windres.exe:
+        if checker(&path.join("rc.exe")) || checker(&path.join("windres.exe")) {
+            return Some(path.to_path_buf());
+        }
+        // If the path points directly to rc.exe / windres.exe binary:
+        if checker(path) {
+            let is_binary = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower == "rc.exe" || lower == "windres.exe"
+                })
+                .unwrap_or(false);
+
+            if is_binary {
+                return path.parent().map(std::path::Path::to_path_buf);
+            }
+        }
+        None
+    }
+
+    fn probe_sdk_bin_with<F>(sdk_path: &std::path::Path, checker: &F) -> Option<std::path::PathBuf>
+    where
+        F: Fn(&std::path::Path) -> bool,
+    {
+        let candidates = [
+            sdk_path.join("bin").join("x64").join("rc.exe"),
+            sdk_path.join("bin").join("x86").join("rc.exe"),
+            sdk_path.join("bin").join("rc.exe"),
+            sdk_path.join("rc.exe"),
+        ];
+
+        for candidate in &candidates {
+            if checker(candidate) {
+                return candidate.parent().map(std::path::Path::to_path_buf);
+            }
+        }
+
+        None
     }
 }
 
