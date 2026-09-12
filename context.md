@@ -972,3 +972,25 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Stale `src/db.rs` path reference and residual `config` -> `db` dependency in architectural documentation eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 1 — Windows Resource Compilation & Build Script Hardening (`build.rs` & `tests/build_script_test.rs`)
+> * **Changes:**
+>   - **Gated Windows Resources & Dependency Isolation**: `build.rs::main` gated behind `#[cfg(not(test))]`. `winres::WindowsResource` isolated behind `#[cfg(all(windows, not(test)))]` with a no-op stub for tests/non-Windows, enabling `tests/build_script_test.rs` to mount `build.rs` without requiring `winres` in `[dev-dependencies]`.
+>   - **Dynamic 4-Tier SDK Discovery Precedence**: Replaced ambient registry dependency with a 4-tier discovery pipeline (`WINRES_TOOLKIT_PATH` → `RC_PATH` → `WINDOWS_SDK_PATH` → ambient registry) without hardcoded local machine paths.
+>   - **Subprocess Safety & Confinement (CWE-426 / CWE-427)**: Implemented `validate_path_safety` enforcing that all path arguments from environment variables contain no null bytes, control characters, or unescaped quotes.
+>   - **Defensive Icon Asset Ingestion (CWE-1284 / CWE-1287)**: Implemented `validate_icon_asset` and `validate_icon_bytes`, performing single-handle metadata inspection, bounded size validation (`0 < len <= 524,288` bytes), and 6-byte ICO magic header validation (`00 00 01 00` with `image_count >= 1`).
+>   - **Fail-Closed Release Policy & Remediation Guide**: `handle_resource_error` provides a structured 5-point remediation box on `PROFILE == "release"` and exits with code 1 (`std::process::exit(1)`), preventing silent error swallowing and legacy Windows UAC virtualization (CWE-390 / CWE-250) while strictly complying with `.ast-grep/rules/unwrap-in-production.yml`. Includes `SYNCDIR_ALLOW_MISSING_ICON=1` escape hatch for headless/container CI.
+>   - **Invalidation Triggers**: `emit_rebuild_directives` prints `cargo:rerun-if-changed=syncdir.ico` and `cargo:rerun-if-env-changed` for `WINRES_TOOLKIT_PATH`, `RC_PATH`, `WINDOWS_SDK_PATH`, and `SYNCDIR_ALLOW_MISSING_ICON`.
+>   - **Isolated Integration Test Suite**: Created `tests/build_script_test.rs` with 21 unit/integration tests using pure DI closures (`Fn(&str) -> Option<String>`, `Fn(&Path) -> bool`) avoiding thread-unsafe process environment mutations.
+>   - **Quality Verification Gate**: All 443 automated tests (365 lib + 7 bin + 21 build_script + 13 integration + 8 property + 20 snapshot + 9 doc-tests), `cargo clippy -- -D warnings`, and `cargo fmt --check` passing with exit code 0. Zero AST-grep or Narsil security violations in `build.rs`.
+> * **New Constraints:**
+>   - Build scripts must not hardcode local developer paths.
+>   - Environment variables must be validated via `validate_path_safety` before being passed to external toolkits.
+>   - Release builds fail-closed on resource compilation failure unless `SYNCDIR_ALLOW_MISSING_ICON=1` is provided.
+> * **Pruned:**
+>   - Ambient swallowing of `winres` compilation errors in `build.rs` eliminated.
+>   - Silent generation of unmanifested release binaries subject to UAC virtualization eliminated.
+
+
