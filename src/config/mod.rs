@@ -16,10 +16,10 @@ use validation::preprocess_config_toml;
 pub(crate) mod raw;
 use raw::RawConfig;
 
-pub mod target;
+pub(crate) mod target;
 pub use target::{DestinationCollection, TargetDir, TargetRole, VerificationMode};
 
-pub mod builder;
+pub(crate) mod builder;
 pub use builder::{ConfigBuilder, TargetSyncConfigBuilder};
 
 /// Default block size (64KB) as a non-zero integer.
@@ -92,7 +92,7 @@ impl TargetSyncConfig {
     /// Returns [`SyncError::Validation`] if parameters, timeouts, block sizes, or paths fail validation,
     /// or if the destination directory is identical to or nested within the source directory.
     pub fn from_config(config: &Config, dest_dir: impl Into<TargetDir>) -> Result<Self, SyncError> {
-        TargetSyncConfigBuilder::new(config.source_dir(), dest_dir)
+        TargetSyncConfigBuilder::new(config.source_target_dir().clone(), dest_dir)
             .block_size_bytes(config.block_size_bytes())
             .block_sync_threshold_bytes(config.block_sync_threshold_bytes())
             .verify_writes(config.verify_writes())
@@ -104,26 +104,31 @@ impl TargetSyncConfig {
     }
 
     /// Source directory getter.
+    #[must_use]
     pub fn source_dir(&self) -> &Path {
         self.source_dir.as_path()
     }
 
     /// Source target dir getter.
+    #[must_use]
     pub fn source_target_dir(&self) -> &TargetDir {
         &self.source_dir
     }
 
     /// Destination directory getter.
+    #[must_use]
     pub fn dest_dir(&self) -> &Path {
         &self.dest_dir
     }
 
     /// Destination target dir getter.
+    #[must_use]
     pub fn dest_target_dir(&self) -> &TargetDir {
         &self.dest_dir
     }
 
     /// Block size in bytes getter.
+    #[must_use]
     pub fn block_size_bytes(&self) -> u64 {
         self.block_size_bytes
     }
@@ -139,36 +144,43 @@ impl TargetSyncConfig {
     }
 
     /// Block sync threshold in bytes getter.
+    #[must_use]
     pub fn block_sync_threshold_bytes(&self) -> u64 {
         self.block_sync_threshold_bytes
     }
 
     /// Verify writes flag getter.
+    #[must_use]
     pub fn verify_writes(&self) -> bool {
         self.verify_writes
     }
 
     /// Verification mode getter.
+    #[must_use]
     pub fn verification_mode(&self) -> VerificationMode {
         self.verification_mode
     }
 
     /// Debounce seconds getter.
+    #[must_use]
     pub fn debounce_seconds(&self) -> u64 {
         self.debounce_seconds
     }
 
     /// Retry interval in seconds getter.
+    #[must_use]
     pub fn retry_interval_seconds(&self) -> u64 {
         self.retry_interval_seconds
     }
 
     /// Propagate deletions flag getter.
+    #[must_use]
     pub fn propagate_deletions(&self) -> bool {
         self.propagate_deletions
     }
 
     /// Sets write verification flag.
+    #[must_use]
     pub fn with_verify_writes(mut self, verify: bool) -> Self {
         self.verify_writes = verify;
         self.verification_mode = VerificationMode::from_legacy_flag(verify);
@@ -176,6 +188,7 @@ impl TargetSyncConfig {
     }
 
     /// Sets verification mode.
+    #[must_use]
     pub fn with_verification_mode(mut self, mode: VerificationMode) -> Self {
         self.verification_mode = mode;
         self.verify_writes = mode != VerificationMode::Disabled;
@@ -184,10 +197,10 @@ impl TargetSyncConfig {
 
     /// Explicit fallible conversion from `&Config` that returns an error if no destinations are configured.
     pub fn try_from_config(cfg: &Config) -> Result<Self, SyncError> {
-        let dest = cfg.dest_dir().ok_or_else(|| {
+        let dest = cfg.destinations().first().ok_or_else(|| {
             SyncError::validation("Config has no destination directories configured")
         })?;
-        Self::from_config(cfg, dest)
+        Self::from_config(cfg, dest.clone())
     }
 
     /// Explicit fallible conversion from owned `Config`.
@@ -314,6 +327,7 @@ impl Config {
     }
 
     /// Return a clone of this Config with the specified destination directory set.
+    #[must_use]
     pub fn with_dest_dir(&self, dest: PathBuf) -> Self {
         let mut cloned = self.clone();
         cloned.destinations = DestinationCollection::from_raw(Some(dest), None);
@@ -321,37 +335,44 @@ impl Config {
     }
 
     /// Source directory getter.
+    #[must_use]
     pub fn source_dir(&self) -> &Path {
         self.source_dir.as_path()
     }
 
     /// Return strongly-typed source TargetDir.
+    #[must_use]
     pub fn source_target_dir(&self) -> &TargetDir {
         &self.source_dir
     }
 
     /// Return the normalized source directory path.
+    #[must_use]
     #[deprecated(since = "0.2.0", note = "Use source_dir() directly")]
     pub fn resolved_source_dir(&self) -> &Path {
         self.source_dir.as_path()
     }
 
     /// Return strongly-typed destination slice.
+    #[must_use]
     pub fn destinations(&self) -> &[TargetDir] {
         self.destinations.as_slice()
     }
 
     /// Return a merged, deduplicated list of all configured destination directories.
+    #[must_use]
     pub fn resolved_dest_dirs(&self) -> Vec<PathBuf> {
         self.destinations.to_path_bufs()
     }
 
     /// Primary destination directory getter.
+    #[must_use]
     pub fn dest_dir(&self) -> Option<&Path> {
         self.destinations.iter().next().map(TargetDir::as_path)
     }
 
     /// Extra destination directories getter.
+    #[must_use]
     #[deprecated(
         since = "0.2.0",
         note = "use Config::destinations() or Config::resolved_dest_dirs() instead"
@@ -365,26 +386,31 @@ impl Config {
     }
 
     /// Debounce seconds getter.
+    #[must_use]
     pub fn debounce_seconds(&self) -> u64 {
         self.debounce_seconds
     }
 
     /// Propagate deletions flag getter.
+    #[must_use]
     pub fn propagate_deletions(&self) -> bool {
         self.propagate_deletions
     }
 
     /// Block sync threshold in bytes getter.
+    #[must_use]
     pub fn block_sync_threshold_bytes(&self) -> u64 {
         self.block_sync_threshold_bytes
     }
 
     /// Block size in bytes getter.
+    #[must_use]
     pub fn block_size_bytes(&self) -> u64 {
         self.block_size_bytes
     }
 
     /// Write verification flag getter.
+    #[must_use]
     pub fn verify_writes(&self) -> bool {
         self.verify_writes
     }
@@ -393,12 +419,14 @@ impl Config {
     ///
     /// If `verification_mode` was explicitly configured, returns it.
     /// Otherwise, resolves based on the legacy `verify_writes` boolean flag.
+    #[must_use]
     pub fn verification_mode(&self) -> VerificationMode {
         self.verification_mode
             .unwrap_or_else(|| VerificationMode::from_legacy_flag(self.verify_writes))
     }
 
     /// Retry interval in seconds getter.
+    #[must_use]
     pub fn retry_interval_seconds(&self) -> u64 {
         self.retry_interval_seconds
     }
@@ -534,28 +562,6 @@ impl Config {
     /// Returns `SyncError::Config` if the `APPDATA` environment variable is not set.
     pub fn default_config_path() -> Result<PathBuf, SyncError> {
         Ok(Self::default_app_dir()?.join("config.toml"))
-    }
-}
-
-impl TryFrom<&Config> for crate::db::StoreConfig {
-    type Error = SyncError;
-
-    fn try_from(config: &Config) -> Result<Self, Self::Error> {
-        Self::new(
-            config.block_size_bytes(),
-            config.block_sync_threshold_bytes(),
-        )
-    }
-}
-
-impl TryFrom<&TargetSyncConfig> for crate::db::StoreConfig {
-    type Error = SyncError;
-
-    fn try_from(config: &TargetSyncConfig) -> Result<Self, Self::Error> {
-        Self::new(
-            config.block_size_bytes(),
-            config.block_sync_threshold_bytes(),
-        )
     }
 }
 

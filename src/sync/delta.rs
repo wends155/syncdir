@@ -476,7 +476,7 @@ impl<S: HashStore> DeltaTransferEngine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, TargetSyncConfig};
+    use crate::config::{Config, TargetDir, TargetSyncConfig};
     use crate::db::{MockHashStore, SqliteHashStore};
     use crate::sync::LocalSyncEngine;
     use std::path::Path;
@@ -599,7 +599,10 @@ mod tests {
         let content = vec![0xABu8; 1024];
         std::fs::write(src.join(file_name), &content).unwrap();
 
-        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(src.clone()),
+            TargetDir::from_validated(dst.clone()),
+        )
             .block_size_bytes(512)
             .block_sync_threshold_bytes(512)
             .verification_mode(VerificationMode::MetadataAndFlush)
@@ -650,7 +653,10 @@ mod tests {
         std::fs::write(&src_file_path, &content).unwrap();
         let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
 
-        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(src.clone()),
+            TargetDir::from_validated(dst.clone()),
+        )
             .block_size_bytes(256)
             .block_sync_threshold_bytes(256)
             .verification_mode(VerificationMode::Sampled)
@@ -691,7 +697,8 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let src_file = src.join("large.bin");
@@ -728,7 +735,8 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let src_file = src.join("large.bin");
         let dst_file = dst.join("large.bin");
 
@@ -788,7 +796,8 @@ mod tests {
             .verify_writes(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         let src_file = src.join("large.bin");
@@ -859,7 +868,8 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let cfg = test_config(source.clone(), dest.clone());
-        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&cfg, TargetDir::from_validated(dest.clone())).unwrap();
         let store_cfg = crate::db::StoreConfig::new(
             target_cfg.block_size_bytes(),
             target_cfg.block_sync_threshold_bytes(),
@@ -930,7 +940,10 @@ mod tests {
             fs::create_dir_all(&dest).unwrap();
 
             let db_path = temp.path().join("hashes.db");
-            let target_cfg = TargetSyncConfig::builder(source.clone(), dest.clone())
+            let target_cfg = TargetSyncConfig::builder(
+                TargetDir::from_validated(source.clone()),
+                TargetDir::from_validated(dest.clone()),
+            )
                 .block_size_bytes(512)
                 .block_sync_threshold_bytes(512)
                 .build()

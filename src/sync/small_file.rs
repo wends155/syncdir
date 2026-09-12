@@ -206,7 +206,7 @@ impl SmallFileTransferEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, TargetSyncConfig};
+    use crate::config::{Config, TargetDir, TargetSyncConfig};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -235,7 +235,10 @@ mod tests {
         std::fs::write(&src_file_path, b"hello world").unwrap();
         let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
 
-        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(src.clone()),
+            TargetDir::from_validated(dst.clone()),
+        )
             .verification_mode(VerificationMode::Disabled)
             .build()
             .unwrap();
@@ -275,7 +278,8 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = SmallFileTransferEngine::new(target_cfg);
 
         let dst_file = dst.join("target.txt");
@@ -375,7 +379,8 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let cfg = test_config(source.clone(), dest.clone());
-        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&cfg, TargetDir::from_validated(dest.clone())).unwrap();
         let engine = SmallFileTransferEngine::new(target_cfg);
 
         let src_file = source.join("hello.txt");
@@ -410,7 +415,10 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&dest).unwrap();
 
-        let target_cfg = TargetSyncConfig::builder(source.clone(), dest.clone())
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(source.clone()),
+            TargetDir::from_validated(dest.clone()),
+        )
             .verification_mode(crate::config::VerificationMode::Sampled)
             .build()
             .unwrap();
@@ -442,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_sync_small_file_staging_nonce_and_buffer_fallback() {
-        use crate::config::{TargetSyncConfig, VerificationMode};
+        use crate::config::{TargetDir, TargetSyncConfig, VerificationMode};
         use crate::sync::types::{FileSyncTask, RelativePath, safe_modified_millis};
         use std::fs;
         use tempfile::tempdir;
@@ -461,7 +469,10 @@ mod tests {
         let meta = fs::metadata(&src_file).unwrap();
         let src_mod = safe_modified_millis(&meta).unwrap();
 
-        let target_cfg = TargetSyncConfig::builder(src.clone(), dst.clone())
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(src.clone()),
+            TargetDir::from_validated(dst.clone()),
+        )
             .verification_mode(VerificationMode::Full)
             .build()
             .unwrap();

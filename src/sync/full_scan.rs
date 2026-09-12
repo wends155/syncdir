@@ -489,7 +489,7 @@ impl<'a, D: FullScanDriver + ?Sized> FullScanCoordinator<'a, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, TargetSyncConfig};
+    use crate::config::{Config, TargetDir, TargetSyncConfig};
     use crate::db::MockHashStore;
     use std::collections::hash_map::DefaultHasher;
     use std::fs;
@@ -587,7 +587,8 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
         let cancel = AtomicBool::new(false);
 

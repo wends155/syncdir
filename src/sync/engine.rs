@@ -942,7 +942,7 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, TargetSyncConfig};
+    use crate::config::{Config, TargetDir, TargetSyncConfig};
     use crate::db::{MockHashStore, SqliteHashStore};
     use pretty_assertions::assert_eq;
     use std::fs::OpenOptions;
@@ -1423,7 +1423,8 @@ mod tests {
         )
         .unwrap();
         let store = SqliteHashStore::new(&db_path, store_cfg).unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(store, target_cfg);
 
         // Small file sync (< 64 bytes threshold)
@@ -1560,7 +1561,8 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
         let config = Config::test_default(src.clone(), dst.clone());
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine =
             LocalSyncEngine::new(MockHashStore::new(), target_cfg.with_verify_writes(true));
         std::fs::write(src.join("small.txt"), b"payload").unwrap();
@@ -1586,7 +1588,8 @@ mod tests {
             .verify_writes(false)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
@@ -1711,7 +1714,8 @@ mod tests {
             .block_size_bytes(512)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(MockHashStore::new(), target_cfg);
 
         // Sync file 1
@@ -1868,7 +1872,8 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
@@ -1922,7 +1927,7 @@ mod tests {
             .build()
             .unwrap();
         let target_cfg_no_prop =
-            TargetSyncConfig::from_config(&config_no_prop, dst.clone()).unwrap();
+            TargetSyncConfig::from_config(&config_no_prop, TargetDir::from_validated(dst.clone())).unwrap();
         let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
         let rec3 = FileRecord::from_raw("unprop.txt", 4, 300).unwrap();
         store.save_file(&rec3, &[]).unwrap();
@@ -2147,7 +2152,8 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(db, target_cfg);
 
         let outcome = engine.run_configured_full_scan().unwrap();
@@ -2372,7 +2378,8 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, target_cfg);
 
@@ -2399,7 +2406,7 @@ mod tests {
 
     #[test]
     fn test_case_only_rename_on_destination_updates_disk_casing_and_db() {
-        use crate::config::{Config, TargetSyncConfig};
+        use crate::config::{Config, TargetDir, TargetSyncConfig};
         use crate::db::{HashStore, SqliteHashStore, StoreConfig};
         use std::fs;
         use std::path::Path;
@@ -2423,7 +2430,8 @@ mod tests {
             .dest_dir(dst.clone())
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(db, target_cfg);
 
         let mut scratch = vec![0u8; 64 * 1024];

@@ -1,5 +1,5 @@
 use pretty_assertions::assert_eq;
-use syncdir::config::{Config, TargetSyncConfig};
+use syncdir::config::{Config, TargetDir, TargetSyncConfig};
 use syncdir::db::{FileRecord, HashStore, SqliteHashStore, StoreConfig};
 use syncdir::path_util::RelativePath;
 use syncdir::sync::SyncCommand;
@@ -93,7 +93,8 @@ fn test_watcher_and_sync_engine_flow() {
     // Start watcher & sync worker BEFORE writing the file
     let _watcher = DirectoryWatcher::start(&source, tx.clone()).unwrap();
     let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let target_config = TargetSyncConfig::from_config(&config, dest.clone()).unwrap();
+    let target_config =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(dest.clone())).unwrap();
     let engine = LocalSyncEngine::new(store, target_config.clone());
     let worker_ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
     let _worker_handle = start_sync_worker(worker_ctx).unwrap();
@@ -169,7 +170,8 @@ fn test_propagate_deletions_false() {
         .propagate_deletions(false)
         .build()
         .unwrap();
-    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone()).unwrap();
+    let target_cfg =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(dest.clone())).unwrap();
 
     let store = SqliteHashStore::new(
         &db_path,
@@ -264,7 +266,8 @@ fn test_path_traversal_prevention() {
     std::fs::create_dir(&dest).unwrap();
 
     let config = Config::test_default(source.clone(), dest.clone());
-    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone()).unwrap();
+    let target_cfg =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(dest.clone())).unwrap();
     let store = SqliteHashStore::new(
         &db_path,
         StoreConfig::new(
@@ -302,7 +305,8 @@ fn test_subsecond_sync_precision() {
     std::fs::create_dir(&dest).unwrap();
 
     let config = Config::test_default(source.clone(), dest.clone());
-    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone()).unwrap();
+    let target_cfg =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(dest.clone())).unwrap();
     let store = SqliteHashStore::new(
         &db_path,
         StoreConfig::new(
@@ -343,7 +347,8 @@ fn test_directory_rename_syncs_child_files() {
     std::fs::create_dir(&dest).unwrap();
 
     let config = Config::test_default(source.clone(), dest.clone());
-    let target_cfg = TargetSyncConfig::from_config(&config, dest.clone()).unwrap();
+    let target_cfg =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(dest.clone())).unwrap();
     let store = SqliteHashStore::new(
         &db_path,
         StoreConfig::new(
@@ -452,7 +457,8 @@ fn test_worker_reachability_and_offline_drain_guard() {
         .retry_interval_seconds(1)
         .build()
         .unwrap();
-    let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+    let target_cfg =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
 
     let mock_engine = MockSyncEngine::new();
     let mock_resolver = Arc::new(MockNetworkResolver::new());
@@ -505,7 +511,7 @@ fn test_worker_reachability_and_offline_drain_guard() {
 #[test]
 fn test_delta_sync_interrupted_write_invalidates_cache() {
     use std::path::Path;
-    use syncdir::config::{Config, TargetSyncConfig};
+    use syncdir::config::{Config, TargetDir, TargetSyncConfig};
     use syncdir::db::{HashStore, SqliteHashStore, StoreConfig};
     use syncdir::sync::LocalSyncEngine;
 
@@ -563,7 +569,8 @@ fn test_delta_sync_interrupted_write_invalidates_cache() {
         std::fs::write(&src_file, vec![1u8; 2048]).unwrap();
         std::fs::write(&dst_file, vec![1u8; 2048]).unwrap();
 
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let engine = LocalSyncEngine::new(store, target_cfg);
 
         // Initial sync populates SQLite cache

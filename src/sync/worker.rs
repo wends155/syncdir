@@ -1380,7 +1380,7 @@ pub fn start_sync_worker<E: SyncEngine + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, TargetSyncConfig};
+    use crate::config::{Config, TargetDir, TargetSyncConfig};
     use crate::db::MockHashStore;
     use crate::path_util::RelativePath;
     use crate::sync::engine::LocalSyncEngine;
@@ -2157,9 +2157,13 @@ mod tests {
         let dst = temp.path().join("dest");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _tx = tx;
-        let target_cfg = TargetSyncConfig::builder(src, dst).build().unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(src),
+            TargetDir::from_validated(dst),
+        )
+        .build()
+        .unwrap();
         let engine = MockSyncEngine::new();
 
         // 1. Zero max_pending_queue must fail validation
@@ -2205,7 +2209,12 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let target_cfg = TargetSyncConfig::builder(src, dst).build().unwrap();
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(src),
+            TargetDir::from_validated(dst),
+        )
+        .build()
+        .unwrap();
         let engine = MockSyncEngine::new();
         let scan_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sc = scan_count.clone();

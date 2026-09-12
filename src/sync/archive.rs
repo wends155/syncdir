@@ -263,7 +263,7 @@ impl ArchiveManager {
 mod tests {
     use super::super::path_safety::verify_destination_not_reparse;
     use super::*;
-    use crate::config::{Config, TargetSyncConfig};
+    use crate::config::{Config, TargetDir, TargetSyncConfig};
     use tempfile::tempdir;
 
     fn test_config(source: std::path::PathBuf, dest: std::path::PathBuf) -> Config {
@@ -364,7 +364,8 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
         let archive_manager = Arc::new(ArchiveManager::new(target_cfg, reparse_cache));
 
@@ -552,7 +553,8 @@ mod tests {
             .propagate_deletions(true)
             .build()
             .unwrap();
-        let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&config, TargetDir::from_validated(dst.clone())).unwrap();
         let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
         let archive_manager = ArchiveManager::new(target_cfg, reparse_cache);
 
@@ -601,7 +603,8 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let cfg = test_config(source.clone(), dest.clone());
-        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&cfg, TargetDir::from_validated(dest.clone())).unwrap();
         let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
         let manager = ArchiveManager::new(target_cfg, reparse_cache);
 
@@ -691,7 +694,8 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
 
         let cfg = test_config(source, dest.clone());
-        let target_cfg = TargetSyncConfig::from_config(&cfg, dest.clone()).unwrap();
+        let target_cfg =
+            TargetSyncConfig::from_config(&cfg, TargetDir::from_validated(dest.clone())).unwrap();
         let reparse_cache = Arc::new(ReparseCache::new(1000, 100));
         assert!(reparse_cache.is_empty());
 

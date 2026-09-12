@@ -190,8 +190,8 @@ fn test_sync_error_display_write_verification_failed_with_block() {
 #[test]
 fn test_target_sync_config_debug_snapshot() {
     let target_config = syncdir::config::TargetSyncConfig::builder(
-        PathBuf::from(r"C:\source"),
-        PathBuf::from(r"D:\backup"),
+        syncdir::config::TargetDir::try_from(r"C:\source").unwrap(),
+        syncdir::config::TargetDir::try_from(r"D:\backup").unwrap(),
     )
     .debounce_seconds(5)
     .propagate_deletions(true)

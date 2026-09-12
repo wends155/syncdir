@@ -75,6 +75,7 @@ impl TryFrom<RawTargetDir> for TargetDir {
 
 impl TargetDir {
     /// Construct a validated TargetDir by normalizing path via normalize_path() and validating syntax for role.
+    #[must_use]
     pub fn try_new(path: impl Into<PathBuf>, role: TargetRole) -> Result<Self, SyncError> {
         let dir = Self(normalize_path(path.into()));
         dir.validate(role)?;
@@ -172,24 +173,33 @@ impl std::fmt::Display for TargetDir {
     }
 }
 
-#[allow(deprecated)]
-impl From<PathBuf> for TargetDir {
-    fn from(p: PathBuf) -> Self {
-        Self::new(p)
+impl TryFrom<PathBuf> for TargetDir {
+    type Error = SyncError;
+
+    fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
+        let normalized = normalize_path(path);
+        Self::validate_internal(&normalized, None)?;
+        Ok(Self(normalized))
     }
 }
 
-#[allow(deprecated)]
-impl From<&Path> for TargetDir {
-    fn from(p: &Path) -> Self {
-        Self::new(p)
+impl TryFrom<&Path> for TargetDir {
+    type Error = SyncError;
+
+    fn try_from(path: &Path) -> Result<Self, Self::Error> {
+        let normalized = normalize_path(path.to_path_buf());
+        Self::validate_internal(&normalized, None)?;
+        Ok(Self(normalized))
     }
 }
 
-#[allow(deprecated)]
-impl From<&str> for TargetDir {
-    fn from(s: &str) -> Self {
-        Self::new(s)
+impl TryFrom<&str> for TargetDir {
+    type Error = SyncError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        let normalized = normalize_path(PathBuf::from(s));
+        Self::validate_internal(&normalized, None)?;
+        Ok(Self(normalized))
     }
 }
 
@@ -259,21 +269,21 @@ impl DestinationCollection {
     }
 
     /// Construct from legacy optional primary and additional destination paths.
-    #[allow(deprecated)]
     #[must_use]
     pub fn from_raw(primary: Option<PathBuf>, additional: Option<Vec<PathBuf>>) -> Self {
         let mut items = Vec::new();
         if let Some(p) = primary {
-            items.push(TargetDir::new(p));
+            items.push(TargetDir::from_validated(p));
         }
         if let Some(adds) = additional {
             for a in adds {
-                items.push(TargetDir::new(a));
+                items.push(TargetDir::from_validated(a));
             }
         }
         Self::new(items)
     }
 
+    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = &TargetDir> {
         self.destinations.iter()
     }
@@ -381,5 +391,47 @@ mod tests {
             log_output.is_empty(),
             "Expected zero log records from TargetDir::validate, got: {log_output}"
         );
+    }
+
+    #[test]
+    fn test_target_dir_try_from_pathbuf() {
+        let drive_path = PathBuf::from(r"C:\valid\source\path");
+        let target = TargetDir::try_from(drive_path).unwrap();
+        assert_eq!(target.as_path(), Path::new(r"C:\valid\source\path"));
+
+        let unc_path = PathBuf::from(r"\\server\share\data");
+        let target_unc = TargetDir::try_from(unc_path).unwrap();
+        assert_eq!(target_unc.as_path(), Path::new(r"\\server\share\data"));
+
+        let rel_path = PathBuf::from("relative/source");
+        assert!(TargetDir::try_from(rel_path).is_err());
+
+        let empty_path = PathBuf::from("");
+        assert!(TargetDir::try_from(empty_path).is_err());
+    }
+
+    #[test]
+    fn test_target_dir_try_from_path_and_str() {
+        let target_ref = TargetDir::try_from(Path::new(r"D:\data\dest")).unwrap();
+        assert_eq!(target_ref.as_path(), Path::new(r"D:\data\dest"));
+
+        let target_str = TargetDir::try_from(r"E:\archive\dir").unwrap();
+        assert_eq!(target_str.as_path(), Path::new(r"E:\archive\dir"));
+
+        assert!(TargetDir::try_from(Path::new("not/absolute")).is_err());
+        assert!(TargetDir::try_from("just_a_folder").is_err());
+        assert!(TargetDir::try_from(r"\\.\pipe\bad").is_err());
+    }
+
+    #[test]
+    fn test_target_dir_try_from_syntax_rejection() {
+        assert!(TargetDir::try_from("").is_err());
+        assert!(TargetDir::try_from("relative/path").is_err());
+        assert!(TargetDir::try_from(r"\no_drive_or_unc").is_err());
+        assert!(TargetDir::try_from(r"\\.\pipe\device").is_err());
+        assert!(TargetDir::try_from(r"\\?\C:\verbatim").is_err());
+
+        let validated = TargetDir::from_validated(r"C:\valid\prechecked");
+        assert_eq!(validated.as_path(), Path::new(r"C:\valid\prechecked"));
     }
 }

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 /// Builder for constructing and validating a [`TargetSyncConfig`].
 #[derive(Debug, Clone)]
+#[must_use = "builders do nothing unless .build() is called"]
 pub struct TargetSyncConfigBuilder {
     source_dir: TargetDir,
     dest_dir: TargetDir,
@@ -46,18 +47,21 @@ impl TargetSyncConfigBuilder {
     }
 
     /// Set block size in bytes.
+    #[must_use]
     pub fn block_size_bytes(mut self, val: u64) -> Self {
         self.block_size_bytes = val;
         self
     }
 
     /// Set block sync threshold in bytes.
+    #[must_use]
     pub fn block_sync_threshold_bytes(mut self, val: u64) -> Self {
         self.block_sync_threshold_bytes = val;
         self
     }
 
     /// Set write verification flag.
+    #[must_use]
     pub fn verify_writes(mut self, val: bool) -> Self {
         self.verify_writes = val;
         self.verification_mode = Some(VerificationMode::from_legacy_flag(val));
@@ -65,6 +69,7 @@ impl TargetSyncConfigBuilder {
     }
 
     /// Set verification mode.
+    #[must_use]
     pub fn verification_mode(mut self, mode: VerificationMode) -> Self {
         self.verification_mode = Some(mode);
         self.verify_writes = mode != VerificationMode::Disabled;
@@ -72,18 +77,21 @@ impl TargetSyncConfigBuilder {
     }
 
     /// Set debouncing interval in seconds.
+    #[must_use]
     pub fn debounce_seconds(mut self, val: u64) -> Self {
         self.debounce_seconds = val;
         self
     }
 
     /// Set retry interval in seconds.
+    #[must_use]
     pub fn retry_interval_seconds(mut self, val: u64) -> Self {
         self.retry_interval_seconds = val;
         self
     }
 
     /// Set deletion propagation flag.
+    #[must_use]
     pub fn propagate_deletions(mut self, val: bool) -> Self {
         self.propagate_deletions = val;
         self
@@ -154,6 +162,7 @@ impl TargetSyncConfigBuilder {
 
 /// Builder for creating and customizing [`Config`] instances.
 #[derive(Debug, Clone)]
+#[must_use = "builders do nothing unless .build() is called"]
 pub struct ConfigBuilder {
     source_dir: PathBuf,
     dest_dir: Option<PathBuf>,
@@ -185,42 +194,49 @@ impl ConfigBuilder {
     }
 
     /// Set primary destination directory.
+    #[must_use]
     pub fn dest_dir(mut self, dest: impl Into<PathBuf>) -> Self {
         self.dest_dir = Some(dest.into());
         self
     }
 
     /// Set multiple destination directories.
+    #[must_use]
     pub fn dest_dirs(mut self, dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
         self.dest_dirs = Some(dirs.into_iter().map(Into::into).collect());
         self
     }
 
     /// Set debouncing duration in seconds.
+    #[must_use]
     pub fn debounce_seconds(mut self, val: u64) -> Self {
         self.debounce_seconds = val;
         self
     }
 
     /// Set whether file deletions should propagate.
+    #[must_use]
     pub fn propagate_deletions(mut self, val: bool) -> Self {
         self.propagate_deletions = val;
         self
     }
 
     /// Set block sync threshold in bytes.
+    #[must_use]
     pub fn block_sync_threshold_bytes(mut self, val: u64) -> Self {
         self.block_sync_threshold_bytes = val;
         self
     }
 
     /// Set block size in bytes.
+    #[must_use]
     pub fn block_size_bytes(mut self, val: u64) -> Self {
         self.block_size_bytes = val;
         self
     }
 
     /// Set write verification flag.
+    #[must_use]
     pub fn verify_writes(mut self, val: bool) -> Self {
         self.verify_writes = val;
         self.verification_mode = Some(VerificationMode::from_legacy_flag(val));
@@ -228,6 +244,7 @@ impl ConfigBuilder {
     }
 
     /// Set write verification mode explicitly.
+    #[must_use]
     pub fn verification_mode(mut self, mode: VerificationMode) -> Self {
         self.verification_mode = Some(mode);
         self.verify_writes = mode != VerificationMode::Disabled;
@@ -235,12 +252,14 @@ impl ConfigBuilder {
     }
 
     /// Set retry interval in seconds.
+    #[must_use]
     pub fn retry_interval_seconds(mut self, val: u64) -> Self {
         self.retry_interval_seconds = val;
         self
     }
 
     /// Add an additional destination directory.
+    #[must_use]
     pub fn add_dest_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         match self.dest_dirs.as_mut() {

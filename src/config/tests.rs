@@ -12,8 +12,8 @@ fn test_target_sync_config_block_size_nonzero() {
     let dest = temp.path().join("dest");
 
     let target_zero = TargetSyncConfig::from_raw_parts(
-        src.clone(),
-        TargetDir::from(dest.clone()),
+        TargetDir::from_validated(src.clone()),
+        TargetDir::from_validated(dest.clone()),
         0,
         1024,
         true,
@@ -25,8 +25,8 @@ fn test_target_sync_config_block_size_nonzero() {
     assert_eq!(target_zero.block_size_nonzero().get(), 64 * 1024);
 
     let target_custom = TargetSyncConfig::from_raw_parts(
-        src,
-        TargetDir::from(dest),
+        TargetDir::from_validated(src),
+        TargetDir::from_validated(dest),
         128 * 1024,
         1024,
         true,
@@ -686,7 +686,11 @@ fn test_target_sync_config_from_config() {
         .propagate_deletions(false)
         .build()
         .unwrap();
-    let target = TargetSyncConfig::from_config(&config, PathBuf::from(r"C:\dst2")).unwrap();
+    let target = TargetSyncConfig::from_config(
+        &config,
+        TargetDir::from_validated(PathBuf::from(r"C:\dst2")),
+    )
+    .unwrap();
     assert_eq!(target.source_dir(), Path::new(r"C:\src"));
     assert_eq!(target.dest_dir(), Path::new(r"C:\dst2"));
     assert_eq!(target.block_size_bytes(), 1024);
@@ -762,13 +766,16 @@ fn test_config_destinations_matches_dest_dirs() {
 
 #[test]
 fn test_target_sync_config_builder() {
-    let builder = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .block_size_bytes(512 * 1024)
-        .block_sync_threshold_bytes(2 * 1024 * 1024)
-        .verify_writes(false)
-        .debounce_seconds(5)
-        .retry_interval_seconds(20)
-        .propagate_deletions(false);
+    let builder = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .block_size_bytes(512 * 1024)
+    .block_sync_threshold_bytes(2 * 1024 * 1024)
+    .verify_writes(false)
+    .debounce_seconds(5)
+    .retry_interval_seconds(20)
+    .propagate_deletions(false);
 
     let cfg = builder.build().expect("valid builder should build");
     assert_eq!(cfg.source_dir(), Path::new(r"C:\source"));
@@ -781,31 +788,43 @@ fn test_target_sync_config_builder() {
     assert!(!cfg.propagate_deletions());
 
     // Zero block size fails
-    let invalid = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .block_size_bytes(0)
-        .build();
+    let invalid = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .block_size_bytes(0)
+    .build();
     assert!(invalid.is_err());
 
     // Block size > 64MB fails
-    let invalid = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .block_size_bytes(65 * 1024 * 1024)
-        .build();
+    let invalid = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .block_size_bytes(65 * 1024 * 1024)
+    .build();
     assert!(invalid.is_err());
 
     // Zero threshold fails
-    let invalid = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .block_sync_threshold_bytes(0)
-        .build();
+    let invalid = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .block_sync_threshold_bytes(0)
+    .build();
     assert!(invalid.is_err());
 }
 
 #[test]
 fn test_target_sync_config_builder_validation_invariants() {
     // 1. Threshold < block size fails
-    let err = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .block_size_bytes(1024 * 1024)
-        .block_sync_threshold_bytes(512 * 1024)
-        .build();
+    let err = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .block_size_bytes(1024 * 1024)
+    .block_sync_threshold_bytes(512 * 1024)
+    .build();
     assert!(err.is_err());
     assert!(
         err.unwrap_err()
@@ -814,9 +833,12 @@ fn test_target_sync_config_builder_validation_invariants() {
     );
 
     // 2. Debounce seconds == 0 fails
-    let err = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .debounce_seconds(0)
-        .build();
+    let err = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .debounce_seconds(0)
+    .build();
     assert!(err.is_err());
     assert!(
         err.unwrap_err()
@@ -825,9 +847,12 @@ fn test_target_sync_config_builder_validation_invariants() {
     );
 
     // 3. Retry interval seconds == 0 fails
-    let err = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .retry_interval_seconds(0)
-        .build();
+    let err = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .retry_interval_seconds(0)
+    .build();
     assert!(err.is_err());
     assert!(
         err.unwrap_err()
@@ -836,17 +861,29 @@ fn test_target_sync_config_builder_validation_invariants() {
     );
 
     // 4. Source == Destination fails
-    let err = TargetSyncConfig::builder(r"C:\source", r"C:\source").build();
+    let err = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"C:\source"),
+    )
+    .build();
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains("recursive sync loop"));
 
     // 5. Dest nested inside Source fails
-    let err = TargetSyncConfig::builder(r"C:\source", r"C:\source\nested_dest").build();
+    let err = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"C:\source\nested_dest"),
+    )
+    .build();
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains("recursive sync loop"));
 
     // 6. Source nested inside Dest fails
-    let err = TargetSyncConfig::builder(r"C:\source\nested_src", r"C:\source").build();
+    let err = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source\nested_src"),
+        TargetDir::from_validated(r"C:\source"),
+    )
+    .build();
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains("recursive sync loop"));
 }
@@ -922,16 +959,20 @@ fn test_verification_mode_target_sync_config_plumbing() {
         .verification_mode(VerificationMode::MetadataAndFlush)
         .build()
         .unwrap();
-    let target = TargetSyncConfig::from_config(&config, r"D:\dest").unwrap();
+    let target =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(r"D:\dest")).unwrap();
     assert_eq!(
         target.verification_mode(),
         VerificationMode::MetadataAndFlush
     );
 
-    let target_builder = TargetSyncConfig::builder(r"C:\source", r"D:\dest")
-        .verification_mode(VerificationMode::Sampled)
-        .build()
-        .unwrap();
+    let target_builder = TargetSyncConfig::builder(
+        TargetDir::from_validated(r"C:\source"),
+        TargetDir::from_validated(r"D:\dest"),
+    )
+    .verification_mode(VerificationMode::Sampled)
+    .build()
+    .unwrap();
     assert_eq!(
         target_builder.verification_mode(),
         VerificationMode::Sampled
@@ -1018,7 +1059,10 @@ fn test_config_builder_build_validates_invariants() {
 fn test_target_sync_config_from_config_rejects_nested_and_ancestor_paths() {
     let config = Config::test_default(r"C:\source", r"D:\dest");
     // Nested path (dest inside source)
-    let res_nested = TargetSyncConfig::from_config(&config, r"C:\source\nested");
+    let res_nested = TargetSyncConfig::from_config(
+        &config,
+        TargetDir::from_validated(r"C:\source\nested"),
+    );
     assert!(res_nested.is_err());
     match res_nested.unwrap_err() {
         SyncError::Validation { kind, .. } => {
@@ -1028,7 +1072,8 @@ fn test_target_sync_config_from_config_rejects_nested_and_ancestor_paths() {
     }
 
     // Ancestor path (source inside dest)
-    let res_ancestor = TargetSyncConfig::from_config(&config, r"C:\");
+    let res_ancestor =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(r"C:\"));
     assert!(res_ancestor.is_err());
     match res_ancestor.unwrap_err() {
         SyncError::Validation { kind, .. } => {
@@ -1044,7 +1089,10 @@ fn test_target_sync_config_from_config_rejects_invalid_block_size_and_ordering()
         .dest_dir(r"D:\dest")
         .block_size_bytes(0)
         .build_unvalidated();
-    let res = TargetSyncConfig::from_config(&invalid_config, r"D:\dest");
+    let res = TargetSyncConfig::from_config(
+        &invalid_config,
+        TargetDir::from_validated(r"D:\dest"),
+    );
     assert!(res.is_err());
 
     let invalid_order = Config::builder(r"C:\source")
@@ -1052,68 +1100,28 @@ fn test_target_sync_config_from_config_rejects_invalid_block_size_and_ordering()
         .block_size_bytes(1024)
         .block_sync_threshold_bytes(512)
         .build_unvalidated();
-    let res_order = TargetSyncConfig::from_config(&invalid_order, r"D:\dest");
+    let res_order = TargetSyncConfig::from_config(
+        &invalid_order,
+        TargetDir::from_validated(r"D:\dest"),
+    );
     assert!(res_order.is_err());
 }
 
 #[test]
-fn test_store_config_try_from_config() {
+fn test_config_block_parameters_for_storage() {
     let temp = tempdir().unwrap();
     let src = temp.path().join("source");
-    let dest = temp.path().join("dest");
+    let dst = temp.path().join("dest");
 
     let config = Config::builder(src)
-        .dest_dir(dest)
+        .dest_dir(dst)
         .block_size_bytes(1024 * 1024)
+        .block_sync_threshold_bytes(10 * 1024 * 1024)
         .build_unvalidated();
 
-    let store_cfg = crate::db::StoreConfig::try_from(&config).unwrap();
-    assert_eq!(store_cfg.block_size_bytes(), 1024 * 1024);
-
-    let zero_config = Config::builder(temp.path().join("src2"))
-        .dest_dir(temp.path().join("dst2"))
-        .block_size_bytes(0)
-        .build_unvalidated();
-
-    let err = crate::db::StoreConfig::try_from(&zero_config);
-    assert!(err.is_err());
-}
-
-#[test]
-fn test_store_config_try_from_target_sync_config() {
-    let temp = tempdir().unwrap();
-    let src = temp.path().join("source");
-    let dest = temp.path().join("dest");
-
-    let target = TargetSyncConfig::from_raw_parts(
-        src,
-        TargetDir::from(dest),
-        1024 * 1024,
-        10 * 1024 * 1024,
-        true,
-        VerificationMode::Full,
-        3,
-        10,
-        true,
-    );
-
-    let store_cfg = crate::db::StoreConfig::try_from(&target).unwrap();
-    assert_eq!(store_cfg.block_size_bytes(), 1024 * 1024);
-
-    let zero_target = TargetSyncConfig::from_raw_parts(
-        temp.path().join("src2"),
-        TargetDir::from(temp.path().join("dst2")),
-        0,
-        10 * 1024 * 1024,
-        true,
-        VerificationMode::Full,
-        3,
-        10,
-        true,
-    );
-
-    let err = crate::db::StoreConfig::try_from(&zero_target);
-    assert!(err.is_err());
+    // Verify Config exposes block size parameters queryable by storage components without depending on db
+    assert_eq!(config.block_size_bytes(), 1024 * 1024);
+    assert_eq!(config.block_sync_threshold_bytes(), 10 * 1024 * 1024);
 }
 
 #[test]
@@ -1124,19 +1132,25 @@ fn test_target_sync_config_builder_verify_writes_syncs_with_verification_mode() 
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&dest).unwrap();
 
-    let cfg = TargetSyncConfig::builder(src.clone(), dest.clone())
-        .verification_mode(VerificationMode::Full)
-        .verify_writes(false)
-        .build()
-        .unwrap();
+    let cfg = TargetSyncConfig::builder(
+        TargetDir::from_validated(src.clone()),
+        TargetDir::from_validated(dest.clone()),
+    )
+    .verification_mode(VerificationMode::Full)
+    .verify_writes(false)
+    .build()
+    .unwrap();
     assert_eq!(cfg.verification_mode(), VerificationMode::Disabled);
     assert!(!cfg.verify_writes());
 
-    let cfg2 = TargetSyncConfig::builder(src.clone(), dest.clone())
-        .verification_mode(VerificationMode::Disabled)
-        .verify_writes(true)
-        .build()
-        .unwrap();
+    let cfg2 = TargetSyncConfig::builder(
+        TargetDir::from_validated(src.clone()),
+        TargetDir::from_validated(dest.clone()),
+    )
+    .verification_mode(VerificationMode::Disabled)
+    .verify_writes(true)
+    .build()
+    .unwrap();
     assert_ne!(cfg2.verification_mode(), VerificationMode::Disabled);
     assert!(cfg2.verify_writes());
 
@@ -1157,8 +1171,8 @@ fn test_target_sync_config_block_size_nonzero_panic_free_fallback() {
     let dest = temp.path().join("dest");
 
     let target_zero = TargetSyncConfig::from_raw_parts(
-        src,
-        TargetDir::from(dest),
+        TargetDir::from_validated(src),
+        TargetDir::from_validated(dest),
         0,
         1024,
         true,
@@ -1174,9 +1188,9 @@ fn test_target_sync_config_block_size_nonzero_panic_free_fallback() {
 #[allow(deprecated)]
 fn test_target_sync_config_source_dir_target_dir() {
     use crate::config::TargetSyncConfig;
-    use crate::config::target::TargetDir;
+    use crate::config::TargetDir;
     let td = TargetDir::new("C:\\Users\\Data");
-    let config = TargetSyncConfig::builder(td.clone(), "D:\\Backup")
+    let config = TargetSyncConfig::builder(td.clone(), TargetDir::from_validated("D:\\Backup"))
         .build()
         .expect("build");
     assert_eq!(config.source_dir(), std::path::Path::new("C:\\Users\\Data"));
@@ -1188,7 +1202,7 @@ fn test_target_sync_config_source_dir_target_dir() {
 
 #[test]
 fn test_target_dir_serde_proxy_validation() {
-    use crate::config::target::TargetDir;
+    use crate::config::TargetDir;
     #[allow(dead_code)]
     #[derive(serde::Deserialize)]
     struct Cfg {
@@ -1201,4 +1215,61 @@ fn test_target_dir_serde_proxy_validation() {
     let empty_toml = r#"target = """#;
     let cfg_err: Result<Cfg, _> = toml::from_str(empty_toml);
     assert!(cfg_err.is_err());
+}
+
+#[test]
+fn test_config_builders_must_use_and_fluent_setters() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("source");
+    let dst = temp.path().join("dest");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+
+    let cfg = Config::builder(&src)
+        .dest_dir(&dst)
+        .debounce_seconds(5)
+        .retry_interval_seconds(15)
+        .block_size_bytes(64 * 1024)
+        .block_sync_threshold_bytes(1024 * 1024)
+        .propagate_deletions(false)
+        .verify_writes(true)
+        .build()
+        .unwrap();
+
+    assert_eq!(cfg.debounce_seconds(), 5);
+    assert_eq!(cfg.retry_interval_seconds(), 15);
+    assert_eq!(cfg.block_size_bytes(), 64 * 1024);
+    assert_eq!(cfg.block_sync_threshold_bytes(), 1024 * 1024);
+    assert!(!cfg.propagate_deletions());
+
+    let target_cfg = TargetSyncConfig::builder(
+        TargetDir::try_from(src.clone()).unwrap(),
+        TargetDir::try_from(dst.clone()).unwrap(),
+    )
+    .debounce_seconds(7)
+    .retry_interval_seconds(20)
+    .block_size_bytes(128 * 1024)
+    .block_sync_threshold_bytes(2 * 1024 * 1024)
+    .propagate_deletions(true)
+    .verify_writes(false)
+    .build()
+    .unwrap();
+
+    assert_eq!(target_cfg.debounce_seconds(), 7);
+    assert_eq!(target_cfg.retry_interval_seconds(), 20);
+    assert_eq!(target_cfg.block_size_bytes(), 128 * 1024);
+    assert_eq!(target_cfg.block_sync_threshold_bytes(), 2 * 1024 * 1024);
+    assert!(target_cfg.propagate_deletions());
+}
+
+#[test]
+fn test_destination_collection_query_must_use() {
+    let d1 = TargetDir::try_from(r"C:\dest1").unwrap();
+    let d2 = TargetDir::try_from(r"D:\dest2").unwrap();
+    let col = DestinationCollection::new(vec![d1, d2]);
+
+    assert_eq!(col.len(), 2);
+    assert!(!col.is_empty());
+    assert_eq!(col.as_slice().len(), 2);
+    assert_eq!(col.iter().count(), 2);
 }
