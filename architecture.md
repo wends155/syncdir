@@ -222,7 +222,7 @@ syncdir/
 | `db` | `path_util`, `error` | `config`, `sync`, `monitor`, `tray`, `main`, `daemon` |
 | `startup` | `error` | `config`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
 | `net` | `path_util`, `error` | `config`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
-| `config` | `path_util`, `db` (types only), `error` | `net`, `sync`, `monitor`, `tray`, `main`, `daemon` |
+| `config` | `path_util`, `error` | `net`, `sync`, `db`, `monitor`, `tray`, `main`, `daemon` |
 | `path_util` | `error` | All other internal modules |
 | `error` | None | All |
 
@@ -323,7 +323,7 @@ graph TD
     monitor --> sync & path_util & error
     sync --> db & config & net & path_util & error
     db --> path_util & error
-    config --> path_util & db & error
+    config --> path_util & error
     net --> path_util & error
     startup --> error
 ```
@@ -365,11 +365,13 @@ sequenceDiagram
 * **Worker Debounce Batch Persistence & Fallback**: Worker loops buffer file sync transfers in-memory (`sync_file_to_dest_staged`) up to 500 files per tick, committing SQLite records in a single batch transaction via `flush_staged_syncs`. If SQLite batch persistence fails, `flush_record_batch` automatically falls back to individual `save_file` calls to ensure partial progress and transactional resilience.
 * **Zero-Allocation Superscript Path Normalization**: `normalize_superscripts_cow` in path safety uses an ASCII fast-path returning `Cow::Borrowed` when no unicode superscripts are present, eliminating up to 10 unconditional heap string allocations per path component.
 * **Bounded Archive Candidate Discovery**: `prune_archive` enforces a 5,000-candidate scan ceiling (`MAX_ARCHIVE_PRUNE_CANDIDATES`) with early traversal termination, preventing unbounded filesystem walks and memory consumption during archive retention checks.
-* **Multi-Lens Code Review Remediation (Blocks 1–4)**: All 36 findings from the multi-lens code review (`review_report.md`) across correctness, performance, security, architecture, and API design are fully resolved:
+* **Multi-Lens Code Review Remediation (Blocks 1–6)**: All 37 findings from the multi-lens code review across correctness, performance, security, architecture, and API design are 100% resolved and audited:
   * **Block 1: Observability & Tracing Modernization**: Upgraded to `tracing = { version = "0.1", features = ["attributes"] }`, deployed `#[tracing::instrument]` across subsystem boundaries, established thread-scoped worker spans (`sync_worker`, `watcher_coordinator`), sanitized user paths against CRLF log injection (CWE-117), scrubbed usernames/PII in diagnostic logs, and implemented flush-guaranteed crash reporting in the panic hook.
-  * **Block 2: Worker Queue & State Resilience**: Hardened `SyncWorkerRunner` discrete tick loop, immediate eviction of transient `NotFound` source deletions, capped generic I/O retry loops at 10 attempts with exponential backoff, throttled catch-up scan failures to avoid tight spin loops, synchronized destination reachability on `ScanOutcome::PartialFailure`, and converted watcher coordinator shutdown to zero-sleep event-driven timeout synchronization (`signal_rx.recv_timeout`).
-  * **Block 3: Engine Casing, Security & Performance**: Destination on-disk casing alignment via atomic two-step renames (`align_dest_file_casing_if_needed`), SQLite UPSERT casing updates preserving block signatures, symmetrical `ReparseCache` eviction for both source and destination parent paths (CWE-59 defense), prepared statement caching in `save_files_batch`, block hash vector pre-allocation, zero-allocation full scan cache lookups (`NormalizedCaseFoldedPath`), single-path directory scanner inspection, zero-allocation peekable path safety traversal, and `splitmix64` small-file staging nonces.
+  * **Block 2: Storage Subsystem Decoupling & Worker Resilience**: Decomposed monolithic `src/db.rs` into `src/db/{mod, traits, sqlite, mock}.rs` with zero-allocation record preloading (`list_all_records`), atomic single-transaction deletions with rollback, exact Unicode path preservation, hardened `SyncWorkerRunner` discrete tick loop, immediate eviction of transient `NotFound` source deletions, and capped generic I/O retry loops at 10 attempts with exponential backoff.
+  * **Block 3: Configuration & Path Domain Layer Decoupling**: Fully decoupled `src/config/` from `src/db/` (0 `crate::db` imports), enforced fallible `TryFrom` conversions on `TargetDir` with syntax validation, retracted internal submodules to `pub(crate)`, applied `#[must_use]` to builders and pure query getters, and implemented zero-allocation `RelativePath::as_forward_slash_str()`.
   * **Block 4: API Safety, Trait Segregation & Hardening**: Monolithic `SyncEngine` segregated into 5 discrete role traits (`FileSynchronizer`, `FileDeleter`, `BatchFlusher`, `ScanEngine`, `ArchiveEngine`) unified by a composite supertrait; `FullScanCoordinator` decoupled behind `FullScanDriver` with `MockFullScanDriver`; `FileSyncTask` protected by fluent `FileSyncTaskBuilder` with typed `&RelativePath`; `TargetDir` protected by `RawTargetDir` Serde proxy; `RelativePath` bidirectional equality; `SyncError` constructors annotated with `#[must_use]`; and `SyncDaemonBuilder` introduced.
+  * **Block 5: Core Sync Engine Decoupling, Fast-Path Casing & Cache Invalidation**: Decomposed monolithic `src/sync/engine.rs` to <750 LOC by extracting traits to `traits.rs` and tests to `engine_tests.rs`; implemented hot-path casing alignment bypass on verified cache hits (`is_verified_cache_hit`); hardened `ReparseCache` against non-existent root caching; added read-lock probe in `evict_dir`; and protected archive pruning deletions with TOCTOU symlink checks immediately before removal.
+  * **Block 6: System Tray UI Modularization & Application Lifecycle**: Decomposed monolithic `src/tray.rs` (1,173 LOC) into modular submodules under `src/tray/` (`mod.rs`, `state.rs`, `dialog.rs`, `menu.rs`, `event_loop.rs`, `assets.rs`), ensuring every file strictly complies with `<400` LOC design guidelines; hardened Windows Explorer launching with `/select,"<path>"` quoting using Win32 `raw_arg` for whitespace paths; annotated canonical test doubles with `#[doc(hidden)]` under `syncdir::test_support`; and sanitized user path logging across scanner and archive modules to prevent CWE-117 log injection.
 
 ## 15. Data Model
 
@@ -410,7 +412,7 @@ erDiagram
 ```
 
 ### Migration Strategy
-Migrations are managed in `src/db.rs` programmatically. At startup, `db` runs a `CREATE TABLE IF NOT EXISTS` statement for both tables and creates the composite index to guarantee schema availability. Metadata table checks enforce `db_version` compatibility.
+Migrations are managed in `src/db/sqlite.rs` programmatically. At startup, `db` runs a `CREATE TABLE IF NOT EXISTS` statement for both tables and creates the composite index to guarantee schema availability. Metadata table checks enforce `db_version` compatibility.
 
 ## 16. Environment Configuration
 No external APIs or environment variables are required. Configuration is loaded entirely from `%APPDATA%\syncdir\config.toml` containing:

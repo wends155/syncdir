@@ -955,3 +955,20 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Release preparation ready for version bump to v0.2.0 and branch merge to `main`.
 > * **Pruned:**
 >   - All 37 qualitative review findings marked 100% resolved and audited.
+
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Documentation & Architectural Specification Synchronization (`/update-doc` & `/architecture`)
+> * **Changes:**
+>   - **`spec.md` Verification Hash Updated**: Advanced verification commit hash from `2f489f6` to `8e5cd6d`. Confirmed all 5 required sections (`doc-rules.md §4`) and 11 module contracts are 100% synchronized with zero behavioral drift.
+>   - **Package Documentation Alignment**: Confirmed `Cargo.toml [package.description]`, `src/lib.rs //!` crate-level overview, and `README.md` are 100% identical.
+>   - **`architecture.md § 6` & `§ 13` Dependency Rules Decoupled**: Updated `config` row in Dependency Direction Rules to remove `db (types only)` from *May Import*, placing `db` under *Must NOT Import* (reflecting Block 3 storage decoupling with 0 `crate::db` occurrences). Removed `& db` from the `config` edge in the Mermaid module interaction diagram.
+>   - **`architecture.md § 14` Review Remediation Synchronized**: Expanded §14 to document all 6 blocks and 37 resolved qualitative review findings, adding detailed summaries for Block 5 (Core Sync Engine Decoupling, Fast-Path Casing Alignment Bypass & Reparse Cache Hardening) and Block 6 (System Tray UI Modularization into `<400` LOC files, Explorer Space Quoting, CWE-117 Logging Defense).
+>   - **`architecture.md § 15` Storage Path Corrected**: Updated SQLite programmatic migration strategy path reference from `src/db.rs` to `src/db/sqlite.rs`.
+>   - **Quality Verification Gate**: All 422 automated tests (365 lib + 7 bin + 13 integration + 8 property + 20 snapshot + 9 doc-tests), `cargo doc --no-deps`, `cargo clippy -- -D warnings`, and `cargo fmt --check` passing with exit code 0.
+> * **New Constraints:**
+>   - `architecture.md` dependency rules and diagrams strictly reflect zero coupling between `config` and `db`.
+> * **Pruned:**
+>   - Stale `src/db.rs` path reference and residual `config` -> `db` dependency in architectural documentation eliminated.
+
