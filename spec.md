@@ -492,7 +492,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 
 ### 7. Tray Module
 
-> Manages the system tray icon, tooltips, checkable context menus, and event notifications. All windowing types (`winit`, `UserEvent`) are encapsulated behind `TrayEventLoop`.
+> Manages the system tray icon, tooltips, checkable context menus, and event notifications. Decomposed into `src/tray/{mod, state, dialog, menu, event_loop, assets}.rs`. All windowing types (`winit`, `UserEvent`) are encapsulated behind `TrayEventLoop`.
 
 #### Public API
 
@@ -503,15 +503,37 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `TrayEventLoop::status_observer` | `(&self) -> Arc<dyn SyncStatusObserver>` | `Arc<dyn SyncStatusObserver>` | Encapsulates `winit` event loop proxy |
 | `DestinationState::new` | `(path: impl Into<PathBuf>, is_online: impl Into<ConnectivityState>) -> Self` | `DestinationState` | — |
 | `DestinationState::with_resolved_unc` | `(mut self, resolved_unc: impl Into<Option<PathBuf>>) -> Self` | `DestinationState` | — |
-| `TrayState::new` | `(initial_dest_online: Vec<ConnectivityState>) -> Self` | `TrayState` | — |
+| `DestinationState::path` | `(&self) -> &Path` | `&Path` | — |
+| `DestinationState::is_online` | `(&self) -> ConnectivityState` | `ConnectivityState` | — |
+| `DestinationState::resolved_unc` | `(&self) -> Option<&Path>` | `Option<&Path>` | — |
+| `DestinationState::display_label` | `(&self) -> &str` | `&str` | Precomputed display label |
+| `TrayState::new` | `(initial_dest_online: impl IntoIterator<Item = impl Into<ConnectivityState>>) -> Self` | `TrayState` | — |
 | `TrayState::empty` | `() -> Self` | `TrayState` | — |
-| `TrayState::update_target_status` | `(&mut self, target_index: usize, online: ConnectivityState) -> bool` | `bool` (changed) | — |
+| `TrayState::update_target_status` | `(&mut self, target_index: usize, online: impl Into<ConnectivityState>) -> bool` | `bool` (changed) | — |
 | `TrayState::update_watcher_status` | `(&mut self, source_online: ConnectivityState, watcher_active: WatcherState) -> bool` | `bool` (changed) | — |
 | `TrayState::set_scan_notice` | `(&mut self, notice: Option<String>) -> bool` | `bool` | — |
 | `TrayState::overall_status` | `(&self) -> EngineStatus` | `EngineStatus` | — |
 | `TrayState::tooltip_text` | `(&self) -> String` | `String` | — |
-| `format_explorer_args` | `(path: &Path, is_dir: bool) -> Vec<OsString>` | `Vec<OsString>` | Formats single `/select,<path>` token for files, preventing default directory launch |
-| `open_path` | `(path: &Path) -> std::io::Result<()>` | `()` | Launches default Windows shell application via `%SystemRoot%\explorer.exe` |
+| `format_explorer_args` | `(path: &Path, is_dir: bool) -> Vec<OsString>` | `Vec<OsString>` | Formats directory path as-is, file without whitespace as `/select,<path>`, and file with whitespace as `/select,"<path>"` |
+| `open_path` | `(path: &Path) -> std::io::Result<()>` | `()` | Launches default Windows shell application via `%SystemRoot%\explorer.exe` using Win32 `raw_arg` for `/select,"<path>"` |
+
+#### Behavioral Scenarios
+
+[HAPPY] Explorer argument formatting for directories
+GIVEN a path representing a directory `C:\Program Files\SyncDir`
+WHEN `format_explorer_args(path, true)` is called
+THEN the argument vector contains exactly one element equal to the directory path as-is
+
+[HAPPY] Explorer argument formatting for file without whitespace
+GIVEN a path representing a file `C:\folder\file.txt`
+WHEN `format_explorer_args(path, false)` is called
+THEN the argument vector contains exactly `/select,C:\folder\file.txt`
+
+[HAPPY] Explorer argument formatting for file with whitespace
+GIVEN a path representing a file `C:\Program Files\App Data\log file.txt`
+WHEN `format_explorer_args(path, false)` is called
+THEN the argument vector contains `/select,"C:\Program Files\App Data\log file.txt"`
+AND `open_path` passes the argument using Win32 `raw_arg` to prevent shell quote escaping
 
 ---
 
@@ -571,7 +593,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `ValidationKind` | `enum: Security, ReparsePoint, RecursiveLoop, Invariant, Transient` | Typed validation classification with `is_permanent(&self) -> bool` |
 | `SyncError::WriteVerificationFailed` | `{ path: PathBuf }` | Distinct retryable write integrity failure |
 | `SyncError::LockPoison` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Mutex poisoning errors |
-| `SyncError::Watcher` | `(#[from] WatcherError)` | Directory watcher errors wrapping strongly typed `WatcherError` |
+| `SyncError::Watcher` | `(#[from] WatcherError)` | Directory watcher errors wrapping strongly typed `#[non_exhaustive] WatcherError` |
 | `SyncError::Tray` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | GUI / Tray notification errors |
 | `SyncError::Registry` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Windows registry errors |
 | `SyncError::validation` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Semantic validation error constructor (default Invariant) |
@@ -581,7 +603,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `SyncError::validation_loop` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Recursive loop validation constructor (RecursiveLoop) |
 | `SyncError::validation_invariant` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Domain invariant constructor (Invariant) |
 | `SyncError::is_permanent_validation_failure` | `(&self) -> bool` | `#[must_use]` Detects non-retryable fatal violations via `kind.is_permanent()` |
-| `SyncError::is_not_found` | `(&self) -> bool` | `#[must_use]` Detects `std::io::ErrorKind::NotFound` across IO variants |
+| `SyncError::is_not_found` | `(&self) -> bool` | `#[must_use]` Detects `std::io::ErrorKind::NotFound` across IO variants and `WatcherError::PathNotFound(_)` |
 | `SyncError::is_network_offline` | `(&self) -> bool` | `#[must_use]` Matches Win32 SMB disconnect error codes |
 | `SyncError::is_cancelled` | `(&self) -> bool` | `#[must_use]` Checks cancellation state |
 | `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps 9 standard `ErrorKind` variants and 11 Win32 error codes |
@@ -594,6 +616,27 @@ WHEN `is_permanent_validation_failure` is evaluated
 THEN permanent security and invariant violations (`Security`, `ReparsePoint`, `RecursiveLoop`) return `true`
 AND the item is evicted from the debounce retry queue without looping retries
 AND transient errors return `false`, preserving exponential backoff retries
+
+[ERROR] PathNotFound detection across Watcher and IO errors
+GIVEN a `SyncError::Watcher` wrapping `WatcherError::PathNotFound(path)`
+WHEN `is_not_found()` is called
+THEN it evaluates to `true`
+
+---
+
+### 11. Test Support Module
+
+> Canonical re-exports of test doubles and mock backends for multi-crate integration tests, hidden from public API documentation via `#[doc(hidden)]`.
+
+#### Public API
+
+| Type | Signature | Notes |
+|------|-----------|-------|
+| `test_support::MockHashStore` | `struct` | `#[doc(hidden)]` In-memory `HashStore` double |
+| `test_support::MockSyncEngine` | `struct` | `#[doc(hidden)]` In-memory `SyncEngine` double |
+| `test_support::MockSyncStatusObserver` | `struct` | `#[doc(hidden)]` In-memory status event collector |
+| `test_support::MockNetworkResolver` | `struct` | `#[doc(hidden)]` In-memory `NetworkResolver` double |
+| `test_support::MockStartupRegistry` | `struct` | `#[doc(hidden)]` In-memory `RegistryBackend` double |
 
 ---
  

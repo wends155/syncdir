@@ -88,8 +88,14 @@ syncdir/
     │       ├── context.rs # SyncWorkerContext, SyncWorkerContextBuilder with resolver DI
     │       ├── runner.rs # SyncWorkerRunner state machine with deterministic tick(now) stepping
     │       └── tests.rs  # 37 isolated unit tests for worker lifecycle and invariants
-    ├── tray.rs           # System tray icon event loop, menus, and process execution
     └── tray/
+        ├── mod.rs        # Tray facade, re-exporting submodules
+        ├── state.rs      # TrayState, DestinationState, EngineStatus, TrayExitReason
+        ├── state_tests.rs # 15 unit tests for TrayState and status transitions
+        ├── dialog.rs     # Win32 modal dialogs, open_path, format_explorer_args with whitespace quoting
+        ├── menu.rs       # TrayActionHandler, TrayMenuIds, build_tray_menu
+        ├── event_loop.rs # TrayEventLoop, TrayController, WinitStatusObserver, run_tray
+        ├── event_loop_tests.rs # Unit tests for event loop structures
         └── assets.rs     # Compile-time icon RGBA buffer generation, .rdata tables, and icon cache
 ```
 
@@ -176,8 +182,12 @@ syncdir/
 * **Does NOT own**: Filesystem watching, tray menu construction, or SQLite database operations.
 
 ### `tray`
-* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `TrayEventLoop::run`, displaying native error modal dialogs (`show_error_dialog`), event dispatching and UI loop abstraction via `TrayController` (`pub(crate)`), encapsulating winit event proxy behind `TrayEventLoop::status_observer() -> Arc<dyn SyncStatusObserver>`, managing `TrayState` (pure state container tracking strongly-typed `ConnectivityState` and `WatcherState` domain enum transitions, online destination counts, scan notices, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping with encapsulated precomputed `display_label`, state-transition-gated repaint Win32 IPC (suppressing duplicate `Shell_NotifyIconW` calls), guarded config reload background thread execution, qualified `%SystemRoot%\explorer.exe` process execution in `tray::open_path` reusing `path_util::system_root`, and toggling Windows startup registration via injected `RegistryBackend` trait (`TrayActionHandler`).
+* **Owns**: Creating the system tray icon, registering menu event handlers, executing the windowless message pump, displaying system toast notifications, signaling clean process restart via `TrayExitReason` enum return from `TrayEventLoop::run`, displaying native error modal dialogs (`show_error_dialog`), event dispatching and UI loop abstraction via `TrayController` (`pub(crate)`), encapsulating winit event proxy behind `TrayEventLoop::status_observer() -> Arc<dyn SyncStatusObserver>`, managing `TrayState` (pure state container tracking strongly-typed `ConnectivityState` and `WatcherState` domain enum transitions, online destination counts, scan notices, and tooltip text formatting without Win32/winit UI side-effects), `DestinationState` parameter grouping with encapsulated precomputed `display_label`, state-transition-gated repaint Win32 IPC (suppressing duplicate `Shell_NotifyIconW` calls), guarded config reload background thread execution, qualified `%SystemRoot%\explorer.exe` process execution in `tray::open_path` reusing `path_util::system_root` with whitespace-safe `/select,"<path>"` quoting using Win32 `raw_arg`, and toggling Windows startup registration via injected `RegistryBackend` trait (`TrayActionHandler`). Decomposed into modular submodules under `src/tray/` strictly complying with the <800 LOC rule:
 * **Submodules**:
+  * `tray::state`: `TrayState`, `DestinationState` (with encapsulated fields and builder), `EngineStatus`, and `TrayExitReason`.
+  * `tray::dialog`: Native Win32 modal dialogs (`show_about_dialog`, `show_error_dialog`), wide string helper `to_wide_null_terminated`, `open_path` (reusing `path_util::system_root`), and hardened `format_explorer_args` handling paths with whitespace via `/select,"<path>"` and Win32 `raw_arg`.
+  * `tray::menu`: `TrayActionHandler` trait, `TrayMenuIds`, and pure menu construction `build_tray_menu`.
+  * `tray::event_loop`: `TrayEventLoop`, `TrayController`, `WinitStatusObserver`, winit `UserEvent`, and `run_tray`.
   * `tray::assets`: Compile-time 32×32 RGBA icon buffer generation (`const fn generate_status_rgba`), static `.rdata` tables (`STATUS_RGBA`), zero-panic array caching (`ICON_CACHE` via `OnceLock<[Icon; EngineStatus::COUNT]>`), and graceful healthy fallback.
 
 * **Does NOT own**: Filesystem watching or database execution.
@@ -187,7 +197,10 @@ syncdir/
 * **Does NOT own**: Configuration validation, system diagnostic telemetry collection, or UI execution.
 * **Trait Interfaces**:
   * `RegistryBackend`: Interface for Windows startup registry operations.
-* **Mock Availability**: `MockStartupRegistry` (implemented in `src/startup.rs`) for cross-platform unit testing.
+* **Mock Availability**: `MockStartupRegistry` (implemented in `src/startup.rs` and re-exported under `test_support`) for cross-platform unit testing.
+
+### `test_support`
+* **Owns**: Canonical re-exports of test doubles (`MockHashStore`, `MockSyncEngine`, `MockSyncStatusObserver`, `MockNetworkResolver`, `MockStartupRegistry`) decorated with `#[doc(hidden)]` to isolate test scaffolding from public documentation while supporting integration test suites.
 
 ---
 
