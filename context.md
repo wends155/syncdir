@@ -901,6 +901,46 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Non-existent directories must never be cached in `ReparseCache`.
 >   - All archive pruning deletions must be guarded by TOCTOU symlink checks immediately before removal.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 6 — System Tray UI, Application Lifecycle & Quality Hardening (`src/tray/`, `src/error.rs`, `src/test_support.rs`, `src/sync/`)
+> * **Changes:**
+>   - **Decomposed Monolithic `src/tray.rs` (Findings 7, 25)**:
+>     - Decomposed `src/tray.rs` (1,173 LOC) into modular submodules under `src/tray/`:
+>       - `src/tray/mod.rs` (16 LOC): Pure subsystem facade re-exporting public and internal components.
+>       - `src/tray/state.rs` (279 LOC): Pure UI state container (`TrayState`, `DestinationState`, `EngineStatus`, `TrayExitReason`) with encapsulated fields and builder patterns.
+>       - `src/tray/state_tests.rs` (179 LOC): 15 isolated unit tests for `TrayState` transitions and repaint gating invariants.
+>       - `src/tray/dialog.rs` (244 LOC): Native Win32 modal dialogs (`show_about_dialog`, `show_error_dialog`), wide string null-terminated encoder (`to_wide_null_terminated`), `open_path` (reusing `path_util::system_root`), and hardened Explorer argument quoting (`format_explorer_args`).
+>       - `src/tray/menu.rs` (193 LOC): `TrayActionHandler` trait, `TrayMenuIds`, and pure context menu construction `build_tray_menu`.
+>       - `src/tray/event_loop.rs` (397 LOC): `TrayController`, `TrayEventLoop`, `WinitStatusObserver`, and `run_tray` event pump.
+>       - `src/tray/event_loop_tests.rs` (25 LOC): Event loop data structures and event debugging tests.
+>       - `src/tray/assets.rs` (197 LOC): Compile-time 32×32 RGBA icon generation and caching.
+>     - Every single file under `src/tray/` strictly satisfies the project's <400 LOC design guideline (well below the <800 LOC ceiling).
+>   - **Windows Explorer Argument Quoting (Finding 28)**:
+>     - Hardened `format_explorer_args` to format `/select,"<path>"` when file paths contain spaces, paired with Win32 `raw_arg` in `open_path` to prevent command shell quote stripping or corruption.
+>   - **Test Double Documentation Encapsulation (Finding 9)**:
+>     - Annotated canonical test doubles (`MockHashStore`, `MockSyncEngine`, `MockSyncStatusObserver`, `MockNetworkResolver`, `MockStartupRegistry`) with `#[doc(hidden)]` and re-exported them under `syncdir::test_support`.
+>   - **CWE-117 Log Injection Sanitization (Finding 29)**:
+>     - Converted all 10 Display path logging (`%path.display()`) and `#[tracing::instrument]` span attributes to Debug formatting (`?path`, `?dir`, `?source_root`, `?dest_dir`) across `src/sync/scanner.rs` and `src/sync/archive.rs`. Verified via scoped tracing capture tests.
+>   - **Watcher Error Forward-Compatibility & NotFound Classification (Finding 37)**:
+>     - Decorated `WatcherError` with `#[non_exhaustive]` in `src/error.rs` and extended `SyncError::is_not_found` to recognize `WatcherError::PathNotFound(_)`.
+>   - **Idle Broadcaster Loop Verification (Finding 30)**:
+>     - Verified `spawn_command_broadcaster` operates sleep-free using blocking `recv()` on `command_rx`.
+>   - **Test Suite Expansion & Quality Verification Gate**:
+>     - Full automated test suite expanded to 422 passing tests (365 lib unit, 7 bin unit, 13 integration, 8 property, 20 snapshot, 9 doc-tests).
+>     - 100% `rustfmt`, zero clippy warnings under `-D warnings`, zero AST-grep violations, and all module boundaries strictly validated.
+> * **New Constraints:**
+>   - All files under `src/tray/` must remain <400 LOC.
+>   - Win32 Explorer `/select,"<path>"` arguments for files with whitespace must be passed via `raw_arg`.
+>   - Test doubles must be decorated with `#[doc(hidden)]` and re-exported under `syncdir::test_support`.
+>   - Path logging and tracing spans in scanner and archive must use Debug formatting (`?path`) to prevent log injection (CWE-117).
+> * **Pruned:**
+>   - Monolithic `src/tray.rs` (1,173 LOC) eliminated.
+>   - Explorer launch failures for paths with spaces eliminated.
+>   - Test mock clutter from public API documentation eliminated.
+
+
 
 
 
