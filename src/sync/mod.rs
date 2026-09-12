@@ -11,17 +11,15 @@ pub(crate) mod mock;
 pub(crate) mod path_safety;
 pub(crate) mod scanner;
 pub(crate) mod small_file;
+pub mod traits;
 pub mod types;
 pub(crate) mod worker;
+pub use traits::*;
 
 pub use full_scan::{FullScanCoordinator, FullScanDriver};
 
 pub use delta::DirtyBlockRange;
-pub use engine::{
-    ArchiveEngine, BatchFlusher, ConnectivityState, FileDeleter, FileMetadataSnapshot,
-    FileSynchronizer, LocalSyncEngine, ScanEngine, ScanOutcome, SyncCommand, SyncEngine,
-    SyncStatusObserver, WatcherState,
-};
+pub use engine::{LocalSyncEngine, SyncCommand};
 pub use mock::{MockSyncEngine, MockSyncStatusObserver};
 pub use path_safety::{ReparseCache, is_safe_relative_path};
 #[allow(deprecated)]
