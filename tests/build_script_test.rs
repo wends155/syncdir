@@ -122,3 +122,65 @@ fn test_config_from_env_truthy_flags() {
         assert!(config.allow_missing_icon());
     }
 }
+
+#[test]
+fn test_resolve_toolkit_tier1_precedence() {
+    let mut config = ResourceBuildConfig::from_env_with(|_| None);
+    config.winres_toolkit_path = Some(std::path::PathBuf::from("C:\\ToolkitOverride"));
+    config.rc_path = Some(std::path::PathBuf::from("C:\\RcOverride\\rc.exe"));
+    let checker = |p: &std::path::Path| p == std::path::Path::new("C:\\ToolkitOverride");
+    assert_eq!(
+        config.resolve_toolkit_dir_with(checker),
+        Ok(Some(std::path::PathBuf::from("C:\\ToolkitOverride")))
+    );
+}
+
+#[test]
+fn test_resolve_toolkit_tier2_rc_path_file() {
+    let mut config = ResourceBuildConfig::from_env_with(|_| None);
+    config.rc_path = Some(std::path::PathBuf::from("C:\\Tools\\bin\\rc.exe"));
+    let checker = |p: &std::path::Path| p == std::path::Path::new("C:\\Tools\\bin\\rc.exe");
+    assert_eq!(
+        config.resolve_toolkit_dir_with(checker),
+        Ok(Some(std::path::PathBuf::from("C:\\Tools\\bin")))
+    );
+}
+
+#[test]
+fn test_resolve_toolkit_tier2_rc_path_dir() {
+    let mut config = ResourceBuildConfig::from_env_with(|_| None);
+    config.rc_path = Some(std::path::PathBuf::from("C:\\Tools\\bin"));
+    let checker = |p: &std::path::Path| {
+        p == std::path::Path::new("C:\\Tools\\bin\\rc.exe")
+            || p == std::path::Path::new("C:\\Tools\\bin\\windres.exe")
+    };
+    assert_eq!(
+        config.resolve_toolkit_dir_with(checker),
+        Ok(Some(std::path::PathBuf::from("C:\\Tools\\bin")))
+    );
+}
+
+#[test]
+fn test_resolve_toolkit_tier3_sdk_root() {
+    let mut config = ResourceBuildConfig::from_env_with(|_| None);
+    config.windows_sdk_path =
+        Some(std::path::PathBuf::from("C:\\Program Files (x86)\\Windows Kits\\10"));
+    let expected_bin =
+        std::path::PathBuf::from("C:\\Program Files (x86)\\Windows Kits\\10\\bin\\x64");
+    let checker = move |p: &std::path::Path| {
+        p == std::path::Path::new(
+            "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\x64\\rc.exe",
+        )
+    };
+    assert_eq!(
+        config.resolve_toolkit_dir_with(checker),
+        Ok(Some(expected_bin))
+    );
+}
+
+#[test]
+fn test_resolve_toolkit_tier4_fallback() {
+    let config = ResourceBuildConfig::from_env_with(|_| None);
+    let checker = |_p: &std::path::Path| false;
+    assert_eq!(config.resolve_toolkit_dir_with(checker), Ok(None));
+}

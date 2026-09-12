@@ -104,8 +104,28 @@ pub fn validate_icon_asset(path: &std::path::Path) -> Result<(), BuildResourceEr
     validate_icon_bytes(&header)
 }
 
-pub fn validate_path_safety(_path: &std::path::Path) -> Result<(), BuildResourceError> {
-    Err(BuildResourceError::UnsafePath("Stub".into()))
+pub fn validate_path_safety(path: &std::path::Path) -> Result<(), BuildResourceError> {
+    let path_str = path.to_str().ok_or_else(|| {
+        BuildResourceError::UnsafePath("Path contains invalid UTF-8 characters".to_string())
+    })?;
+
+    if path_str.contains('\0') {
+        return Err(BuildResourceError::UnsafePath(
+            "Path contains prohibited null byte".to_string(),
+        ));
+    }
+    if path_str.contains('"') {
+        return Err(BuildResourceError::UnsafePath(
+            "Path contains prohibited quote characters".to_string(),
+        ));
+    }
+    if path_str.chars().any(|c| c.is_control()) {
+        return Err(BuildResourceError::UnsafePath(
+            "Path contains prohibited control characters".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,17 +143,27 @@ impl ResourceBuildConfig {
         Self::from_env_with(|var| std::env::var(var).ok())
     }
 
-    pub fn from_env_with<E>(_lookup: E) -> Self
+    pub fn from_env_with<E>(lookup: E) -> Self
     where
         E: Fn(&str) -> Option<String>,
     {
+        let read_path = |var: &str| {
+            lookup(var)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+        };
+        let allow_missing = lookup("SYNCDIR_ALLOW_MISSING_ICON")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
         Self {
-            winres_toolkit_path: None,
-            rc_path: None,
-            windows_sdk_path: None,
-            allow_missing_icon: false,
-            profile: String::new(),
-            target_os: String::new(),
+            winres_toolkit_path: read_path("WINRES_TOOLKIT_PATH"),
+            rc_path: read_path("RC_PATH"),
+            windows_sdk_path: read_path("WINDOWS_SDK_PATH"),
+            allow_missing_icon: allow_missing,
+            profile: lookup("PROFILE").unwrap_or_default(),
+            target_os: lookup("CARGO_CFG_TARGET_OS").unwrap_or_default(),
         }
     }
 
@@ -145,6 +175,17 @@ impl ResourceBuildConfig {
     #[must_use]
     pub fn allow_missing_icon(&self) -> bool {
         self.allow_missing_icon
+    }
+
+    pub fn resolve_toolkit_dir(&self) -> Result<Option<std::path::PathBuf>, BuildResourceError> {
+        self.resolve_toolkit_dir_with(|p| p.exists())
+    }
+
+    pub fn resolve_toolkit_dir_with<F>(&self, _checker: F) -> Result<Option<std::path::PathBuf>, BuildResourceError>
+    where
+        F: Fn(&std::path::Path) -> bool,
+    {
+        Ok(None)
     }
 }
 
