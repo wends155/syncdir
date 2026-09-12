@@ -89,7 +89,7 @@ impl HashStore for MockHashStore {
     }
 
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
-        let key = record.relative_path().to_sqlite_key().to_lowercase();
+        let key = record.relative_path().as_forward_slash_str().to_ascii_lowercase();
         let mut inner = self
             .inner
             .write()
@@ -211,7 +211,7 @@ impl HashStore for MockHashStore {
         inner.batch_save_calls += 1;
 
         for (record, hashes) in records {
-            let key = record.relative_path().to_sqlite_key().to_lowercase();
+            let key = record.relative_path().as_forward_slash_str().to_ascii_lowercase();
             let id = if let Some(existing) = inner.records.get(&key) {
                 existing.id().unwrap_or(1)
             } else {

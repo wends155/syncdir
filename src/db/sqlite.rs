@@ -185,7 +185,7 @@ impl HashStore for SqliteHashStore {
         level = "debug"
     )]
     fn save_file(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError> {
-        let key = record.relative_path().to_sqlite_key();
+        let key = record.relative_path().as_forward_slash_str();
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
@@ -248,7 +248,7 @@ impl HashStore for SqliteHashStore {
             )?;
 
             for (record, hashes) in records {
-                let key = record.relative_path().to_sqlite_key();
+                let key = record.relative_path().as_forward_slash_str();
                 let file_id: i64 = meta_stmt.query_row(
                     params![key, record.file_size() as i64, record.last_modified()],
                     |row| row.get(0),

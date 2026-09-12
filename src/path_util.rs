@@ -269,6 +269,7 @@ impl RelativePath {
     /// # Errors
     /// Returns `SyncError::Validation` if the path is empty, absolute, contains directory traversals,
     /// DOS device names, Alternate Data Streams, or other unsafe patterns.
+    #[must_use]
     pub fn try_new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
         let p = path.as_ref();
         if p.as_os_str().is_empty() || p.to_string_lossy().trim().is_empty() {
@@ -303,6 +304,7 @@ impl RelativePath {
     /// Construct a new `RelativePath`, validating security invariants and normalizing slashes to `/`.
     /// Inline wrapper around `RelativePath::try_new`.
     #[inline]
+    #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
         Self::try_new(path)
     }
@@ -319,18 +321,36 @@ impl RelativePath {
 
     /// Borrows the underlying path slice.
     #[inline]
+    #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.0
     }
 
+    /// Borrows the normalized forward-slash string representation with zero heap allocations.
+    #[inline]
+    #[must_use]
+    pub fn as_forward_slash_str(&self) -> &str {
+        self.0.to_str().unwrap_or("")
+    }
+
+    /// Converts to canonical storage key format (forward-slash delimited).
+    #[inline]
+    #[must_use]
+    pub fn to_storage_key(&self) -> String {
+        self.as_forward_slash_str().to_string()
+    }
+
     /// Converts to SQLite storage key format.
     #[inline]
+    #[must_use]
+    #[deprecated(since = "0.2.0", note = "use to_storage_key or as_forward_slash_str instead")]
     pub fn to_sqlite_key(&self) -> String {
-        self.0.to_string_lossy().into_owned()
+        self.to_storage_key()
     }
 
     /// Returns a new `RelativePath` with ASCII characters converted to lowercase.
     #[inline]
+    #[must_use]
     pub fn to_ascii_lowercase(&self) -> Self {
         Self(PathBuf::from(self.0.to_string_lossy().to_ascii_lowercase()))
     }
@@ -731,8 +751,13 @@ mod tests {
             "RelativePath(\"docs/nested/spec.txt\")"
         );
 
-        // to_sqlite_key
-        assert_eq!(rel.to_sqlite_key(), "docs/nested/spec.txt");
+        // Storage key and forward-slash string
+        assert_eq!(rel.as_forward_slash_str(), "docs/nested/spec.txt");
+        assert_eq!(rel.to_storage_key(), "docs/nested/spec.txt");
+        #[allow(deprecated)]
+        {
+            assert_eq!(rel.to_sqlite_key(), "docs/nested/spec.txt");
+        }
 
         // to_ascii_lowercase
         let upper_rel = RelativePath::new("Docs/Nested/SPEC.txt").unwrap();
@@ -804,5 +829,30 @@ mod tests {
         let diff = PathBuf::from("other/file.txt");
         assert_ne!(rel, diff);
         assert_ne!(diff, rel);
+    }
+
+    #[test]
+    fn test_relative_path_as_forward_slash_str_and_storage_key() {
+        let rp = RelativePath::try_new("nested/subfolder/file.txt").unwrap();
+        assert_eq!(rp.as_forward_slash_str(), "nested/subfolder/file.txt");
+        assert_eq!(rp.to_storage_key(), "nested/subfolder/file.txt");
+
+        // Backslash input is normalized to forward-slash internally
+        let rp_back = RelativePath::try_new(r"deep\windows\path.rs").unwrap();
+        assert_eq!(rp_back.as_forward_slash_str(), "deep/windows/path.rs");
+        assert_eq!(rp_back.to_storage_key(), "deep/windows/path.rs");
+
+        // Unicode character preservation
+        let rp_unicode = RelativePath::try_new("docs/rapport_été_2026.pdf").unwrap();
+        assert_eq!(rp_unicode.as_forward_slash_str(), "docs/rapport_été_2026.pdf");
+        assert_eq!(rp_unicode.to_storage_key(), "docs/rapport_été_2026.pdf");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_relative_path_to_sqlite_key_deprecated_shim() {
+        let rp = RelativePath::try_new("legacy/key/test.txt").unwrap();
+        assert_eq!(rp.to_sqlite_key(), "legacy/key/test.txt");
+        assert_eq!(rp.to_sqlite_key(), rp.to_storage_key());
     }
 }
