@@ -395,7 +395,6 @@ mod tests {
     #[test]
     fn test_file_watcher_trait_mockability() {
         use crate::error::SyncError;
-        use crate::monitor::{FileWatcher, WatcherFactory};
         use crate::sync::SyncCommand;
         use std::path::Path;
         use std::sync::Arc;
@@ -458,7 +457,6 @@ mod tests {
 
     #[test]
     fn test_handle_rename_pair_case_only_dispatches_file_modified() {
-        use crate::monitor::DirectoryWatcher;
         use crate::path_util::RelativePath;
         use crate::sync::engine::SyncCommand;
         use std::path::PathBuf;

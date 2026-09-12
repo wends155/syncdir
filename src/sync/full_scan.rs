@@ -81,7 +81,7 @@ pub trait FullScanDriver: Send + Sync {
     -> Result<(HashSet<PathBuf>, bool), SyncError>;
 
     /// Load existing database records for comparison.
-    fn load_cached_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError>;
+    fn load_cached_records(&self) -> Result<Vec<FileRecord>, SyncError>;
 
     /// Synchronize a single file to the destination directory.
     fn sync_file_core(
@@ -157,7 +157,7 @@ impl<S: HashStore> FullScanDriver for LocalSyncEngine<S> {
         Ok((source_files, scan_complete))
     }
 
-    fn load_cached_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
+    fn load_cached_records(&self) -> Result<Vec<FileRecord>, SyncError> {
         self.db().list_all_records()
     }
 
@@ -230,17 +230,17 @@ impl<'a, D: FullScanDriver + ?Sized> FullScanCoordinator<'a, D> {
     }
 
     /// Stage 3: Load existing database records and construct normalized lookup map.
-    pub(crate) fn load_cached_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
+    pub(crate) fn load_cached_records(&self) -> Result<Vec<FileRecord>, SyncError> {
         self.driver.load_cached_records()
     }
 
     /// Build normalized lookup mapping relative paths to database records.
     pub(crate) fn build_cache_lookup<'b>(
         &self,
-        cached_records: &'b HashMap<PathBuf, FileRecord>,
+        cached_records: &'b [FileRecord],
     ) -> HashMap<NormalizedCaseFoldedPath<'b>, &'b FileRecord> {
         cached_records
-            .values()
+            .iter()
             .map(|rec| (NormalizedCaseFoldedPath(rec.relative_path().as_path()), rec))
             .collect()
     }
@@ -333,7 +333,7 @@ impl<'a, D: FullScanDriver + ?Sized> FullScanCoordinator<'a, D> {
         &self,
         active_dest: &Path,
         source_files: &HashSet<PathBuf>,
-        cached_records: &HashMap<PathBuf, FileRecord>,
+        cached_records: &[FileRecord],
         scan_complete: bool,
     ) -> Result<usize, SyncError> {
         if !self.driver.propagate_deletions() {
@@ -364,14 +364,14 @@ impl<'a, D: FullScanDriver + ?Sized> FullScanCoordinator<'a, D> {
         let mut delete_skip_count = 0usize;
         let mut missing_to_delete: Vec<&Path> = Vec::new();
 
-        for tracked_path in cached_records.keys() {
+        for record in cached_records {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(SyncError::Cancelled);
             }
+            let tracked_path = record.relative_path().as_path();
 
             #[cfg(windows)]
-            let is_present =
-                source_lookup.contains(&NormalizedCaseFoldedPath(tracked_path.as_path()));
+            let is_present = source_lookup.contains(&NormalizedCaseFoldedPath(tracked_path));
             #[cfg(not(windows))]
             let is_present = source_files.contains(tracked_path);
 
@@ -404,7 +404,7 @@ impl<'a, D: FullScanDriver + ?Sized> FullScanCoordinator<'a, D> {
                     );
                     delete_skip_count += 1;
                 } else {
-                    missing_to_delete.push(tracked_path.as_path());
+                    missing_to_delete.push(tracked_path);
                 }
             }
         }
@@ -610,9 +610,7 @@ mod tests {
         use crate::config::{Config, TargetSyncConfig};
         use crate::db::{FileRecord, MockHashStore};
         use crate::sync::engine::LocalSyncEngine;
-        use crate::sync::full_scan::{FullScanCoordinator, NormalizedCaseFoldedPath};
-        use std::collections::HashMap;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use std::sync::atomic::AtomicBool;
         use tempfile::tempdir;
 
@@ -625,15 +623,13 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let coordinator = FullScanCoordinator::new(&engine, &dst, &cancel);
 
-        let mut cached_records = HashMap::new();
         let rec1 = FileRecord::from_raw("Docs/Architecture.md", 2048, 1000)
             .unwrap()
             .with_id(1);
         let rec2 = FileRecord::from_raw(r"Assets\Icons\Logo.PNG", 4096, 2000)
             .unwrap()
             .with_id(2);
-        cached_records.insert(PathBuf::from("Docs/Architecture.md"), rec1);
-        cached_records.insert(PathBuf::from(r"Assets\Icons\Logo.PNG"), rec2);
+        let cached_records = vec![rec1, rec2];
 
         let lookup = coordinator.build_cache_lookup(&cached_records);
 
@@ -655,9 +651,229 @@ mod tests {
         ))));
     }
 
+    /// Pure in-memory driver for [`FullScanCoordinator`].
+    #[derive(Clone, Debug)]
+    pub(crate) struct MockFullScanDriver {
+        source_files: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+        scan_complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cached_records: std::sync::Arc<std::sync::Mutex<Vec<crate::db::FileRecord>>>,
+        synced_files: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
+        deleted_files: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        archived_files: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        pruned_archives: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        propagate_deletions: bool,
+        block_size: u64,
+        dest_unreachable: bool,
+    }
+
+    impl Default for MockFullScanDriver {
+        fn default() -> Self {
+            Self {
+                source_files: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+                scan_complete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                cached_records: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                synced_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                deleted_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                archived_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                pruned_archives: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                propagate_deletions: true,
+                block_size: 4096,
+                dest_unreachable: false,
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    impl MockFullScanDriver {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn with_source_files(self, files: impl IntoIterator<Item = PathBuf>) -> Self {
+            let mut sf = self.source_files.lock().unwrap_or_else(|p| p.into_inner());
+            sf.extend(files);
+            drop(sf);
+            self
+        }
+
+        pub fn with_scan_complete(self, complete: bool) -> Self {
+            self.scan_complete
+                .store(complete, std::sync::atomic::Ordering::Relaxed);
+            self
+        }
+
+        pub fn with_cached_records(
+            self,
+            records: impl IntoIterator<Item = (PathBuf, u64, u64)>,
+        ) -> Self {
+            let mut cr = self
+                .cached_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for (i, (path, size, mtime)) in records.into_iter().enumerate() {
+                let rec = crate::db::FileRecord::from_raw(&path, size, mtime as i64)
+                    .unwrap_or_else(|_| {
+                        let rel = crate::path_util::RelativePath::try_new("fallback.txt").unwrap();
+                        crate::db::FileRecord::new(rel, size, mtime as i64)
+                    })
+                    .with_id(i as i64 + 1);
+                cr.push(rec);
+            }
+            drop(cr);
+            self
+        }
+
+        pub fn with_propagate_deletions(mut self, propagate: bool) -> Self {
+            self.propagate_deletions = propagate;
+            self
+        }
+
+        pub fn with_dest_unreachable(mut self, unreachable: bool) -> Self {
+            self.dest_unreachable = unreachable;
+            self
+        }
+
+        pub fn synced_files(&self) -> Vec<(PathBuf, PathBuf)> {
+            self.synced_files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+
+        pub fn deleted_files(&self) -> Vec<PathBuf> {
+            self.deleted_files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    impl FullScanDriver for MockFullScanDriver {
+        fn resolve_active_destination(
+            &self,
+            dest_dir: &Path,
+        ) -> Result<Option<PathBuf>, SyncError> {
+            if self.dest_unreachable {
+                Ok(None)
+            } else {
+                Ok(Some(dest_dir.to_path_buf()))
+            }
+        }
+
+        fn scan_source_files(
+            &self,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<(std::collections::HashSet<PathBuf>, bool), SyncError> {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(SyncError::Cancelled);
+            }
+            let files = self
+                .source_files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            let complete = self
+                .scan_complete
+                .load(std::sync::atomic::Ordering::Relaxed);
+            Ok((files, complete))
+        }
+
+        fn load_cached_records(&self) -> Result<Vec<crate::db::FileRecord>, SyncError> {
+            Ok(self
+                .cached_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone())
+        }
+
+        fn sync_file_core(
+            &self,
+            rel_path: &Path,
+            dest_dir: &Path,
+            _scratch: &mut [u8],
+            _cached: Option<&crate::db::FileRecord>,
+        ) -> Result<Option<(crate::db::FileRecord, Vec<crate::db::BlockHash>)>, SyncError> {
+            self.synced_files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((rel_path.to_path_buf(), dest_dir.to_path_buf()));
+            let rec = crate::db::FileRecord::from_raw(rel_path, 100, 1000).unwrap_or_else(|_| {
+                let rel = crate::path_util::RelativePath::try_new("fallback.txt").unwrap();
+                crate::db::FileRecord::new(rel, 100, 1000)
+            });
+            Ok(Some((rec, vec![])))
+        }
+
+        fn archive_dest_file_only(
+            &self,
+            rel_path: &Path,
+            _dest_dir: &Path,
+        ) -> Result<(), SyncError> {
+            self.archived_files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(rel_path.to_path_buf());
+            Ok(())
+        }
+
+        fn delete_files_batch(&self, paths: &[&Path]) -> Result<(), SyncError> {
+            let mut deleted = self.deleted_files.lock().unwrap_or_else(|p| p.into_inner());
+            let mut cached = self
+                .cached_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for p in paths {
+                deleted.push(p.to_path_buf());
+            }
+            cached.retain(|r| !paths.contains(&r.relative_path().as_path()));
+            Ok(())
+        }
+
+        fn flush_record_batch(
+            &self,
+            batch: &mut Vec<(crate::db::FileRecord, Vec<crate::db::BlockHash>)>,
+        ) -> Result<(), SyncError> {
+            batch.clear();
+            Ok(())
+        }
+
+        fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
+            self.pruned_archives
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(dest_dir.to_path_buf());
+            Ok(())
+        }
+
+        fn propagate_deletions(&self) -> bool {
+            self.propagate_deletions
+        }
+
+        fn block_size_bytes(&self) -> u64 {
+            self.block_size
+        }
+    }
+
+    #[test]
+    fn test_mock_full_scan_driver_in_memory() {
+        let driver = MockFullScanDriver::new()
+            .with_source_files(vec![PathBuf::from("a.txt")])
+            .with_cached_records(vec![(PathBuf::from("b.txt"), 50, 1000)])
+            .with_scan_complete(true);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (files, complete) = driver.scan_source_files(&cancel).unwrap();
+        assert!(complete);
+        assert_eq!(files.len(), 1);
+        assert!(files.contains(&PathBuf::from("a.txt")));
+        let records = driver.load_cached_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].relative_path().as_path(), Path::new("b.txt"));
+    }
+
     #[test]
     fn test_full_scan_driver_cancellation_guards_deletions() {
-        use crate::sync::mock::MockFullScanDriver;
         let dst = Path::new("dst");
         let cancel = AtomicBool::new(false);
         let driver = MockFullScanDriver::new()

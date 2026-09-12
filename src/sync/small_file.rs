@@ -443,7 +443,6 @@ mod tests {
     #[test]
     fn test_sync_small_file_staging_nonce_and_buffer_fallback() {
         use crate::config::{TargetSyncConfig, VerificationMode};
-        use crate::sync::small_file::SmallFileTransferEngine;
         use crate::sync::types::{FileSyncTask, RelativePath, safe_modified_millis};
         use std::fs;
         use tempfile::tempdir;

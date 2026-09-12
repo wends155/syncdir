@@ -844,7 +844,6 @@ mod tests {
 
     #[test]
     fn test_verify_destination_not_reparse_cached_zero_allocation_iteration() {
-        use crate::sync::path_safety::{ReparseCache, verify_destination_not_reparse_cached};
         use std::fs;
         use std::path::Path;
         use tempfile::tempdir;

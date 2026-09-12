@@ -836,6 +836,23 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - All 7 architectural drift areas from `architecture_recommendations_report.md` resolved.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 2 — Storage Subsystem Decoupling (`src/db/`)
+> * **Changes:**
+>   - **Decomposed `src/db.rs` Monolith (Finding 4)**: Decomposed monolithic `src/db.rs` (54.5 KB, 1,563 LOC) into a structured 4-file submodule: `src/db/traits.rs` (pure storage traits/records, zero `rusqlite` dependencies), `src/db/mock.rs` (in-memory test double), `src/db/sqlite.rs` (concrete SQLite engine), and `src/db/mod.rs` (facade with explicit non-wildcard re-exports). Deleted legacy `src/db.rs`.
+>   - **Zero-Allocation Record Ingestion (Finding 15)**: Shifted `HashStore::list_all_records` signature from `Result<HashMap<PathBuf, FileRecord>, SyncError>` to flat `Result<Vec<FileRecord>, SyncError>`. Updated `FullScanDriver`, `LocalSyncEngine`, and `FullScanCoordinator` (`load_cached_records`, `build_cache_lookup`, and `reconcile_deletions`) to consume borrowed slice lookups, eliminating intermediate map allocations during full directory scans.
+>   - **Atomic Single-Transaction File Deletion (Finding 17)**: Refactored `SqliteHashStore::delete_file` to delegate directly to `self.delete_files_batch(&[path])`, ensuring all single-file deletions and cascades execute inside an atomic SQLite transaction with complete rollback on failure.
+>   - **Exact Unicode Path Key Preservation (Finding 27)**: Removed `normalize_superscripts_cow` from `path_to_sqlite_key` to preserve exact UTF-8 filename bytes on disk (e.g., `doc¹.txt` $\ne$ `doc1.txt`), preventing signature cache misses and key collisions.
+>   - **Test Expansion & TDD Verification**: Added 5 new TDD unit test suites (unicode fidelity, atomic rollback via aborting trigger, mixed batch deletions, and flat vector record enumeration). Expanded test suite from 381 to 386 tests (326 lib, 7 bin, 13 integration, 8 property, 20 snapshot, 12 doc-tests).
+>   - **Quality Gate**: 100% `rustfmt`, zero clippy warnings (`-D warnings`), zero AST-grep violations, and zero circular imports.
+> * **New Constraints:**
+>   - `src/db/traits.rs` is a pure leaf domain layer with zero `rusqlite` dependencies.
+>   - All file deletions in `SqliteHashStore` must execute within explicit transaction boundaries.
+>   - `FileRecord` field encapsulation must be respected across submodules via public accessors (`relative_path()`, `file_size()`, `last_modified()`, `id()`).
+
+
 
 
 

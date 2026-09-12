@@ -236,7 +236,6 @@ mod tests {
     #[test]
     fn test_directory_scanner_discovers_files_and_ignores_junctions() {
         use crate::config::{Config, TargetSyncConfig};
-        use crate::sync::scanner::DirectoryScanner;
         use std::collections::HashSet;
         use std::fs;
         use std::path::Path;

@@ -891,14 +891,6 @@ impl TrayEventLoop {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn system_root() -> PathBuf {
-    std::env::var("SystemRoot")
-        .or_else(|_| std::env::var("windir"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
-}
-
 /// Format command line arguments for launching the system file explorer.
 ///
 /// For directories, returns the path as-is to navigate into the directory.
@@ -927,7 +919,7 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let explorer = system_root().join("explorer.exe");
+        let explorer = crate::path_util::system_root().join("explorer.exe");
         if !explorer.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

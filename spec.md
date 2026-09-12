@@ -138,7 +138,6 @@ AND construction fails immediately
 | `is_same_or_descendant` | `(base: &Path, target: &Path) -> bool` | `bool` | Evaluates path hierarchy without I/O or canonicalization |
 | `is_safe_relative_path` | `(path: &Path) -> bool` | `bool` | Validates relative path safety against traversal, devices, ADS, and root prefixes |
 | `normalize_superscripts_cow` | `(s: &str) -> Cow<'_, str>` | `Cow<'_, str>` | Zero-allocation superscript normalization (allocates only if superscripts present) |
-| `open_path` | `(path: &Path) -> std::io::Result<()>` | `std::io::Result<()>` | Deprecated; forwards to `syncdir::tray::open_path` |
 
 #### Behavioral Scenarios
 
@@ -185,8 +184,10 @@ AND unrelated paths return `false`
 | `HashStore::save_file` | `(&self, record: &FileRecord, hashes: &[BlockHash]) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
 | `HashStore::save_files_batch` | `(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError>` | `()` | `SyncError::Db` (batch atomic UPSERT) |
 | `HashStore::get_block_hashes` | `(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError>` | `Vec<BlockHash>` | `SyncError::Db` |
-| `HashStore::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
+| `HashStore::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Db` (atomic transaction with rollback) |
+| `HashStore::delete_files_batch` | `(&self, paths: &[&Path]) -> Result<(), SyncError>` | `()` | `SyncError::Db` (atomic batch deletion transaction) |
 | `HashStore::list_files` | `(&self) -> Result<Vec<RelativePath>, SyncError>` | `Vec<RelativePath>` | `SyncError::Db` |
+| `HashStore::list_all_records` | `(&self) -> Result<Vec<FileRecord>, SyncError>` | `Vec<FileRecord>` | `SyncError::Db` (zero-allocation bulk record preload) |
 | `SqliteHashStore::new` | `(db_path: &Path, config: impl Into<StoreConfig>) -> Result<Self, SyncError>` | `SqliteHashStore` | `SyncError::Db` |
 | `SqliteHashStore::cache_db_path` | `(app_dir: &Path, target_dest: &Path) -> PathBuf` | `PathBuf` | — (deterministic `sigcache_<blake3>.db` path generation) |
 | `MockHashStore::new` | `() -> Self` | `MockHashStore` | — |
@@ -200,11 +201,27 @@ GIVEN a relative path with Windows backslashes `r"documents\subfolder\notes.txt"
 WHEN `path_to_sqlite_key` is called
 THEN the path is returned as a forward-slash key `"documents/subfolder/notes.txt"`
 
+[HAPPY] Exact Unicode superscript key preservation
+GIVEN a relative path with Unicode superscript characters `r"notes\doc¹.txt"`
+WHEN `path_to_sqlite_key` is called
+THEN the exact Unicode characters are preserved as `"notes/doc¹.txt"` without lossy normalization
+
 [HAPPY] Safe directory deletion without wildcard expansion
 GIVEN records for `"test_1/file.txt"` and `"test-1/file.txt"` in SQLite
 WHEN `delete_file` is called for `"test_1"`
 THEN only `"test_1/file.txt"` is removed using exact prefix `substr(relative_path, 1, length(?1) + 1) = ?1 || '/'`
 AND `"test-1/file.txt"` remains intact
+
+[ERROR] Atomic rollback on single file deletion failure
+GIVEN an existing record with block hashes in SQLite
+WHEN `delete_file` encounters a database failure or trigger abort
+THEN the deletion transaction is rolled back completely
+AND the record and block hashes remain preserved in SQLite
+
+[HAPPY] Flat record enumeration for zero-allocation cache lookup
+GIVEN multiple records stored in the SQLite database
+WHEN `list_all_records` is called
+THEN records are returned as a flat `Vec<FileRecord>` ready for borrowed zero-allocation slice iteration in `FullScanCoordinator`
 
 [HAPPY] Efficient UPSERT with RETURNING id
 GIVEN a new file record saved via `save_file`
@@ -236,7 +253,7 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `LocalSyncEngine::evict_verified_dir` | `(&self, dir: &Path)` | `()` | — (evicts dir and descendants from cache) |
 | `LocalSyncEngine::reparse_cache` | `(&self) -> &Arc<ReparseCache>` | `&Arc<ReparseCache>` | — (public accessor returning re-exported ReparseCache) |
 | `FullScanDriver` | `trait: Send + Sync` | — | Decoupled driver abstraction required by `FullScanCoordinator` |
-| `MockFullScanDriver::new` | `() -> Self` | `MockFullScanDriver` | Pure in-memory mock implementation of `FullScanDriver` |
+| `MockFullScanDriver::new` | `() -> Self` | `MockFullScanDriver` | Internal test double for `FullScanCoordinator` tests (scoped to `sync::full_scan::tests`) |
 | `FullScanCoordinator::new` | `(driver: &'a D, dest_dir: &'a Path, cancel: &'a AtomicBool) -> Self` | `FullScanCoordinator<'a, D>` | — (decomposed pipeline coordinator for full directory scans) |
 | `FullScanCoordinator::run` | `(self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` (deletion reconciliation guarded by `scan_complete`) |
 | `start_sync_worker` | `<E: SyncEngine + 'static>(context: SyncWorkerContext<E>) -> Result<JoinHandle<()>, SyncError>` | `Result<JoinHandle<()>, SyncError>` | `SyncError::Io` (thread spawn failure) |

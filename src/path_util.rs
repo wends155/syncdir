@@ -170,41 +170,6 @@ pub fn system_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
 }
 
-/// Launches the system file explorer targeting the specified path.
-///
-/// Returns `Err(std::io::Error)` with `ErrorKind::NotFound` if the path does not exist
-/// or if explorer is not found.
-#[deprecated(since = "0.1.13", note = "Use tray::open_path instead")]
-pub fn open_path(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Path does not exist: {}", path.display()),
-        ));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let explorer = system_root().join("explorer.exe");
-        if !explorer.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Explorer executable not found at {}", explorer.display()),
-            ));
-        }
-        std::process::Command::new(explorer).arg(path).spawn()?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        std::process::Command::new(opener).arg(path).spawn()?;
-    }
-    Ok(())
-}
-
 pub(crate) fn normalize_superscripts_cow<'a>(s: &'a str) -> Cow<'a, str> {
     if !s.bytes().any(|b| b >= 0x80) {
         return Cow::Borrowed(s);
@@ -582,7 +547,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_path_util_hierarchies_and_system_root() {
         assert!(is_same_or_descendant(
             Path::new(r"C:\Users\Documents"),
@@ -599,9 +563,6 @@ mod tests {
 
         let sys_root = system_root();
         assert!(!sys_root.as_os_str().is_empty());
-
-        let res = open_path(Path::new(r"C:\NonExistent_syncdir_dummy_path_12345"));
-        assert!(res.is_err());
     }
 
     #[test]

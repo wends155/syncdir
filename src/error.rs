@@ -544,7 +544,6 @@ mod tests {
 
     #[test]
     fn test_from_watcher_error_for_sync_error_causal_chain() {
-        use crate::error::{SyncError, WatcherError};
         use std::error::Error;
 
         let path = std::path::PathBuf::from("C:\\missing\\path");

@@ -2352,7 +2352,6 @@ mod tests {
     fn test_delete_file_from_dest_symmetrical_reparse_eviction() {
         use crate::config::{Config, TargetSyncConfig};
         use crate::db::MockHashStore;
-        use crate::sync::engine::LocalSyncEngine;
         use std::fs;
         use std::path::Path;
         use tempfile::tempdir;
@@ -2402,7 +2401,6 @@ mod tests {
     fn test_case_only_rename_on_destination_updates_disk_casing_and_db() {
         use crate::config::{Config, TargetSyncConfig};
         use crate::db::{HashStore, SqliteHashStore, StoreConfig};
-        use crate::sync::engine::LocalSyncEngine;
         use std::fs;
         use std::path::Path;
         use tempfile::tempdir;
