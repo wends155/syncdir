@@ -1,0 +1,1202 @@
+use super::*;
+use crate::config::{Config, TargetDir, TargetSyncConfig};
+use crate::db::MockHashStore;
+use crate::path_util::RelativePath;
+use crate::sync::engine::{LocalSyncEngine, ScanOutcome, SyncCommand, SyncStatusObserver};
+use crate::sync::mock::MockSyncEngine;
+use pretty_assertions::assert_eq;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tempfile::tempdir;
+
+#[test]
+fn test_debounce_queue_action_replacement_at_capacity() {
+    let mut q = DebounceQueue::new(2);
+    let path1 = PathBuf::from("file1.txt");
+    let path2 = PathBuf::from("file2.txt");
+    let path3 = PathBuf::from("file3.txt");
+
+    // Fill queue to max_capacity (2) with pending deletes
+    assert!(q.enqueue_delete(path1.clone(), Duration::from_secs(10)));
+    assert!(q.enqueue_delete(path2.clone(), Duration::from_secs(10)));
+    assert_eq!(q.len(), 2);
+
+    // New untracked path must be rejected due to capacity limit
+    assert!(!q.enqueue_sync(path3.clone(), Duration::from_secs(10)));
+    assert_eq!(q.len(), 2);
+
+    // Tracked path in pending_deletes must be accepted for action replacement (sync replacing delete)
+    assert!(q.enqueue_sync(path1.clone(), Duration::from_secs(5)));
+    assert_eq!(q.len(), 2);
+
+    // Vice-versa: tracked path in pending_syncs must be accepted for delete replacement
+    assert!(q.enqueue_delete(path1.clone(), Duration::from_secs(5)));
+    assert_eq!(q.len(), 2);
+}
+
+#[test]
+fn test_debounce_queue_heap_compaction() {
+    let mut q = DebounceQueue::new(100);
+    let path = PathBuf::from("frequently_edited.txt");
+
+    // Enqueue the same path 1000 times with updated deadlines
+    for i in 1..=1000 {
+        q.enqueue_sync(path.clone(), Duration::from_millis(i * 10));
+    }
+
+    // Only 1 item is logically pending
+    assert_eq!(q.len(), 1);
+    // Compaction must have run and kept heap size bounded well below 1000
+    assert!(
+        q.sync_heap.len() <= 64,
+        "Heap size not bounded: {}",
+        q.sync_heap.len()
+    );
+}
+
+#[test]
+fn test_debounce_queue_drain_safety() {
+    let mut q = DebounceQueue::new(10);
+    let now = Instant::now();
+
+    // Empty queue drain returns empty vec without panic
+    assert!(q.drain_ready_syncs(now).is_empty());
+    assert!(q.drain_ready_deletes(now).is_empty());
+
+    // Enqueue items
+    let p1 = PathBuf::from("ready_sync.txt");
+    let p2 = PathBuf::from("future_sync.txt");
+    let d1 = PathBuf::from("ready_del.txt");
+    let d2 = PathBuf::from("future_del.txt");
+
+    q.enqueue_sync(p1.clone(), Duration::from_millis(0));
+    q.enqueue_sync(p2.clone(), Duration::from_secs(60));
+    q.enqueue_delete(d1.clone(), Duration::from_millis(0));
+    q.enqueue_delete(d2.clone(), Duration::from_secs(60));
+
+    // Sleep 1ms to ensure deadline is passed
+    std::thread::sleep(Duration::from_millis(1));
+    let check_now = Instant::now();
+
+    let syncs = q.drain_ready_syncs(check_now);
+    assert_eq!(syncs, vec![p1]);
+
+    let deletes = q.drain_ready_deletes(check_now);
+    assert_eq!(deletes, vec![d1]);
+
+    // Future items remain pending
+    assert_eq!(q.len(), 2);
+}
+
+#[test]
+fn test_calculate_worker_poll_timeout() {
+    let now = Instant::now();
+
+    // Case 1: Empty queue (None) -> 1 second
+    assert_eq!(
+        calculate_worker_poll_timeout(None, now, true),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        calculate_worker_poll_timeout(None, now, false),
+        Duration::from_secs(1)
+    );
+
+    // Case 2: Future deadline -> min(deadline - now, 1s)
+    let future_500ms = now + Duration::from_millis(500);
+    let timeout_future = calculate_worker_poll_timeout(Some(future_500ms), now, true);
+    assert!(timeout_future <= Duration::from_millis(500));
+    assert!(timeout_future >= Duration::from_millis(400));
+
+    let future_2s = now + Duration::from_secs(2);
+    assert_eq!(
+        calculate_worker_poll_timeout(Some(future_2s), now, true),
+        Duration::from_secs(1)
+    );
+
+    // Case 3: Expired deadline (deadline <= now)
+    let past = now - Duration::from_millis(100);
+
+    // When can_drain is true -> Duration::ZERO
+    assert_eq!(
+        calculate_worker_poll_timeout(Some(past), now, true),
+        Duration::ZERO
+    );
+
+    // When can_drain is false (destination or source offline) -> clamped to 1 second
+    assert_eq!(
+        calculate_worker_poll_timeout(Some(past), now, false),
+        Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn test_worker_queue_debouncing_storm() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::test_default(source.clone(), dest.clone());
+    let store = MockHashStore::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Write initial source file
+    fs::write(source.join("storm.txt"), b"initial").unwrap();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = LocalSyncEngine::new(store, target_config.clone());
+    let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+    let _handle = start_sync_worker(context).unwrap();
+
+    // Allow initial scan to complete
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Update source file and send rapid burst of interleaved modified/deleted events
+    fs::write(source.join("storm.txt"), b"storm data").unwrap();
+
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("storm.txt").unwrap(),
+    ))
+    .unwrap();
+    tx.send(SyncCommand::FileDeleted(
+        RelativePath::new("storm.txt").unwrap(),
+    ))
+    .unwrap();
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("storm.txt").unwrap(),
+    ))
+    .unwrap();
+
+    // Wait for debounce and sync to complete (debounce is 1s, allow up to 5s under load)
+    let start = std::time::Instant::now();
+    let mut synced = false;
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        if let Ok(content) = fs::read(dest.join("storm.txt"))
+            && content == b"storm data"
+        {
+            synced = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        synced,
+        "Timed out waiting for debounced storm sync to complete"
+    );
+}
+
+#[test]
+fn test_trigger_full_scan_skipped_offline() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("nonexistent_source");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::test_default(source, dest.clone());
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let store = MockHashStore::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine = LocalSyncEngine::new(store, target_config.clone());
+    let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+    let _handle = start_sync_worker(context).unwrap();
+
+    tx.send(SyncCommand::TriggerFullScan).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let entries: Vec<_> = fs::read_dir(&dest)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "Destination should be empty when source is offline"
+    );
+}
+
+#[test]
+fn test_source_offline_guards_deletions() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    fs::write(dest.join("keep_me.txt"), b"pre-existing").unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest.clone())
+        .debounce_seconds(1)
+        .retry_interval_seconds(1)
+        .propagate_deletions(true)
+        .build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let store = MockHashStore::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine = LocalSyncEngine::new(store, target_config.clone());
+    let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+    let _handle = start_sync_worker(context).unwrap();
+
+    tx.send(SyncCommand::FileDeleted(
+        RelativePath::new("keep_me.txt").unwrap(),
+    ))
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    assert!(dest.join("keep_me.txt").exists());
+}
+
+#[test]
+fn test_worker_network_offline_bailout() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst_offline");
+    fs::create_dir_all(&source).unwrap();
+
+    let config = Config::builder(source.clone())
+        .dest_dir(dest.clone())
+        .debounce_seconds(1)
+        .retry_interval_seconds(1)
+        .build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let store = MockHashStore::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let engine = LocalSyncEngine::new(store, target_config.clone());
+    let context = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+    let _handle = start_sync_worker(context).unwrap();
+
+    fs::write(source.join("file1.txt"), b"hello").unwrap();
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("file1.txt").unwrap(),
+    ))
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!dest.exists());
+}
+
+#[test]
+fn test_sync_worker_evicts_validation_errors_without_retry() {
+    let engine = MockSyncEngine::new();
+    engine.set_sync_error(|| SyncError::validation_security("Permanent validation failure"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    let config = Config::builder(src)
+        .dest_dir(dst)
+        .debounce_seconds(1)
+        .retry_interval_seconds(1)
+        .build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+    let handle = start_sync_worker(ctx).unwrap();
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("file.txt").unwrap(),
+    ))
+    .unwrap();
+    let start = Instant::now();
+    while engine.failed_calls().is_empty() && start.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(tx);
+    handle.join().unwrap();
+    assert_eq!(
+        engine.failed_calls().len(),
+        1,
+        "Validation error must be evicted after 1 attempt, not retried"
+    );
+}
+
+#[test]
+fn test_source_connectivity_tracker() {
+    let tracker = SourceConnectivityTracker::new(true);
+    assert!(tracker.is_online());
+    tracker.set_online(false);
+    assert!(!tracker.is_online());
+    let raw = tracker.raw_arc();
+    assert!(!raw.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn test_debounce_queue_operations() {
+    let mut queue = DebounceQueue::new(2);
+    let p1 = PathBuf::from("a.txt");
+    let p2 = PathBuf::from("b.txt");
+    let p3 = PathBuf::from("c.txt");
+
+    assert!(queue.enqueue_sync(p1.clone(), std::time::Duration::from_millis(10)));
+    assert!(queue.enqueue_delete(p2.clone(), std::time::Duration::from_millis(20)));
+    // At capacity (2 items):
+    assert!(!queue.enqueue_sync(p3, std::time::Duration::from_millis(10)));
+    // Existing path can be refreshed even at capacity:
+    assert!(queue.enqueue_sync(p1.clone(), std::time::Duration::from_millis(50)));
+
+    assert_eq!(queue.pending_sync_count(), 1);
+    assert_eq!(queue.pending_delete_count(), 1);
+
+    // Before deadline, draining returns empty:
+    let drained = queue.drain_ready_syncs(Instant::now());
+    assert!(drained.is_empty());
+
+    // Drain after deadline:
+    let future = Instant::now() + std::time::Duration::from_secs(1);
+    let ready_syncs = queue.drain_ready_syncs(future);
+    assert_eq!(ready_syncs, vec![p1.clone()]);
+    assert_eq!(queue.pending_sync_count(), 0);
+
+    let ready_deletes = queue.drain_ready_deletes(future);
+    assert_eq!(ready_deletes, vec![p2]);
+    assert_eq!(queue.pending_delete_count(), 0);
+
+    // Requeue retry
+    queue.requeue_sync_retry(p1.clone(), std::time::Duration::from_millis(50));
+    assert_eq!(queue.pending_sync_count(), 1);
+}
+
+#[test]
+fn test_debounce_queue_min_heap_correctness() {
+    let mut queue = DebounceQueue::new(10);
+    let pa = PathBuf::from("a.txt");
+    let pb = PathBuf::from("b.txt");
+    let pc = PathBuf::from("c.txt");
+    let pd = PathBuf::from("d.txt");
+
+    let t0 = Instant::now();
+    queue.enqueue_sync(pa.clone(), std::time::Duration::from_millis(50));
+    queue.enqueue_sync(pb.clone(), std::time::Duration::from_millis(10));
+    queue.enqueue_delete(pc.clone(), std::time::Duration::from_millis(30));
+
+    // pb should be earliest (~10ms)
+    let dl1 = queue.earliest_deadline().unwrap();
+    assert!(dl1 <= t0 + std::time::Duration::from_millis(20));
+
+    // Overwrite pb with later deadline (~100ms) -> pc should now be earliest (~30ms)
+    queue.enqueue_sync(pb.clone(), std::time::Duration::from_millis(100));
+    let dl2 = queue.earliest_deadline().unwrap();
+    assert!(dl2 <= t0 + std::time::Duration::from_millis(40));
+
+    // Requeue retry for pd (~5ms) -> pd should now be earliest
+    queue.requeue_sync_retry(pd.clone(), std::time::Duration::from_millis(5));
+    let dl3 = queue.earliest_deadline().unwrap();
+    assert!(dl3 <= t0 + std::time::Duration::from_millis(15));
+
+    // Drain up to 35ms -> pd (5ms) and pc (30ms) drained
+    let drained_sync = queue.drain_ready_syncs(t0 + std::time::Duration::from_millis(35));
+    assert_eq!(drained_sync, vec![pd]);
+    let drained_del = queue.drain_ready_deletes(t0 + std::time::Duration::from_millis(35));
+    assert_eq!(drained_del, vec![pc]);
+
+    // pa (~50ms) should now be earliest
+    let dl4 = queue.earliest_deadline().unwrap();
+    assert!(dl4 <= t0 + std::time::Duration::from_millis(60));
+}
+
+#[test]
+fn test_debounce_queue_stress_10k_entries() {
+    let mut queue = DebounceQueue::new(20_000);
+    for i in 0..10_000 {
+        let path = PathBuf::from(format!("dir/file_{}.txt", i));
+        let delay = std::time::Duration::from_millis((i % 500 + 1) as u64);
+        queue.enqueue_sync(path, delay);
+    }
+
+    let start = Instant::now();
+    for _ in 0..1000 {
+        let dl = queue.earliest_deadline();
+        assert!(dl.is_some());
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "1000 earliest_deadline queries on 10k items took {:?}, expected < 50ms (O(1) peek)",
+        elapsed
+    );
+}
+
+#[test]
+fn test_sync_worker_state_failure_tracking() {
+    let mut state = SyncWorkerState::new(1024);
+    assert_eq!(state.scratch.len(), 1024);
+    let p = Path::new("failed.txt");
+    assert_eq!(state.record_failure(p), 1);
+    assert_eq!(state.record_failure(p), 2);
+    state.reset_failure(p);
+    assert_eq!(state.record_failure(p), 1);
+
+    assert!(!state.needs_catchup_scan());
+    state.mark_needs_catchup_scan();
+    assert!(state.needs_catchup_scan());
+    let now = Instant::now();
+    assert!(!state.should_trigger_catchup_scan(now, 100, 50, true, true));
+    assert!(!state.should_trigger_catchup_scan(now, 50, 50, false, true));
+    assert!(!state.should_trigger_catchup_scan(now, 50, 50, true, false));
+    assert!(state.should_trigger_catchup_scan(now, 50, 50, true, true));
+    state.clear_needs_catchup_scan();
+    assert!(!state.needs_catchup_scan());
+}
+
+#[test]
+fn test_reachability_monitor() {
+    let temp = tempdir().unwrap();
+    let target = temp.path().to_path_buf();
+    let mock_resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+    let mut monitor = ReachabilityMonitor::new(0, target.clone(), 5, mock_resolver);
+
+    assert_eq!(monitor.active_dest(), target.as_path());
+    assert!(!monitor.is_dest_online());
+
+    let now = Instant::now();
+    monitor.check_reachability(now, None);
+    assert!(monitor.is_dest_online());
+}
+
+#[test]
+fn test_calculate_exponential_backoff() {
+    let base = std::time::Duration::from_secs(5);
+    assert_eq!(
+        calculate_exponential_backoff(1, base),
+        std::time::Duration::from_secs(5)
+    );
+    assert_eq!(
+        calculate_exponential_backoff(2, base),
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+        calculate_exponential_backoff(3, base),
+        std::time::Duration::from_secs(20)
+    );
+    assert_eq!(
+        calculate_exponential_backoff(4, base),
+        std::time::Duration::from_secs(40)
+    );
+    assert_eq!(
+        calculate_exponential_backoff(10, base),
+        std::time::Duration::from_secs(300)
+    );
+}
+
+#[test]
+fn test_write_verification_retained_in_pending_syncs() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source.clone())
+        .dest_dir(dest.clone())
+        .debounce_seconds(1)
+        .retry_interval_seconds(1)
+        .build_unvalidated();
+
+    let engine = MockSyncEngine::new();
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_clone = call_count.clone();
+
+    engine.set_sync_handler(move |path| {
+        let count = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if count == 0 {
+            Err(SyncError::write_verification_failed(path.to_path_buf()))
+        } else {
+            Ok(())
+        }
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+    let handle = start_sync_worker(ctx).unwrap();
+
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("data.txt").unwrap(),
+    ))
+    .unwrap();
+
+    let start = Instant::now();
+    while engine.synced_calls().is_empty() && start.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    drop(tx);
+    handle.join().unwrap();
+
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "WriteVerificationFailed must be retried and not evicted after first failure"
+    );
+    assert_eq!(engine.synced_calls().len(), 1);
+    assert_eq!(engine.synced_calls()[0].0, PathBuf::from("data.txt"));
+}
+
+#[test]
+fn test_queue_overflow_triggers_catchup_scan() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(1)
+        .retry_interval_seconds(1)
+        .build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online)
+        .with_max_pending_queue(5);
+    let handle = start_sync_worker(ctx).unwrap();
+
+    // Wait for initial catch-up full scan on destination startup
+    let start = Instant::now();
+    while engine.full_scans_count() == 0 && start.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let base_scans = engine.full_scans_count();
+    assert!(
+        base_scans >= 1,
+        "Initial scan on destination reconnect should complete"
+    );
+
+    // Enqueue 10 distinct file paths to trigger queue overflow (capacity is 5)
+    for i in 0..10 {
+        let _ = tx.send(SyncCommand::FileModified(
+            RelativePath::new(format!("file_{}.txt", i)).unwrap(),
+        ));
+    }
+
+    // Wait for queue to drain and catchup scan to trigger
+    let start = Instant::now();
+    while engine.full_scans_count() <= base_scans
+        && start.elapsed() < std::time::Duration::from_secs(2)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    drop(tx);
+    handle.join().unwrap();
+
+    assert!(
+        engine.full_scans_count() > base_scans,
+        "Queue overflow must trigger an additional catchup full scan after queue drains"
+    );
+}
+
+#[test]
+fn test_worker_sync_and_delete_uses_resolved_unc_path() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let fake_dest = PathBuf::from(r"Z:\mapped_share");
+    let real_unc_dest = dir.path().join("unc_share");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&real_unc_dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(fake_dest.clone())
+        .debounce_seconds(1)
+        .retry_interval_seconds(1)
+        .build_unvalidated();
+
+    let resolver = std::sync::Arc::new(crate::net::MockNetworkResolver::new());
+    resolver.set_alternate_path(fake_dest, real_unc_dest.clone());
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online)
+        .with_resolver(resolver);
+    let handle = start_sync_worker(ctx).unwrap();
+
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("doc.txt").unwrap(),
+    ))
+    .unwrap();
+    tx.send(SyncCommand::FileDeleted(
+        RelativePath::new("old.txt").unwrap(),
+    ))
+    .unwrap();
+
+    let start = Instant::now();
+    while (engine.synced_calls().is_empty() || engine.deleted_calls().is_empty())
+        && start.elapsed() < std::time::Duration::from_secs(3)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    drop(tx);
+    handle.join().unwrap();
+
+    assert_eq!(engine.synced_calls().len(), 1);
+    assert_eq!(engine.synced_calls()[0].0, PathBuf::from("doc.txt"));
+    assert_eq!(engine.synced_calls()[0].1, real_unc_dest);
+
+    assert_eq!(engine.deleted_calls().len(), 1);
+    assert_eq!(engine.deleted_calls()[0].0, PathBuf::from("old.txt"));
+    assert_eq!(engine.deleted_calls()[0].1, real_unc_dest);
+}
+
+#[test]
+fn test_worker_io_backoff() {
+    let base = std::time::Duration::from_secs(2);
+    let b1 = calculate_exponential_backoff(1, base);
+    let b2 = calculate_exponential_backoff(2, base);
+    let b3 = calculate_exponential_backoff(3, base);
+    assert!(b1 <= b2);
+    assert!(b2 <= b3);
+}
+
+#[test]
+fn test_sync_worker_discrete_tick_processes_queue_without_sleep() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(2)
+        .retry_interval_seconds(1)
+        .build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    let t0 = Instant::now();
+    runner.handle_command(SyncCommand::FileModified(
+        RelativePath::new("test.txt").unwrap(),
+    ));
+
+    // T0: Debounce has not elapsed (debounce_seconds = 2), so tick does not drain
+    let outcome = runner.tick(t0).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+    assert_eq!(engine.synced_calls().len(), 0);
+    assert_eq!(runner.queue.pending_count(), 1);
+
+    // T0 + 3s: Debounce has elapsed, tick should process the file
+    let t1 = t0 + Duration::from_secs(3);
+    let outcome = runner.tick(t1).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+    assert_eq!(engine.synced_calls().len(), 1);
+    assert_eq!(engine.synced_calls()[0].0, PathBuf::from("test.txt"));
+    assert_eq!(runner.queue.pending_count(), 0);
+}
+
+#[test]
+fn test_sync_worker_preserves_retry_on_non_permanent_validation_error() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(1)
+        .retry_interval_seconds(5)
+        .build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    // Configure mock engine to return a transient validation error
+    engine.set_sync_error(|| SyncError::validation("temporary lock conflict"));
+
+    runner.handle_command(SyncCommand::FileModified(
+        RelativePath::new("transient.txt").unwrap(),
+    ));
+    let t0 = Instant::now() + Duration::from_secs(2);
+    let _ = runner.tick(t0).unwrap();
+
+    // Non-permanent validation error must be requeued for retry (with 5s backoff)
+    assert_eq!(runner.queue.pending_count(), 1);
+
+    // Now test permanent validation error
+    engine.set_sync_error(|| {
+        SyncError::validation_security("Unsafe path traversal detected: ../secret")
+    });
+
+    runner.handle_command(SyncCommand::FileModified(
+        RelativePath::new("traversal.txt").unwrap(),
+    ));
+    assert_eq!(runner.queue.pending_count(), 2);
+
+    let t1 = t0 + Duration::from_secs(2);
+    let _ = runner.tick(t1).unwrap();
+
+    // Permanent validation failure must be evicted without retry
+    // Only transient.txt remains in the queue (waiting for its 5s backoff)
+    assert_eq!(runner.queue.pending_count(), 1);
+
+    // Advance simulated time past the 5s backoff; clear error so transient.txt succeeds
+    engine.clear_sync_error();
+    let t2 = t1 + Duration::from_secs(6);
+    let _ = runner.tick(t2).unwrap();
+    assert_eq!(runner.queue.pending_count(), 0);
+    assert_eq!(engine.synced_calls().len(), 1);
+    assert_eq!(engine.synced_calls()[0].0, PathBuf::from("transient.txt"));
+}
+
+#[test]
+fn test_sync_worker_context_builder_invariants() {
+    let temp = tempdir().unwrap();
+    let src = temp.path().join("source");
+    let dst = temp.path().join("dest");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let target_cfg = TargetSyncConfig::builder(
+        TargetDir::from_validated(src),
+        TargetDir::from_validated(dst),
+    )
+    .build()
+    .unwrap();
+    let engine = MockSyncEngine::new();
+
+    // 1. Zero max_pending_queue must fail validation
+    let err = SyncWorkerContext::builder(0, target_cfg.clone(), engine.clone(), rx, true)
+        .max_pending_queue(0)
+        .build();
+    assert!(err.is_err(), "max_pending_queue = 0 must fail validation");
+    let err = err.err().unwrap();
+    assert!(matches!(err, SyncError::Validation { .. }));
+    assert!(err.to_string().contains("greater than zero"));
+
+    // 2. Successful build with defaults
+    let (_tx2, rx2) = std::sync::mpsc::channel();
+    let ctx = SyncWorkerContext::builder(1, target_cfg.clone(), engine.clone(), rx2, true)
+        .build()
+        .unwrap();
+    assert_eq!(ctx.target_index(), 1);
+    assert_eq!(ctx.max_pending_queue(), 50_000);
+    assert!(ctx.observer().is_none());
+    assert!(!ctx.cancellation().load(std::sync::atomic::Ordering::SeqCst));
+
+    // 3. Custom options
+    let (_tx3, rx3) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx3 = SyncWorkerContext::builder(2, target_cfg, engine, rx3, true)
+        .max_pending_queue(100)
+        .cancellation(cancel)
+        .build()
+        .unwrap();
+    assert_eq!(ctx3.target_index(), 2);
+    assert_eq!(ctx3.max_pending_queue(), 100);
+    assert!(
+        ctx3.cancellation()
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn test_worker_shutdown_drained_from_try_recv() {
+    let temp = tempdir().unwrap();
+    let src = temp.path().join("source");
+    let dst = temp.path().join("dest");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target_cfg = TargetSyncConfig::builder(
+        TargetDir::from_validated(src),
+        TargetDir::from_validated(dst),
+    )
+    .build()
+    .unwrap();
+    let engine = MockSyncEngine::new();
+    let scan_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sc = scan_count.clone();
+    engine.set_sync_error(move || {
+        let count = sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if count >= 1 {
+            SyncError::Cancelled
+        } else {
+            SyncError::Io(std::io::Error::other("transient"))
+        }
+    });
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let ctx = SyncWorkerContext::new(0, target_cfg, engine, rx, None, source_online);
+    tx.send(SyncCommand::FileModified(
+        RelativePath::new("first.txt").unwrap(),
+    ))
+    .unwrap();
+    tx.send(SyncCommand::TriggerFullScan).unwrap();
+
+    let handle = start_sync_worker(ctx).unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let join_thread = std::thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+
+    // The worker should terminate immediately upon processing TriggerFullScan in try_recv.
+    // If the drain loop break only exits `while let` instead of the outer worker loop,
+    // it hangs waiting for the next recv_timeout / debounce interval.
+    let res = done_rx.recv_timeout(std::time::Duration::from_millis(200));
+    assert!(
+        res.is_ok(),
+        "Worker thread failed to terminate after draining Shutdown/Cancelled command"
+    );
+    let _ = join_thread.join();
+}
+
+#[derive(Clone, Default)]
+struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_sync_worker_runner_periodic_archive_prune_failure_emits_warn_log() {
+    let buffer = SharedBuffer::default();
+    let writer_buffer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer_buffer.clone())
+        .with_ansi(false)
+        .finish();
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source).dest_dir(dest).build_unvalidated();
+
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    engine.set_sync_error(|| SyncError::Io(std::io::Error::other("disk full on archive volume")));
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    // Advance simulated time past 3600s interval to trigger prune
+    let now = Instant::now() + Duration::from_secs(3605);
+    let outcome = tracing::subscriber::with_default(subscriber, || runner.tick(now)).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+
+    let bytes = buffer.0.lock().unwrap().clone();
+    let log_str = String::from_utf8_lossy(&bytes);
+    assert!(
+        log_str.contains("Periodic archive prune failed"),
+        "Expected 'Periodic archive prune failed' in logs, got: {}",
+        log_str
+    );
+}
+
+#[test]
+fn test_sync_worker_thread_span_propagation() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source).dest_dir(dest).build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(0, target_config, engine, rx, None, source_online);
+
+    let (_, log_output) = crate::test_support::with_captured_tracing(|| {
+        let handle = start_sync_worker(ctx).unwrap();
+        drop(tx);
+        let _ = handle.join();
+    });
+
+    assert!(
+        log_output.contains("sync_worker"),
+        "Log output missing sync_worker span: {log_output}"
+    );
+    assert!(
+        log_output.contains("target_index=1"),
+        "Log output missing target_index field: {log_output}"
+    );
+}
+
+#[test]
+fn test_sync_worker_not_found_evicts_immediately_without_retry() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .debounce_seconds(1)
+        .build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    engine.set_sync_error(|| {
+        SyncError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        ))
+    });
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    let t0 = Instant::now();
+    let rel_path = RelativePath::new("deleted_on_disk.txt").unwrap();
+    runner.handle_command(SyncCommand::FileModified(rel_path.clone()));
+
+    let outcome = runner.tick(t0).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+    assert_eq!(runner.queue.pending_count(), 1);
+
+    // T0 + 3s: Debounce elapsed; sync fails with NotFound and source file does not exist on disk
+    let t1 = t0 + Duration::from_secs(3);
+    let outcome = runner.tick(t1).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+
+    // Invariant: Path must be evicted immediately without requeuing, and failure count reset
+    assert_eq!(
+        runner.queue.pending_count(),
+        0,
+        "Path must be immediately discarded from retry queues upon NotFound when source is missing"
+    );
+    assert!(
+        !runner
+            .state
+            .failure_tracker
+            .contains_key(Path::new("deleted_on_disk.txt")),
+        "Failure count must be reset upon NotFound eviction"
+    );
+
+    let t2 = t1 + Duration::from_secs(10);
+    let outcome = runner.tick(t2).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+    assert_eq!(runner.queue.pending_count(), 0);
+}
+
+#[test]
+fn test_sync_worker_generic_io_error_evicts_after_ten_retries() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    // Create dummy file on source so NotFound check does not trigger
+    fs::write(source.join("damaged_block.txt"), b"some data").unwrap();
+
+    let retry_secs = 2;
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .retry_interval_seconds(retry_secs)
+        .debounce_seconds(1)
+        .build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    engine.set_sync_error(|| {
+        SyncError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+    });
+
+    let observer = std::sync::Arc::new(crate::sync::mock::MockSyncStatusObserver::new());
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(
+        0,
+        target_config,
+        engine.clone(),
+        rx,
+        Some(observer.clone()),
+        source_online,
+    );
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    let t0 = Instant::now();
+    let rel_path = RelativePath::new("damaged_block.txt").unwrap();
+    runner.handle_command(SyncCommand::FileModified(rel_path.clone()));
+
+    let mut current_time = t0 + Duration::from_secs(2);
+
+    // Retries 1 through 10 must remain queued with exponential backoff
+    for attempt in 1..=10 {
+        let outcome = runner.tick(current_time).unwrap();
+        assert_eq!(outcome, WorkerTickOutcome::Continue);
+        assert_eq!(
+            runner.queue.pending_count(),
+            1,
+            "Path must be requeued for retry after attempt {attempt}"
+        );
+        let backoff = calculate_exponential_backoff(attempt, Duration::from_secs(retry_secs));
+        current_time += backoff + Duration::from_millis(50);
+    }
+
+    // Attempt 11: 10 failures recorded; this tick permanently evicts
+    let outcome = runner.tick(current_time).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+    assert_eq!(
+        runner.queue.pending_count(),
+        0,
+        "Path must be permanently evicted after 10 retries"
+    );
+    assert!(
+        !runner
+            .state
+            .failure_tracker
+            .contains_key(Path::new("damaged_block.txt"))
+    );
+
+    let failures = observer.write_verification_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0], PathBuf::from("damaged_block.txt"));
+}
+
+#[test]
+fn test_sync_worker_partial_failure_marks_destination_online() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source).dest_dir(dest).build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    engine.set_scan_outcome(Some(ScanOutcome::PartialFailure {
+        synced: 1,
+        failed: 1,
+        delete_failed: 0,
+    }));
+
+    let mock_observer = std::sync::Arc::new(crate::sync::mock::MockSyncStatusObserver::new());
+    let observer: std::sync::Arc<dyn SyncStatusObserver> = mock_observer.clone();
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(
+        0,
+        target_config,
+        engine,
+        rx,
+        Some(observer.clone()),
+        source_online,
+    );
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    // Explicitly mark destination offline
+    runner.reachability.mark_offline(Some(&observer));
+    assert!(!runner.reachability.is_dest_online());
+
+    // Trigger full scan command
+    runner.handle_command(SyncCommand::TriggerFullScan);
+
+    // Invariant: PartialFailure indicates destination is responsive; reachability must be Online
+    assert!(runner.reachability.is_dest_online());
+    assert!(
+        mock_observer
+            .target_statuses()
+            .contains(&(0, crate::sync::ConnectivityState::Online))
+    );
+}
+
+#[test]
+fn test_sync_worker_catchup_scan_failure_applies_backoff() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("src");
+    let dest = dir.path().join("dst");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = Config::builder(source)
+        .dest_dir(dest)
+        .retry_interval_seconds(10)
+        .debounce_seconds(1)
+        .build_unvalidated();
+    let target_config = TargetSyncConfig::try_from_config(&config).unwrap();
+    let engine = MockSyncEngine::new();
+    engine.set_sync_error(|| SyncError::Io(std::io::Error::other("full scan failure")));
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let source_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ctx = SyncWorkerContext::new(0, target_config, engine.clone(), rx, None, source_online);
+    let mut runner = SyncWorkerRunner::new(ctx);
+
+    runner.reachability.mark_online(None);
+    runner.state.mark_needs_catchup_scan();
+
+    let t0 = Instant::now();
+    assert!(
+        runner
+            .state
+            .should_trigger_catchup_scan(t0, 0, runner.drain_threshold, true, true)
+    );
+
+    let outcome = runner.tick(t0).unwrap();
+    assert_eq!(outcome, WorkerTickOutcome::Continue);
+    assert_eq!(engine.full_scans_count(), 1);
+    assert!(runner.state.needs_catchup_scan());
+
+    // Mid-backoff (5s < 10s backoff): should_trigger_catchup_scan must return false
+    let t_mid = t0 + Duration::from_secs(5);
+    assert!(!runner.state.should_trigger_catchup_scan(
+        t_mid,
+        0,
+        runner.drain_threshold,
+        true,
+        true
+    ));
+    let outcome_mid = runner.tick(t_mid).unwrap();
+    assert_eq!(outcome_mid, WorkerTickOutcome::Continue);
+    assert_eq!(engine.full_scans_count(), 1);
+
+    // Expired backoff (11s > 10s): should_trigger_catchup_scan re-enables
+    let t_expired = t0 + Duration::from_secs(11);
+    assert!(runner.state.should_trigger_catchup_scan(
+        t_expired,
+        0,
+        runner.drain_threshold,
+        true,
+        true
+    ));
+    let outcome_expired = runner.tick(t_expired).unwrap();
+    assert_eq!(outcome_expired, WorkerTickOutcome::Continue);
+    assert_eq!(engine.full_scans_count(), 2);
+}
