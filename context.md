@@ -873,6 +873,34 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Redundant heap allocations in `to_sqlite_key()` query binding paths eliminated.
 >   - Unvalidated path ingestion via `From` on `TargetDir` eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 5 — Core Sync Engine Decoupling, Fast-Path Casing & Cache Invalidation (`src/sync/`)
+> * **Changes:**
+>   - **Decomposed `src/sync/engine.rs` Monolith (Finding 3)**: Reduced `src/sync/engine.rs` from 2,522 lines to 720 lines (strictly complying with the <800 LOC ceiling) by extracting pure role traits to `src/sync/traits.rs` (160+ LOC) and unit tests to `src/sync/engine_tests.rs` (1,600+ LOC).
+>   - **Hot-Path Fast-Path Casing Alignment Bypass (Finding 1)**: In `LocalSyncEngine::sync_file_to_dest_core`, bypassed expensive directory `read_dir` traversals in `align_dest_file_casing_if_needed` when local database record metadata matches the destination file (`is_verified_cache_hit`). Instrumenting `CASING_ALIGN_READ_DIR_COUNT` test spy verifies zero directory traversals occur on cache hits.
+>   - **Path Safety & Cache Hardening (Findings 10, 11, 12, 18)**:
+>     - In `src/sync/path_safety.rs`, prevented caching non-existent root paths in `verify_source_not_reparse_cached` and `verify_destination_not_reparse_cached`, ensuring dynamically created roots undergo live verification.
+>     - In `ReparseCache::evict_dir`, added read-lock probe before acquiring the write lock to minimize lock contention.
+>     - In `src/sync/archive.rs`, preceded `fs::create_dir_all` with `verify_destination_not_reparse`, and guarded both pruning loops (age retention and byte quota) with `fs::symlink_metadata` checks immediately before `fs::remove_file` to eliminate TOCTOU junction substitution windows.
+>   - **Scanner & Delta Transfer Efficiency (Findings 16, 32)**:
+>     - In `src/sync/scanner.rs`, checked `entry.file_type()?` before allocating `entry.path()`, avoiding unnecessary heap allocations for non-file/non-dir entries.
+>     - In `src/sync/delta.rs`, preallocated `new_hashes` using `Vec::with_capacity(expected_blocks)`, added `last_modified_block_count: AtomicUsize`, and skipped collecting modified block indices when verification mode is `MetadataAndFlush`.
+>   - **Type Encapsulation & Diagnostics Alignment (Findings 13, 19, 21, 36)**:
+>     - Encapsulated `FileSyncTask` with public getters (`relative_path`, `source_dir`, `destination_dirs`, `action`) and `pub(crate)` fields; mapped task builder validation to `SyncError::validation_invariant`.
+>     - Unified `FileMetadataSnapshot.size` to `u64` and relocated `is_metadata_up_to_date_raw` to `src/sync/types.rs`.
+>     - In `src/sync/full_scan.rs`, tracked `stats.network_offline` explicitly on `e.is_network_offline()`, preventing generic local I/O errors from being misclassified as destination unreachable.
+>   - **Test Suite Expansion & Quality Verification Gate**:
+>     - Added 7 new unit tests across `path_safety.rs`, `archive.rs`, `delta.rs`, `full_scan.rs`, `types.rs`, and `engine_tests.rs`.
+>     - Expanded test suite from 401 to 408 automated tests passing with zero failures (348 lib, 7 bin, 13 integration, 8 property, 20 snapshot, 9 doc-tests).
+>     - 100% `rustfmt`, zero clippy warnings under `-D warnings`, zero AST-grep violations.
+> * **New Constraints:**
+>   - `src/sync/engine.rs` must maintain a strict < 800 line ceiling (currently 720 LOC).
+>   - Casing alignment `align_dest_file_casing_if_needed` must be bypassed on verified cache hits.
+>   - Non-existent directories must never be cached in `ReparseCache`.
+>   - All archive pruning deletions must be guarded by TOCTOU symlink checks immediately before removal.
+
 
 
 

@@ -402,6 +402,7 @@ THEN a minimum sleep of 1 second is enforced to prevent 100% CPU busy-spinning
 GIVEN a file synchronization task where the local SQLite record matches source file size and modification time
 WHEN `sync_file_to_dest_core` executes
 THEN `Ok(None)` is returned immediately without querying remote SMB file metadata or performing redundant reparse traversals
+AND on-disk casing alignment directory traversals (`align_dest_file_casing_if_needed`) are bypassed when relative path casing matches
 
 [CONCURRENCY] RAII DirtyRangeLease zero-lock streaming
 GIVEN a multi-gigabyte delta sync operation
