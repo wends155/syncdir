@@ -17,8 +17,6 @@ pub(crate) mod worker;
 pub use full_scan::{FullScanCoordinator, FullScanDriver};
 
 pub use delta::DirtyBlockRange;
-#[allow(deprecated)]
-pub use engine::is_metadata_up_to_date_raw;
 pub use engine::{
     ArchiveEngine, BatchFlusher, ConnectivityState, FileDeleter, FileMetadataSnapshot,
     FileSynchronizer, LocalSyncEngine, ScanEngine, ScanOutcome, SyncCommand, SyncEngine,
@@ -26,6 +24,8 @@ pub use engine::{
 };
 pub use mock::{MockSyncEngine, MockSyncStatusObserver};
 pub use path_safety::{ReparseCache, is_safe_relative_path};
+#[allow(deprecated)]
+pub use types::is_metadata_up_to_date_raw;
 pub use types::{
     FileSyncTask, FileSyncTaskBuilder, safe_epoch_duration_millis, safe_modified_millis,
 };

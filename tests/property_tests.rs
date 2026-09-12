@@ -58,18 +58,18 @@ proptest! {
     // 3. SMB Timestamp Tolerance & Metadata Evaluation Invariant (±2000ms)
     #[test]
     fn prop_is_metadata_up_to_date_evaluation(
-        size in 0i64..1_000_000i64,
+        size in 5u64..1_000_000u64,
         dest_size_diff in -5i64..=5i64,
         src_mod in 1_000_000_000i64..2_000_000_000i64,
         delta in -10_000i64..=10_000i64,
         has_matching_record in prop::bool::ANY,
     ) {
-        let dest_size = size + dest_size_diff;
+        let dest_size = (size as i64 + dest_size_diff) as u64;
         let dest_mod = src_mod + delta;
 
         let record = if has_matching_record {
             Some(
-                syncdir::db::FileRecord::from_raw("file.bin", size as u64, src_mod)
+                syncdir::db::FileRecord::from_raw("file.bin", size, src_mod)
                     .unwrap()
                     .with_id(1),
             )

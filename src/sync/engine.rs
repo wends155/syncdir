@@ -13,9 +13,10 @@ use super::delta::DirtyBlockRange;
 use super::path_safety::{is_reparse_or_symlink_meta, is_safe_relative_path};
 use super::scanner::scan_dir;
 
-#[allow(unused_imports)]
+#[allow(unused_imports, deprecated)]
 pub use super::types::{
-    FileSyncTask, RelativePath, safe_epoch_duration_millis, safe_modified_millis,
+    FileMetadataSnapshot, FileSyncTask, RelativePath, is_metadata_up_to_date_raw,
+    safe_epoch_duration_millis, safe_modified_millis,
 };
 
 /// Commands sent from the file watcher or tray UI to the sync worker thread.
@@ -224,75 +225,6 @@ pub trait SyncEngine:
     /// filesystem components. Called upon destination reconnection, full scan initiation, or error recovery.
     /// Default implementation is a no-op for mock or non-caching engines.
     fn invalidate_verified_dirs(&self) {}
-}
-
-/// Snapshot of a file's size and modification timestamp for drift detection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileMetadataSnapshot {
-    pub size: i64,
-    pub modified_epoch_millis: i64,
-}
-
-impl FileMetadataSnapshot {
-    /// Create a new metadata snapshot.
-    pub fn new(size: i64, modified_epoch_millis: i64) -> Self {
-        Self {
-            size,
-            modified_epoch_millis,
-        }
-    }
-
-    /// Compute snapshot from `std::fs::Metadata`
-    pub fn from_metadata(meta: &std::fs::Metadata) -> Result<Self, SyncError> {
-        Ok(Self {
-            size: meta.len() as i64,
-            modified_epoch_millis: safe_modified_millis(meta)?,
-        })
-    }
-
-    /// Check if destination metadata matches source snapshot and optional DB record.
-    #[must_use]
-    pub fn is_up_to_date(
-        &self,
-        dest: &FileMetadataSnapshot,
-        record: Option<&crate::db::FileRecord>,
-    ) -> bool {
-        if let Some(record) = record
-            && record.file_size() as i64 == self.size
-            && record.last_modified() == self.modified_epoch_millis
-            && dest.size == self.size
-            && dest
-                .modified_epoch_millis
-                .abs_diff(self.modified_epoch_millis)
-                <= 2000
-        {
-            return true;
-        }
-        false
-    }
-}
-
-impl From<&crate::db::FileRecord> for FileMetadataSnapshot {
-    fn from(record: &crate::db::FileRecord) -> Self {
-        Self {
-            size: record.file_size() as i64,
-            modified_epoch_millis: record.last_modified().max(0),
-        }
-    }
-}
-
-/// Raw metadata evaluation for testing and backward compatibility.
-#[deprecated(
-    since = "0.2.0",
-    note = "use FileMetadataSnapshot::is_up_to_date instead"
-)]
-#[doc(hidden)]
-pub fn is_metadata_up_to_date_raw(
-    dest: &FileMetadataSnapshot,
-    src: &FileMetadataSnapshot,
-    record: Option<&crate::db::FileRecord>,
-) -> bool {
-    src.is_up_to_date(dest, record)
 }
 
 /// RAII lease for a `DirtyBlockRange` buffer checked out from `LocalSyncEngine`.

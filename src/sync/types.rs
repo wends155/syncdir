@@ -8,16 +8,20 @@ use std::time::{Duration, UNIX_EPOCH};
 /// A task representing a single file synchronization operation.
 #[derive(Debug, Clone)]
 pub struct FileSyncTask<'a> {
-    pub rel_path: &'a RelativePath,
-    pub src_path: &'a Path,
-    pub dest_path: &'a Path,
-    pub dest_dir: &'a Path,
-    pub src_size: u64,
-    pub src_mod: i64,
-    pub cached_id: Option<i64>,
+    pub(crate) rel_path: &'a RelativePath,
+    pub(crate) src_path: &'a Path,
+    pub(crate) dest_path: &'a Path,
+    pub(crate) dest_dir: &'a Path,
+    pub(crate) src_size: u64,
+    pub(crate) src_mod: i64,
+    pub(crate) cached_id: Option<i64>,
 }
 
 impl<'a> FileSyncTask<'a> {
+    #[deprecated(
+        since = "0.2.0",
+        note = "use FileSyncTaskBuilder or FileSyncTask::builder to ensure invariant validation"
+    )]
     pub fn new(
         rel_path: &'a RelativePath,
         src_path: &'a Path,
@@ -41,6 +45,41 @@ impl<'a> FileSyncTask<'a> {
     #[must_use]
     pub fn builder(rel_path: &'a RelativePath) -> FileSyncTaskBuilder<'a> {
         FileSyncTaskBuilder::new(rel_path)
+    }
+
+    #[must_use]
+    pub fn rel_path(&self) -> &'a RelativePath {
+        self.rel_path
+    }
+
+    #[must_use]
+    pub fn src_path(&self) -> &'a Path {
+        self.src_path
+    }
+
+    #[must_use]
+    pub fn dest_path(&self) -> &'a Path {
+        self.dest_path
+    }
+
+    #[must_use]
+    pub fn dest_dir(&self) -> &'a Path {
+        self.dest_dir
+    }
+
+    #[must_use]
+    pub fn src_size(&self) -> u64 {
+        self.src_size
+    }
+
+    #[must_use]
+    pub fn src_mod(&self) -> i64 {
+        self.src_mod
+    }
+
+    #[must_use]
+    pub fn cached_id(&self) -> Option<i64> {
+        self.cached_id
     }
 }
 
@@ -109,19 +148,19 @@ impl<'a> FileSyncTaskBuilder<'a> {
     pub fn build(self) -> Result<FileSyncTask<'a>, SyncError> {
         let src_path = self
             .src_path
-            .ok_or_else(|| SyncError::generic("src_path is required"))?;
+            .ok_or_else(|| SyncError::validation_invariant("src_path is required"))?;
         let dest_path = self
             .dest_path
-            .ok_or_else(|| SyncError::generic("dest_path is required"))?;
+            .ok_or_else(|| SyncError::validation_invariant("dest_path is required"))?;
         let dest_dir = self
             .dest_dir
-            .ok_or_else(|| SyncError::generic("dest_dir is required"))?;
+            .ok_or_else(|| SyncError::validation_invariant("dest_dir is required"))?;
         let src_size = self
             .src_size
-            .ok_or_else(|| SyncError::generic("src_size is required"))?;
+            .ok_or_else(|| SyncError::validation_invariant("src_size is required"))?;
         let src_mod = self
             .src_mod
-            .ok_or_else(|| SyncError::generic("src_mod is required"))?;
+            .ok_or_else(|| SyncError::validation_invariant("src_mod is required"))?;
         let cached_id = self.cached_id.unwrap_or(None);
 
         Ok(FileSyncTask {
@@ -134,6 +173,80 @@ impl<'a> FileSyncTaskBuilder<'a> {
             cached_id,
         })
     }
+}
+
+/// Represents an atomic snapshot of file metadata (size and modification timestamp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMetadataSnapshot {
+    pub size: u64,
+    pub modified_epoch_millis: i64,
+}
+
+impl FileMetadataSnapshot {
+    /// Create a new metadata snapshot.
+    #[must_use]
+    pub fn new(size: u64, modified_epoch_millis: i64) -> Self {
+        Self {
+            size,
+            modified_epoch_millis,
+        }
+    }
+
+    /// Compute snapshot from `std::fs::Metadata`
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Io` if timestamp conversion fails.
+    pub fn from_metadata(meta: &std::fs::Metadata) -> Result<Self, SyncError> {
+        Ok(Self {
+            size: meta.len(),
+            modified_epoch_millis: safe_modified_millis(meta)?,
+        })
+    }
+
+    /// Check if destination metadata matches source snapshot and optional DB record.
+    #[must_use]
+    pub fn is_up_to_date(
+        &self,
+        dest: &FileMetadataSnapshot,
+        record: Option<&crate::db::FileRecord>,
+    ) -> bool {
+        if let Some(record) = record
+            && record.file_size() == self.size
+            && record.last_modified() == self.modified_epoch_millis
+            && dest.size == self.size
+            && dest
+                .modified_epoch_millis
+                .abs_diff(self.modified_epoch_millis)
+                <= 2000
+        {
+            return true;
+        }
+        false
+    }
+}
+
+impl From<&crate::db::FileRecord> for FileMetadataSnapshot {
+    fn from(record: &crate::db::FileRecord) -> Self {
+        Self {
+            size: record.file_size(),
+            modified_epoch_millis: record.last_modified().max(0),
+        }
+    }
+}
+
+/// Raw metadata evaluation for testing and backward compatibility.
+#[deprecated(
+    since = "0.2.0",
+    note = "use FileMetadataSnapshot::is_up_to_date instead"
+)]
+#[doc(hidden)]
+pub fn is_metadata_up_to_date_raw(
+    dest: &FileMetadataSnapshot,
+    src: &FileMetadataSnapshot,
+    record: Option<&crate::db::FileRecord>,
+) -> bool {
+    src.is_up_to_date(dest, record)
 }
 
 /// Extract file modified time as milliseconds since UNIX epoch.
@@ -162,6 +275,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn test_file_sync_task_construction_and_timestamp_helpers() {
         let src = std::path::Path::new("C:\\src\\file.txt");
         let dest = std::path::Path::new("C:\\dst\\file.txt");
@@ -235,5 +349,50 @@ mod tests {
 
         let incomplete = FileSyncTask::builder(&rel).build();
         assert!(incomplete.is_err());
+    }
+
+    #[test]
+    fn test_file_sync_task_getters_and_builder_invariants() {
+        let rel = RelativePath::try_new("doc.pdf").unwrap();
+        let src = Path::new("C:\\source\\doc.pdf");
+        let dest = Path::new("D:\\dest\\doc.pdf");
+        let dest_dir = Path::new("D:\\dest");
+
+        let task = FileSyncTask::builder(&rel)
+            .src_path(src)
+            .dest_path(dest)
+            .dest_dir(dest_dir)
+            .src_size(1024)
+            .src_mod(1700000000)
+            .cached_id(Some(42))
+            .build()
+            .unwrap();
+
+        assert_eq!(task.rel_path(), &rel);
+        assert_eq!(task.src_path(), src);
+        assert_eq!(task.dest_path(), dest);
+        assert_eq!(task.dest_dir(), dest_dir);
+        assert_eq!(task.src_size(), 1024);
+        assert_eq!(task.src_mod(), 1700000000);
+        assert_eq!(task.cached_id(), Some(42));
+
+        // Missing src_path triggers invariant error
+        let invalid = FileSyncTask::builder(&rel)
+            .dest_path(dest)
+            .dest_dir(dest_dir)
+            .src_size(1024)
+            .src_mod(1700000000)
+            .build();
+
+        assert!(invalid.is_err());
+        match invalid.err().unwrap() {
+            SyncError::Validation {
+                kind: crate::error::ValidationKind::Invariant,
+                message,
+            } => {
+                assert!(message.contains("src_path is required"));
+            }
+            err => panic!("Expected Validation Invariant error, got: {err:?}"),
+        }
     }
 }
