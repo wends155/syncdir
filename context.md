@@ -993,4 +993,26 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Ambient swallowing of `winres` compilation errors in `build.rs` eliminated.
 >   - Silent generation of unmanifested release binaries subject to UAC virtualization eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 2 — Release Automation Hardening (`scripts/build-release.ps1` & `tests/test_build_release.ps1`)
+> * **Changes:**
+>   - **PowerShell Parameter Interface & Help Documentation**: Added `[CmdletBinding()] param()` with parameters (`-WinresToolkitPath`, `-RcPath`, `-WindowsSdkPath`, `-AllowMissingIcon`, `-SkipQualityGate`, `-SkipCrtCheck`, `-SkipPeVerification`) and `.SYNOPSIS` / `.DESCRIPTION` / `.PARAMETER` / `.EXAMPLE` comment-based help block.
+>   - **Input Path Safety Validation**: Added `Test-PathSafety` rejecting null bytes, control characters, and unescaped quotes with fail-safe null/whitespace handling.
+>   - **Environment Scoping & Bidirectional Restoration**: Implemented `Invoke-WithEnvironmentScope` and `Restore-EnvironmentState` ensuring environment mutations (including `$env:PATH` and `$env:WINRES_TOOLKIT_PATH`) are reverted and newly added variables removed even on terminating exceptions.
+>   - **Pure 4-Tier SDK Discovery & Compiler Sibling Walking**: Implemented `Resolve-SdkToolkit` resolving toolkit paths across CLI overrides → environment variables → `Get-Command rc.exe` → dynamic compiler sibling walking (walking parent directories up from `cl.exe` / `link.exe` to discover `Windows Kits\10\bin\*\x64\rc.exe` on portable MSVC without registry keys or admin rights) → Registry (`Installed Roots`). Tested via injectable `[scriptblock]$PathExists`.
+>   - **Pure PowerShell PE Binary Parser & Verification Gate**: Implemented `Test-PeBinaryStructure` parsing DOS, COFF, Optional PE32+ (offset 128) and PE32 (offset 112) `DataDirectory[2]` Resource Table, mapping RVA to file offsets, and verifying `.rsrc`, `RT_MANIFEST (24)`, and `RT_ICON (3 / 14)` with stream disposal. Implemented `Assert-ReleaseResourceIntegrity` enforcing fail-closed packaging aborts on missing resources unless `-AllowMissingIcon` is passed.
+>   - **Pipeline Encapsulation & Entrypoint Guard**: Encapsulated pipeline into `Invoke-BuildRelease` with parameter projection and dot-source guard (`if ($MyInvocation.InvocationName -ne '.')`).
+>   - **Automated PowerShell Test Suite**: Created `tests/test_build_release.ps1` with 18 unit/integration tests with synthetic PE generator (`New-MockPeBinary`) and conditional live release binary check.
+>   - **Quality Verification Gate**: 18/18 PowerShell tests passing, 443/443 Rust workspace tests passing, zero formatting violations, zero clippy warnings, and zero ast-grep violations.
+> * **New Constraints:**
+>   - Release automation must not hardcode local developer paths.
+>   - Release builds fail-closed if `.rsrc`, manifest, or icon is missing unless `-AllowMissingIcon` is explicitly provided.
+>   - Packaging scripts must restore environment variables bidirectionally.
+> * **Pruned:**
+>   - Hardcoded `C:\Program Files (x86)\Windows Kits\10` path probing in release script eliminated.
+>   - Silent release packaging of unmanifested / icon-less binaries eliminated.
+
+
 
