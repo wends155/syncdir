@@ -38,18 +38,23 @@ syncdir/
 ├── Cargo.toml            # Project dependencies and workspace config
 ├── Cargo.lock            # Cargo lockfile
 ├── build.rs              # Windows PE executable resource compilation script (winres)
-├── syncdir.ico           # 32x32 32bpp Windows application icon asset
+├── syncdir.ico           # Multi-resolution Windows application icon asset (7 mipmaps: 16x16 to 256x256, 32bpp, ~372 KB)
 ├── LICENSE               # Project MIT license
 ├── README.md             # Project README documentation
 ├── architecture.md       # Technical design (this file)
 ├── spec.md               # Behavioral specifications
 ├── context.md            # Decisions and history
 ├── .agents/              # TARS rules, workflows, and scripts
+├── scripts/
+│   ├── build-release.ps1     # Release compilation, static CRT inspection, PE resource verification, and packaging
+│   └── check-quality.ps1     # Comprehensive code quality pipeline (fmt, clippy, tests, static analysis)
 ├── tests/
-│   ├── integration_tests.rs # Integration testing suite (13 scenarios)
-│   ├── property_tests.rs    # Proptest generative invariant suites (8 properties)
-│   ├── snapshot_tests.rs    # Insta golden snapshot tests (20 snapshots)
-│   └── snapshots/           # Insta snapshot golden files
+│   ├── build_script_test.rs  # Isolated build script integration test suite (22 tests)
+│   ├── integration_tests.rs  # Integration testing suite (13 scenarios)
+│   ├── property_tests.rs     # Proptest generative invariant suites (8 properties)
+│   ├── snapshot_tests.rs     # Insta golden snapshot tests (20 snapshots)
+│   ├── test_build_release.ps1 # Release automation and PE resource parser test suite (19 tests)
+│   └── snapshots/            # Insta snapshot golden files
 └── src/
     ├── lib.rs            # Crate library root and module declarations
     ├── main.rs           # Daemon entry point, composition root, DaemonTrayHandler, and telemetry
@@ -105,6 +110,11 @@ syncdir/
 ```
 
 ## 5. Module Boundaries
+
+### `build.rs`
+* **Owns**: Windows PE executable resource compilation (`winres`), application icon embedding (`syncdir.ico`), application manifest generation with execution identity `asInvoker` preventing legacy UAC File and Registry Virtualization (CWE-390 / CWE-250), deterministic 4-tier SDK discovery (`WINRES_TOOLKIT_PATH` -> `RC_PATH` -> `WINDOWS_SDK_PATH` -> Registry), path safety validation (`validate_path_safety`), single-handle icon asset validation (`validate_icon_asset`), fail-closed release error policy (`PROFILE == "release"` terminating via `std::process::exit(1)`), headless CI bypass (`SYNCDIR_ALLOW_MISSING_ICON=1`), and Cargo rebuild invalidation triggers (`cargo:rerun-if-changed=syncdir.ico` and `cargo:rerun-if-env-changed`). Isolated test harness in `tests/build_script_test.rs` mounts `build.rs` directly via dependency-injected closures for pure thread-safe environment inspection.
+* **Does NOT own**: Runtime daemon execution, runtime configuration loading.
+* **Trait Interfaces**: None.
 
 ### `config`
 * **Owns**: Parsing `config.toml` from `%APPDATA%\syncdir\config.toml`, strongly-typed path domain modeling via `TargetDir` (`TargetDir::try_new` validating drive roots `R:\`, UNC prefixes `\\`, and slash normalization at construction; `TargetDir::new` deprecated; `RawTargetDir` Serde proxy `#[serde(try_from = "RawTargetDir", into = "PathBuf")]` enforcing invariant validation during TOML/JSON deserialization; fallible `TryFrom<PathBuf>`, `TryFrom<&Path>`, and `TryFrom<&str>` conversions; unvalidated `From` conversions removed to preserve trait coherence) and `DestinationCollection` (encapsulating destination lists with Windows case-insensitive deduplication while strictly preserving insertion order; `DestinationCollection::iter` annotated with `#[must_use]`), deduplicated sync boundary validation via `validate_sync_boundaries` preventing identical and nested source/dest configurations, encapsulated `TargetSyncConfig` with private fields and `TargetSyncConfigBuilder` enforcing construction invariants (with struct-level and setter-level `#[must_use]`; non-empty destination collections, path format validation, recursive sync loop containment via `validate_sync_boundaries`, strictly positive debounce and retry intervals, block size caps $\le 64$MB and positivity, and `block_sync_threshold_bytes >= block_size_bytes`), `ConfigBuilder` with struct-level and setter-level `#[must_use]`, pure query getters annotated with `#[must_use]`, submodules `builder` and `target` retracted to `pub(crate)` with symbols exposed exclusively via the `syncdir::config` facade, zero-copy `destinations()` slice (with `Config::dest_dirs` deprecated in favor of `Config::destinations()` and `Config::resolved_dest_dirs()`), Serde backward-compatibility bridging via `RawConfig`, quote-aware TOML bracket parsing (`preprocess_config_toml`), strict path format validation (`Config::validate()` and `TargetDir::validate()`), `TargetSyncConfig::from_config` invariant enforcement returning `Result<Self, SyncError>`, completely decoupled from `db` (0 `crate::db` imports in `config`), and runtime settings. Subsystem is organized into an acyclic hierarchy under `src/config/`: `mod.rs`, `builder.rs`, `raw.rs`, `target.rs`, `validation.rs`, and `tests.rs`.
@@ -213,6 +223,7 @@ syncdir/
 
 | Module | May Import | Must NOT Import |
 |--------|-----------|-----------------|
+| `build.rs` | `winres` (Windows build-dependency) | Runtime crate dependencies, `src/` modules |
 | `main` | `daemon`, `tray`, `config`, `sync`, `startup`, `net`, `path_util`, `error` | `db` (direct), `winit` |
 | `daemon` | `config`, `net`, `monitor`, `sync`, `db` (via factory), `path_util`, `error` | `main`, `tray`, `startup` |
 | `tray` | `sync`, `config`, `error`, `startup` (trait), `path_util`, `tray::assets` | `db` (direct), `main`, `daemon` |
@@ -264,7 +275,7 @@ syncdir/
 * **Log Injection Sanitization (CWE-117 Defense)**: Structured log events use `Debug` formatting (`?rel_path`) or validated domain newtypes to escape carriage returns and line feeds, preventing CRLF log injection in user-controlled filesystem paths.
 
 ## 10. Testing Strategy
-* **Test Suite Metrics**: 422 total automated tests passing with zero regressions and zero warnings across all targets (365 unit tests in `src/lib.rs`, 7 in `src/main.rs`, 13 integration tests, 8 property tests, 20 snapshot tests, 9 doc-tests, and 2 ignored interactive GUI modal dialog tests).
+* **Test Suite Metrics**: 444 total automated Rust tests (365 unit tests in `src/lib.rs`, 7 in `src/main.rs`, 22 in `tests/build_script_test.rs`, 13 integration tests, 8 property tests, 20 snapshot tests, 9 doc-tests, and 2 ignored interactive GUI modal dialog tests) plus 19 PowerShell release automation and PE resource tests passing with zero regressions and zero warnings across all targets.
 * **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config/` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db/` (`traits.rs`, `sqlite.rs`, CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing, hierarchy comparison, system root detection), `src/startup.rs`, `src/tray/` (`state_tests.rs`, `event_loop_tests.rs`, `dialog.rs`, `menu.rs`, testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), `src/monitor.rs` (watcher buffer overflow recovery and event dispatching), `src/test_support.rs` (canonical test double re-exports and tracing capture buffer tests), and the decomposed `src/sync/` submodules:
   * `src/sync/engine.rs` & `src/sync/engine_tests.rs`: Composed `LocalSyncEngine` end-to-end regression, metadata timestamp tolerances, TOCTOU size protection, directory creation, destination file truncation repair, two-phase lock release, fast-path casing alignment bypass on matching relative path, and reparse cache invalidation.
   * `src/sync/delta.rs`: Standalone `DeltaTransferEngine` Blake3 chunk hashing, delta sync dirty block updates, and read-back verification.
@@ -372,6 +383,10 @@ sequenceDiagram
   * **Block 4: API Safety, Trait Segregation & Hardening**: Monolithic `SyncEngine` segregated into 5 discrete role traits (`FileSynchronizer`, `FileDeleter`, `BatchFlusher`, `ScanEngine`, `ArchiveEngine`) unified by a composite supertrait; `FullScanCoordinator` decoupled behind `FullScanDriver` with `MockFullScanDriver`; `FileSyncTask` protected by fluent `FileSyncTaskBuilder` with typed `&RelativePath`; `TargetDir` protected by `RawTargetDir` Serde proxy; `RelativePath` bidirectional equality; `SyncError` constructors annotated with `#[must_use]`; and `SyncDaemonBuilder` introduced.
   * **Block 5: Core Sync Engine Decoupling, Fast-Path Casing & Cache Invalidation**: Decomposed monolithic `src/sync/engine.rs` to <750 LOC by extracting traits to `traits.rs` and tests to `engine_tests.rs`; implemented hot-path casing alignment bypass on verified cache hits (`is_verified_cache_hit`); hardened `ReparseCache` against non-existent root caching; added read-lock probe in `evict_dir`; and protected archive pruning deletions with TOCTOU symlink checks immediately before removal.
   * **Block 6: System Tray UI Modularization & Application Lifecycle**: Decomposed monolithic `src/tray.rs` (1,173 LOC) into modular submodules under `src/tray/` (`mod.rs`, `state.rs`, `dialog.rs`, `menu.rs`, `event_loop.rs`, `assets.rs`), ensuring every file strictly complies with `<400` LOC design guidelines; hardened Windows Explorer launching with `/select,"<path>"` quoting using Win32 `raw_arg` for whitespace paths; annotated canonical test doubles with `#[doc(hidden)]` under `syncdir::test_support`; and sanitized user path logging across scanner and archive modules to prevent CWE-117 log injection.
+* **Windows Resource Icon & Release Hardening Remediation (Blocks 1–3)**:
+  * **Block 1: Build Script Hardening & Dynamic Toolkit Abstraction**: Hardened `build.rs` with 4-tier SDK toolkit discovery (`WINRES_TOOLKIT_PATH`, `RC_PATH`, `WINDOWS_SDK_PATH`, Registry), embedded `asInvoker` application manifest preventing UAC virtualization (CWE-390 / CWE-250), single-handle defensive icon asset validation (<512 KB, 6-byte header), fail-closed release error policy via `exit(1)`, CI escape hatch (`SYNCDIR_ALLOW_MISSING_ICON=1`), invalidation triggers, and 22 isolated integration tests in `tests/build_script_test.rs`.
+  * **Block 2: Release Automation Hardening & PE Resource Verification Gate**: Hardened `scripts/build-release.ps1` with dynamic parameter overrides, scoped environment restoration (`Invoke-WithEnvironmentScope`), automatic compiler sibling probing (`cl.exe` -> `rc.exe`), native PowerShell PE binary structure parser (`Test-PeBinaryStructure`), fail-closed post-build PE verification gate (`Assert-ReleaseResourceIntegrity` confirming `.rsrc`, `RT_MANIFEST (24)`, and `RT_ICON (3 / 14)`), and 19 automated tests in `tests/test_build_release.ps1`.
+  * **Block 3: Multi-Resolution Icon Asset Upgrade & Documentation Synchronization**: Upgraded `syncdir.ico` to a 372,526-byte (~372 KB) 7-mipmap container (16×16, 24×24, 32×32, 48×48, 64×64, 128×128, 256×256 at 32bpp BGRA DIB with 1-bit AND mask) matching official brand palette (`RGB(66, 133, 244)` border, `RGB(255, 255, 255)` center), added Rust and PowerShell multi-resolution container integrity assertions, and synchronized `architecture.md`, `spec.md`, and `README.md`.
 
 ## 15. Data Model
 
@@ -415,7 +430,9 @@ erDiagram
 Migrations are managed in `src/db/sqlite.rs` programmatically. At startup, `db` runs a `CREATE TABLE IF NOT EXISTS` statement for both tables and creates the composite index to guarantee schema availability. Metadata table checks enforce `db_version` compatibility.
 
 ## 16. Environment Configuration
-No external APIs or environment variables are required. Configuration is loaded entirely from `%APPDATA%\syncdir\config.toml` containing:
+
+### Daemon Runtime Execution
+No external APIs or environment variables are required for daemon runtime execution. Configuration is loaded entirely from `%APPDATA%\syncdir\config.toml` containing:
 
 ```toml
 source_dir = "C:/Users/username/Documents"
@@ -436,3 +453,13 @@ block_sync_threshold_bytes = 10485760 # 10MB
 block_size_bytes = 1048576 # 1MB
 verify_writes = true # Verify rewritten blocks by hashing read-back bytes
 ```
+
+### Build Script & Release Automation Overrides
+While daemon runtime requires zero environment variables, the build script (`build.rs`) and release packaging script (`scripts/build-release.ps1`) support optional environment variables to enable deterministic compilation in portable toolchains and non-administrator environments:
+
+| Variable | Scope | Purpose | Default Behavior |
+|:---|:---|:---|:---|
+| `WINRES_TOOLKIT_PATH` | Build / Packaging | Explicit directory containing `rc.exe` or `windres.exe` (Tier 1 SDK discovery) | Falls back to `RC_PATH` |
+| `RC_PATH` | Build / Packaging | Direct path to `rc.exe` binary or its enclosing directory (Tier 2 SDK discovery) | Falls back to `WINDOWS_SDK_PATH` |
+| `WINDOWS_SDK_PATH` | Build / Packaging | Root directory of a Windows Kits / SDK installation (Tier 3 SDK discovery) | Falls back to registry probing (`HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`) |
+| `SYNCDIR_ALLOW_MISSING_ICON` | Build / Packaging | Permissive escape hatch (`"1"`, `"true"`, `"yes"`) downgrading release resource compilation and PE verification aborts to non-fatal warnings | Defaults to fail-closed (`exit(1)`) in release profile |

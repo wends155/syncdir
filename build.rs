@@ -374,6 +374,17 @@ pub fn compile_windows_resources(config: &ResourceBuildConfig) -> Result<(), Bui
 
     let mut res = winres::WindowsResource::new();
     res.set_icon("syncdir.ico");
+    res.set_manifest(
+        r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+        <requestedPrivileges>
+            <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+        </requestedPrivileges>
+    </security>
+</trustInfo>
+</assembly>"#,
+    );
 
     if let Some(toolkit) = config.resolve_toolkit_dir()? {
         res.set_toolkit_path(&toolkit.to_string_lossy());

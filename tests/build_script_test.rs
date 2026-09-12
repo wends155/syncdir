@@ -220,3 +220,51 @@ fn test_compile_windows_resources_under_test_cfg() {
     let config = ResourceBuildConfig::from_env_with(|_| None);
     assert_eq!(compile_windows_resources(&config), Ok(()));
 }
+
+#[test]
+fn test_workspace_syncdir_ico_multi_resolution() {
+    let ico_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("syncdir.ico");
+    assert!(
+        validate_icon_asset(&ico_path).is_ok(),
+        "Workspace syncdir.ico must pass validate_icon_asset"
+    );
+
+    let bytes = std::fs::read(&ico_path).expect("Failed to read workspace syncdir.ico");
+    let image_count = u16::from_le_bytes([bytes[4], bytes[5]]);
+    assert_eq!(
+        image_count, 7,
+        "syncdir.ico must contain exactly 7 mipmap images"
+    );
+
+    let mut resolutions = Vec::new();
+    for i in 0..image_count as usize {
+        let offset = 6 + i * 16;
+        let w = match bytes[offset] {
+            0 => 256,
+            w => w as u32,
+        };
+        let h = match bytes[offset + 1] {
+            0 => 256,
+            h => h as u32,
+        };
+        let bpp = u16::from_le_bytes([bytes[offset + 6], bytes[offset + 7]]);
+        assert_eq!(bpp, 32, "Mipmap {w}x{h} must be 32bpp");
+        resolutions.push((w, h));
+    }
+
+    let expected = [
+        (16, 16),
+        (24, 24),
+        (32, 32),
+        (48, 48),
+        (64, 64),
+        (128, 128),
+        (256, 256),
+    ];
+    for exp in &expected {
+        assert!(
+            resolutions.contains(exp),
+            "syncdir.ico missing required resolution: {exp:?}"
+        );
+    }
+}

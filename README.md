@@ -95,6 +95,40 @@ When configuring Windows paths in `config.toml`, choose one of the three support
 - `syncdir --unregister-startup`: Removes `syncdir` from the Windows Startup Registry.
 - `syncdir --autostart`: Starts the background sync daemon (invoked automatically by Windows on startup).
 
+## Build & Release Automation
+
+### Build Prerequisites & SDK Toolkit Resolution
+When compiling `syncdir` on Windows, `build.rs` embeds the application icon (`syncdir.ico`) and PE application manifest (`asInvoker`). This requires the Windows SDK Resource Compiler (`rc.exe`).
+
+The build script evaluates a deterministic 4-tier discovery hierarchy:
+1. **Tier 1 (`WINRES_TOOLKIT_PATH`):** Direct folder containing `rc.exe` / `windres.exe`.
+2. **Tier 2 (`RC_PATH`):** Path directly to the `rc.exe` binary or its enclosing directory.
+3. **Tier 3 (`WINDOWS_SDK_PATH`):** Windows Kits / SDK root directory (probes `bin/x64/rc.exe`).
+4. **Tier 4 (Ambient Probing):** Standard Windows Registry (`HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`) and PATH.
+
+If building in a headless CI environment or a system without the Windows SDK, set:
+```sh
+set SYNCDIR_ALLOW_MISSING_ICON=1
+```
+to downgrade release resource compilation aborts to non-fatal warnings.
+
+### Release Script (`scripts/build-release.ps1`)
+The release packaging pipeline can be executed directly with optional parameter overrides:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1 [OPTIONS]
+```
+
+| Parameter | Type | Description |
+|:---|:---|:---|
+| `-WinresToolkitPath` | `[string]` | Path to directory containing `rc.exe` / `windres.exe` (Tier 1 override) |
+| `-RcPath` | `[string]` | Path directly to `rc.exe` binary or parent folder (Tier 2 override) |
+| `-WindowsSdkPath` | `[string]` | Path to Windows Kits / SDK root folder (Tier 3 override) |
+| `-AllowMissingIcon` | `[switch]` | Permissive escape hatch downgrading release icon/manifest PE verification to warnings |
+| `-SkipQualityGate` | `[switch]` | Skips the pre-build code formatting and clippy linting check |
+| `-SkipCrtCheck` | `[switch]` | Skips `dumpbin /dependents` static CRT dependency inspection |
+| `-SkipPeVerification` | `[switch]` | Skips post-build PE `.rsrc`, manifest, and icon integrity verification |
+
 ## Features / Feature Flags
 
 - **Multiple Destinations**: Broadcasts filesystem change events from a single source folder to multiple independent target directories, running concurrent isolated sync processes.

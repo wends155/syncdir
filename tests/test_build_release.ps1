@@ -289,6 +289,36 @@ Run-Test "Test-PeBinaryStructure: Live release binary check (conditional)" {
     }
 }
 
+Run-Test "syncdir.ico: Multi-resolution container integrity and mipmaps" {
+    $icoPath = Join-Path $RepoRoot "syncdir.ico"
+    Assert-True (Test-Path $icoPath) "syncdir.ico must exist"
+    $bytes = [System.IO.File]::ReadAllBytes($icoPath)
+    Assert-True ($bytes.Length -gt 0 -and $bytes.Length -le 524288) "Size must be <= 512 KB"
+
+    $reserved = [BitConverter]::ToUInt16($bytes, 0)
+    $resType = [BitConverter]::ToUInt16($bytes, 2)
+    $imageCount = [BitConverter]::ToUInt16($bytes, 4)
+    Assert-Equal $reserved 0 "ICO reserved word must be 0"
+    Assert-Equal $resType 1 "ICO resource type must be 1"
+    Assert-Equal $imageCount 7 "Must contain exactly 7 mipmaps"
+
+    $resolutions = @()
+    for ($i = 0; $i -lt $imageCount; $i++) {
+        $offset = 6 + ($i * 16)
+        $w = $bytes[$offset]
+        $h = $bytes[$offset + 1]
+        $actualW = if ($w -eq 0) { 256 } else { [int]$w }
+        $actualH = if ($h -eq 0) { 256 } else { [int]$h }
+        $bpp = [BitConverter]::ToUInt16($bytes, $offset + 6)
+        Assert-Equal $bpp 32 "Mipmap $($actualW)x$($actualH) must be 32bpp"
+        $resolutions += "$($actualW)x$($actualH)"
+    }
+    $expected = @("16x16", "24x24", "32x32", "48x48", "64x64", "128x128", "256x256")
+    foreach ($exp in $expected) {
+        Assert-True ($resolutions -contains $exp) "Icon must contain $exp mipmap"
+    }
+}
+
 # Test summary output and exit code
 Write-Output ""
 Write-Output ("Tests: {0} Total | {1} Passed | {2} Failed" -f $script:TotalTests, $script:PassedTests, $script:FailedTests)

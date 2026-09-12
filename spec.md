@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 8e5cd6d
+> Last verified against: 59c2d25
  
 | Field | Value |
 |-------|-------|
@@ -687,6 +687,69 @@ THEN it evaluates to `true`
 | `test_support::MockStartupRegistry` | `struct` | `#[doc(hidden)]` In-memory `RegistryBackend` double |
 
 ---
+
+### 12. Build Script Module (`build.rs`)
+
+> Compiles Windows PE binary resources (`RT_GROUP_ICON`, `RT_MANIFEST`) via `winres` with dynamic SDK discovery, defensive icon validation, and fail-closed error handling.
+
+#### Public API
+
+| Function / Struct | Signature | Returns | Errors |
+|-------------------|-----------|---------|--------|
+| `ResourceBuildConfig::from_env` | `() -> Self` | `ResourceBuildConfig` | Infallible (sanitized from env) |
+| `ResourceBuildConfig::from_env_with` | `<E>(lookup: E) -> Self where E: Fn(&str) -> Option<String>` | `ResourceBuildConfig` | Infallible (dependency-injected env constructor) |
+| `ResourceBuildConfig::resolve_toolkit_dir` | `(&self) -> Result<Option<PathBuf>, BuildResourceError>` | `Option<PathBuf>` | `BuildResourceError::UnsafePath` |
+| `validate_path_safety` | `(path: &Path) -> Result<(), BuildResourceError>` | `()` | `BuildResourceError::UnsafePath` (null bytes, control characters, quotes) |
+| `validate_icon_asset` | `(path: &Path) -> Result<(), BuildResourceError>` | `()` | `BuildResourceError::IconNotFound`, `IconInvalid`, `Io` |
+| `validate_icon_bytes` | `(bytes: &[u8]) -> Result<(), BuildResourceError>` | `()` | `BuildResourceError::IconInvalid` (length < 6, reserved != 0, type != 1, count == 0) |
+| `compile_windows_resources` | `(config: &ResourceBuildConfig) -> Result<(), BuildResourceError>` | `()` | `BuildResourceError::CompilationFailed`, `IconNotFound`, `IconInvalid` |
+
+#### Behavioral Scenarios
+
+[HAPPY] Valid multi-resolution icon asset validation
+GIVEN a valid 7-mipmap `syncdir.ico` file on disk with valid 6-byte header and size <= 512 KB
+WHEN `validate_icon_asset` is called
+THEN validation succeeds returning `Ok(())`
+
+[ERROR] Icon file exceeds 512 KB ceiling
+GIVEN an icon file whose length exceeds 524,288 bytes
+WHEN `validate_icon_asset` is called
+THEN `BuildResourceError::IconInvalid` is returned
+
+[ERROR] Release profile compilation failure
+GIVEN `PROFILE == "release"` and compilation fails without `SYNCDIR_ALLOW_MISSING_ICON=1`
+WHEN `handle_resource_error` is called
+THEN an actionable remediation guide is printed to stderr and the process terminates via `std::process::exit(1)`
+
+---
+
+### 13. Release Automation Pipeline (`scripts/build-release.ps1`)
+
+> Orchestrates portable release compilation, MSVC static CRT inspection (`dumpbin`), post-build PE binary structure verification, and distribution packaging.
+
+#### Public API
+
+| Function | Parameters | Returns | Errors |
+|----------|------------|---------|--------|
+| `Test-PeBinaryStructure` | `-FilePath <string>` | `[PSCustomObject]` | Non-terminating object with `.IsValidPe`, `.HasRsrcSection`, `.HasResourceTable`, `.HasManifest`, `.HasIcon` |
+| `Assert-ReleaseResourceIntegrity` | `-BinaryPath <string>, -AllowMissingIcon <bool>` | `void` | Throws fail-closed policy violation if .rsrc, manifest, or icon is missing |
+| `Resolve-SdkToolkit` | `-WinresToolkitPath <string>, -RcPath <string>, -WindowsSdkPath <string>, -PathExists <scriptblock>` | `[string]` (toolkit directory) | Returns `$null` on missing toolkit without throwing |
+| `Invoke-WithEnvironmentScope` | `-EnvironmentUpdates <hashtable>, -Action <scriptblock>` | `void` | Restores original process environment even on uncaught scriptblock exceptions |
+| `Invoke-BuildRelease` | Parameterized release pipeline | `void` | Exits 1 on quality, CRT, or PE integrity failure |
+
+#### Behavioral Scenarios
+
+[HAPPY] Release binary contains valid PE structure, manifest, and multi-res icon
+GIVEN a release executable built with `build.rs` embedding manifest (`asInvoker`) and `syncdir.ico`
+WHEN `Assert-ReleaseResourceIntegrity` is executed
+THEN verification succeeds confirming .rsrc section, manifest, and application icon
+
+[ERROR] Release binary lacks embedded manifest or icon
+GIVEN an executable without resource directory table or missing RT_MANIFEST / RT_ICON
+WHEN `Assert-ReleaseResourceIntegrity` is executed without `-AllowMissingIcon`
+THEN a terminating fail-closed policy violation is thrown
+
+---
  
 ## Data Models
  
@@ -912,12 +975,14 @@ User interface tray-icon utilizing `tray-icon` and `winit` with `TrayController`
 Integrates `StartupRegistry` under HKCU for automatic daemon launch on user login.
 
 ### 6. Automated Testing Frameworks
-381 automated test cases verifying engine behavior:
-- Unit test suite across all modules (321 unit tests in `src/lib.rs`, 7 tests in `src/main.rs`).
+444 automated Rust test cases plus 19 PowerShell release and PE resource integrity tests:
+- Unit test suite across all modules (365 unit tests in `src/lib.rs`, 7 tests in `src/main.rs`).
+- Build script integration test suite (`tests/build_script_test.rs`: 22 tests).
 - Integration test suite (`tests/integration_tests.rs`: 13 tests).
 - Generative property test suite (`tests/property_tests.rs`: 8 proptest suites).
 - Snapshot regression test suite (`tests/snapshot_tests.rs`: 20 insta golden snapshots).
-- Documentation tests (`cargo test --doc`: 12 doctests).
+- Documentation tests (`cargo test --doc`: 9 doctests).
+- PowerShell release automation test suite (`tests/test_build_release.ps1`: 19 tests).
 
 ### 7. Development & Release Automation Scripts (`scripts/`)
 - `scripts/check-quality.ps1`: Code quality pipeline executing formatting, linter, tests, and static analysis.

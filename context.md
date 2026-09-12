@@ -1014,5 +1014,24 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Hardcoded `C:\Program Files (x86)\Windows Kits\10` path probing in release script eliminated.
 >   - Silent release packaging of unmanifested / icon-less binaries eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 3 — Multi-Resolution Icon Asset Upgrade & Documentation Synchronization (`syncdir.ico`, `architecture.md`, `spec.md`, `README.md`)
+> * **Changes:**
+>   - **Canonical Multi-Resolution Windows Icon Container**: Upgraded `syncdir.ico` from a single-resolution asset to a canonical 7-mipmap container (16×16, 24×24, 32×32, 48×48, 64×64, 128×128, 256×256) at 32bpp BGRA uncompressed DIB with 1-bit transparency mask and exact brand colors `RGB(66, 133, 244)` and `RGB(255, 255, 255)`. Container size is 372,526 bytes (well under the 512 KB ceiling). `ICONDIRENTRY` width/height for 256×256 correctly mapped to `0u8`.
+>   - **Embedded Application Manifest (CWE-390 / CWE-250 Defense)**: Enhanced `build.rs` `compile_windows_resources` with `res.set_manifest(...)` embedding an explicit `asInvoker` UAC manifest, preventing Windows UAC File and Registry Virtualization and satisfying `Assert-ReleaseResourceIntegrity`.
+>   - **Automated Multi-Resolution Verification**: Added `test_workspace_syncdir_ico_multi_resolution` in `tests/build_script_test.rs` and `syncdir.ico: Multi-resolution container integrity and mipmaps` in `tests/test_build_release.ps1` asserting container structure, mipmap count, and color depth.
+>   - **End-to-End Live PE Verification**: Tested live release binary generation via `scripts/build-release.ps1 -SkipQualityGate`, confirming valid PE32+ header, Resource Table at offset 128, `.rsrc` section, `RT_MANIFEST (24)`, and `RT_ICON (3 / 14)`.
+>   - **Documentation Synchronization**: Synchronized `architecture.md` (§4 layout, §5 module boundaries, §6 dependency rules, §10 metrics, §14 review findings, §16 env var rules), `spec.md` (Sections 12 & 13 behavioral contracts, Section 6 test inventory), and `README.md` (Build & Release Automation section with 7 CLI parameters).
+>   - **Quality Verification Gate**: All 444 Rust tests (365 lib + 7 bin + 22 build_script + 13 integration + 8 property + 20 snapshot + 9 doctests), all 19 PowerShell tests, `cargo fmt`, `cargo clippy -- -D warnings`, and `sg scan` passing with exit code 0.
+> * **New Constraints:**
+>   - `syncdir.ico` must remain a multi-resolution container containing at least the standard mipmaps (16, 24, 32, 48, 64, 128, 256) and strictly <= 512 KB.
+>   - Release executables must embed an `asInvoker` application manifest.
+>   - Syncdir runtime maintains strict zero-env-var requirement, cleanly separated from build/release automation toolkit overrides.
+> * **Pruned:**
+>   - All 15 findings from `review_report.md` regarding build script failure (`os error 3`), UAC virtualization risk, single-resolution icon, and fragile release scripting are 100% remediated and closed across Blocks 1–3.
+
+
 
 
