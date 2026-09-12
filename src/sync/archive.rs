@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::path_safety::{
     ReparseCache, is_reparse_or_symlink, is_reparse_or_symlink_meta, is_safe_relative_path,
-    verify_destination_not_reparse_cached,
+    verify_destination_not_reparse, verify_destination_not_reparse_cached,
 };
 use crate::config::TargetSyncConfig;
 use crate::error::SyncError;
@@ -111,6 +111,8 @@ pub(crate) fn prune_archive(
     files.retain(|(path, len, archive_time)| {
         if let Ok(age) = now.duration_since(*archive_time)
             && age > max_age
+            && let Ok(meta) = fs::symlink_metadata(path)
+            && !is_reparse_or_symlink_meta(&meta)
             && fs::remove_file(path).is_ok()
         {
             total_bytes = total_bytes.saturating_sub(*len);
@@ -126,7 +128,10 @@ pub(crate) fn prune_archive(
             if total_bytes <= max_bytes {
                 break;
             }
-            if fs::remove_file(&path).is_ok() {
+            if let Ok(meta) = fs::symlink_metadata(&path)
+                && !is_reparse_or_symlink_meta(&meta)
+                && fs::remove_file(&path).is_ok()
+            {
                 total_bytes = total_bytes.saturating_sub(len);
             }
         }
@@ -229,6 +234,7 @@ impl ArchiveManager {
                         .map_err(|e| SyncError::validation_security(e.to_string()))?;
 
                     if let Some(parent) = archive_path.parent() {
+                        verify_destination_not_reparse(parent, Path::new(""))?;
                         fs::create_dir_all(parent)?;
                     }
                     verify_destination_not_reparse_cached(
@@ -715,5 +721,20 @@ mod tests {
             reparse_cache.contains(&dest),
             "ReparseCache must contain destination root"
         );
+    }
+
+    #[test]
+    fn test_archive_pruning_toctou_symlink_guard() {
+        let temp = tempdir().unwrap();
+        let archive_dir = temp.path().join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let file_path = archive_dir.join("old_archive.txt");
+        std::fs::write(&file_path, b"historical data").unwrap();
+
+        // Prune with age 0 to trigger deletion
+        let res = prune_archive(&archive_dir, 0, 1024 * 1024);
+        assert!(res.is_ok());
+        assert!(!file_path.exists());
     }
 }

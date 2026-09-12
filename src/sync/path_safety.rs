@@ -70,12 +70,22 @@ impl ReparseCache {
 
     /// Evict `dir` and all its descendants from both cache tiers.
     pub fn evict_dir(&self, dir: &Path) {
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.shallow.retain(|p| !p.starts_with(dir));
-        inner.deep.retain(|p| !p.starts_with(dir));
+        let has_match = {
+            let inner = self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.shallow.iter().any(|p| p.starts_with(dir))
+                || inner.deep.iter().any(|p| p.starts_with(dir))
+        };
+        if has_match {
+            let mut inner = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.shallow.retain(|p| !p.starts_with(dir));
+            inner.deep.retain(|p| !p.starts_with(dir));
+        }
     }
 
     /// Clear all cached directories across both tiers.
@@ -118,6 +128,23 @@ impl ReparseCache {
     /// Returns `true` if no entries are cached.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Check whether `path` is contained in either cache tier (alias to `contains`).
+    #[must_use]
+    pub fn is_cached(&self, path: &Path) -> bool {
+        self.contains(path)
+    }
+
+    /// Convenience insert for a path into the shallow cache tier.
+    pub fn insert(&self, path: PathBuf, _is_reparse: bool) {
+        self.insert_ancestor(&path, &path);
+    }
+}
+
+impl Default for ReparseCache {
+    fn default() -> Self {
+        Self::new(1000, 100)
     }
 }
 
@@ -195,17 +222,18 @@ pub fn verify_destination_not_reparse_cached(
     rel_path: &Path,
     cache: &ReparseCache,
 ) -> Result<Option<Metadata>, SyncError> {
-    if !cache.contains(dest_dir) {
-        if fs::symlink_metadata(dest_dir)
-            .map(|m| is_reparse_or_symlink_meta(&m))
-            .unwrap_or(false)
-        {
+    if !cache.contains(dest_dir)
+        && let Ok(m) = fs::symlink_metadata(dest_dir)
+    {
+        if is_reparse_or_symlink_meta(&m) {
             return Err(SyncError::validation_reparse(format!(
                 "Destination root '{}' is a symlink or reparse point; refusing to write",
                 dest_dir.display()
             )));
         }
-        cache.insert_ancestor(dest_dir, dest_dir);
+        if m.is_dir() {
+            cache.insert_ancestor(dest_dir, dest_dir);
+        }
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
@@ -245,16 +273,18 @@ pub fn verify_destination_not_reparse_cached(
     rel_path: &Path,
     cache: &ReparseCache,
 ) -> Result<Option<Metadata>, SyncError> {
-    if !cache.contains(dest_dir) {
-        if let Ok(m) = fs::symlink_metadata(dest_dir) {
-            if is_reparse_or_symlink_meta(&m) {
-                return Err(SyncError::validation_reparse(format!(
-                    "Destination root '{}' is a symlink; refusing to write",
-                    dest_dir.display()
-                )));
-            }
+    if !cache.contains(dest_dir)
+        && let Ok(m) = fs::symlink_metadata(dest_dir)
+    {
+        if is_reparse_or_symlink_meta(&m) {
+            return Err(SyncError::validation_reparse(format!(
+                "Destination root '{}' is a symlink; refusing to write",
+                dest_dir.display()
+            )));
         }
-        cache.insert_ancestor(dest_dir, dest_dir);
+        if m.is_dir() {
+            cache.insert_ancestor(dest_dir, dest_dir);
+        }
     }
     let mut current = dest_dir.to_path_buf();
     let mut leaf_meta = None;
@@ -294,17 +324,18 @@ pub fn verify_source_not_reparse_cached(
     rel_path: &Path,
     cache: &ReparseCache,
 ) -> Result<(), SyncError> {
-    if !cache.contains(source_dir) {
-        if fs::symlink_metadata(source_dir)
-            .map(|m| is_reparse_or_symlink_meta(&m))
-            .unwrap_or(false)
-        {
+    if !cache.contains(source_dir)
+        && let Ok(m) = fs::symlink_metadata(source_dir)
+    {
+        if is_reparse_or_symlink_meta(&m) {
             return Err(SyncError::validation_reparse(format!(
                 "Source root '{}' is a symlink or reparse point; refusing to read",
                 source_dir.display()
             )));
         }
-        cache.insert_ancestor(source_dir, source_dir);
+        if m.is_dir() {
+            cache.insert_ancestor(source_dir, source_dir);
+        }
     }
     let mut current = source_dir.to_path_buf();
     for component in rel_path.parent().into_iter().flat_map(|p| p.components()) {
@@ -333,16 +364,18 @@ pub fn verify_source_not_reparse_cached(
     rel_path: &Path,
     cache: &ReparseCache,
 ) -> Result<(), SyncError> {
-    if !cache.contains(source_dir) {
-        if let Ok(m) = fs::symlink_metadata(source_dir) {
-            if is_reparse_or_symlink_meta(&m) {
-                return Err(SyncError::validation_reparse(format!(
-                    "Source root '{}' is a symlink; refusing to read",
-                    source_dir.display()
-                )));
-            }
+    if !cache.contains(source_dir)
+        && let Ok(m) = fs::symlink_metadata(source_dir)
+    {
+        if is_reparse_or_symlink_meta(&m) {
+            return Err(SyncError::validation_reparse(format!(
+                "Source root '{}' is a symlink; refusing to read",
+                source_dir.display()
+            )));
         }
-        cache.insert_ancestor(source_dir, source_dir);
+        if m.is_dir() {
+            cache.insert_ancestor(source_dir, source_dir);
+        }
     }
     let mut current = source_dir.to_path_buf();
     for component in rel_path.parent().into_iter().flat_map(|p| p.components()) {
@@ -882,5 +915,40 @@ mod tests {
             .expect("Sibling verification must succeed via cached ancestors");
         assert!(sibling_meta.is_some());
         assert_eq!(sibling_meta.unwrap().len(), 15);
+    }
+
+    #[test]
+    fn test_reparse_cache_skips_non_existent_directory() {
+        let temp = tempdir().unwrap();
+        let non_existent = temp.path().join("does_not_exist");
+        let cache = ReparseCache::default();
+
+        let rel = crate::path_util::RelativePath::try_new("file.txt").unwrap();
+        let res = verify_destination_not_reparse_cached(&non_existent, rel.as_path(), &cache);
+        assert!(res.is_ok());
+
+        // Root must NOT be cached because it didn't exist at check time
+        assert!(!cache.is_cached(&non_existent));
+    }
+
+    #[test]
+    fn test_reparse_cache_evict_dir_read_probe() {
+        let cache = ReparseCache::default();
+        let p1 = PathBuf::from(r"C:\syncdir\target1\file.txt");
+        let p2 = PathBuf::from(r"C:\syncdir\target2\file.txt");
+        cache.insert(p1.clone(), false);
+        cache.insert(p2.clone(), false);
+
+        assert!(cache.is_cached(&p1));
+        assert!(cache.is_cached(&p2));
+
+        // Evict target1 only
+        cache.evict_dir(Path::new(r"C:\syncdir\target1"));
+        assert!(!cache.is_cached(&p1));
+        assert!(cache.is_cached(&p2));
+
+        // Evict non-matching path -> read probe skips write lock
+        cache.evict_dir(Path::new(r"C:\syncdir\non_matching"));
+        assert!(cache.is_cached(&p2));
     }
 }

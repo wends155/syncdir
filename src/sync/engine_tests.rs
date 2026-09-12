@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::config::{Config, TargetDir, TargetSyncConfig};
 use crate::db::{MockHashStore, SqliteHashStore};
