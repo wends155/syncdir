@@ -14,18 +14,21 @@ pub(crate) mod small_file;
 pub mod types;
 pub(crate) mod worker;
 
-pub(crate) use full_scan::FullScanCoordinator;
+pub use full_scan::{FullScanCoordinator, FullScanDriver};
 
 pub use delta::DirtyBlockRange;
 #[allow(deprecated)]
 pub use engine::is_metadata_up_to_date_raw;
 pub use engine::{
-    ConnectivityState, FileMetadataSnapshot, LocalSyncEngine, ScanOutcome, SyncCommand, SyncEngine,
+    ArchiveEngine, BatchFlusher, ConnectivityState, FileDeleter, FileMetadataSnapshot,
+    FileSynchronizer, LocalSyncEngine, ScanEngine, ScanOutcome, SyncCommand, SyncEngine,
     SyncStatusObserver, WatcherState,
 };
-pub use mock::{MockSyncEngine, MockSyncStatusObserver};
-pub use path_safety::is_safe_relative_path;
-pub use types::{FileSyncTask, safe_epoch_duration_millis, safe_modified_millis};
+pub use mock::{MockFullScanDriver, MockSyncEngine, MockSyncStatusObserver};
+pub use path_safety::{ReparseCache, is_safe_relative_path};
+pub use types::{
+    FileSyncTask, FileSyncTaskBuilder, safe_epoch_duration_millis, safe_modified_millis,
+};
 pub use worker::{
     SourceConnectivityTracker, SyncWorkerContext, SyncWorkerContextBuilder, start_sync_worker,
 };

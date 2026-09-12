@@ -172,6 +172,7 @@ impl From<toml::de::Error> for SyncError {
 /// # Returns
 ///
 /// `true` if the error indicates a transient or persistent network disconnect, `false` otherwise.
+#[must_use]
 pub fn is_network_offline_io(io_err: &std::io::Error) -> bool {
     matches!(
         io_err.kind(),
@@ -202,11 +203,13 @@ pub fn is_network_offline_io(io_err: &std::io::Error) -> bool {
 
 impl SyncError {
     /// Create a `SyncError::Config` without a source cause.
+    #[must_use]
     pub fn config(msg: impl Into<String>) -> Self {
         SyncError::Config(msg.into(), None)
     }
 
     /// Create a `SyncError::Config` with an underlying source error cause.
+    #[must_use]
     pub fn config_with_source<E: std::error::Error + Send + Sync + 'static>(
         msg: impl Into<String>,
         source: E,
@@ -215,6 +218,7 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Validation` error with default Invariant classification.
+    #[must_use]
     pub fn validation(msg: impl Into<String>) -> Self {
         SyncError::Validation {
             kind: ValidationKind::Invariant,
@@ -223,6 +227,7 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Validation` error with explicit classification kind.
+    #[must_use]
     pub fn validation_kind(kind: ValidationKind, msg: impl Into<String>) -> Self {
         SyncError::Validation {
             kind,
@@ -251,6 +256,7 @@ impl SyncError {
     /// let err = SyncError::validation_security("Unsafe path traversal detected: ../secret");
     /// assert!(err.is_permanent_validation_failure());
     /// ```
+    #[must_use]
     pub fn validation_security(msg: impl Into<String>) -> Self {
         SyncError::Validation {
             kind: ValidationKind::Security,
@@ -259,6 +265,7 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Validation` error for reparse point or junction violations.
+    #[must_use]
     pub fn validation_reparse(msg: impl Into<String>) -> Self {
         SyncError::Validation {
             kind: ValidationKind::ReparsePoint,
@@ -267,26 +274,7 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Validation` error for domain invariant violations.
-    ///
-    /// Used when configuration parameters, builder constraints, or operational invariants
-    /// are breached.
-    ///
-    /// # Arguments
-    ///
-    /// * `msg` - Explanatory message detailing the invariant violation.
-    ///
-    /// # Returns
-    ///
-    /// A [`SyncError::Validation`] instance wrapping the message string.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use syncdir::error::SyncError;
-    ///
-    /// let err = SyncError::validation_invariant("Debounce seconds must be greater than zero");
-    /// assert_eq!(err.to_string(), "Validation error: Debounce seconds must be greater than zero");
-    /// ```
+    #[must_use]
     pub fn validation_invariant(msg: impl Into<String>) -> Self {
         SyncError::Validation {
             kind: ValidationKind::Invariant,
@@ -295,6 +283,7 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Validation` error for recursive sync loop violations.
+    #[must_use]
     pub fn validation_loop(msg: impl Into<String>) -> Self {
         SyncError::Validation {
             kind: ValidationKind::RecursiveLoop,
@@ -303,26 +292,6 @@ impl SyncError {
     }
 
     /// Check if this error is a permanent validation failure that should not be retried.
-    ///
-    /// Permanent failures include security and traversal violations (such as junctions,
-    /// reparse points, reserved device names, or path traversal attempts) where retrying
-    /// would simply repeat the invariant failure and waste CPU/IO cycles.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the error represents a permanent validation failure, or `false` otherwise.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use syncdir::error::SyncError;
-    ///
-    /// let perm = SyncError::validation_security("Destination component is a symlink or reparse point");
-    /// assert!(perm.is_permanent_validation_failure());
-    ///
-    /// let transient = SyncError::validation("Temporary lock delay");
-    /// assert!(!transient.is_permanent_validation_failure());
-    /// ```
     #[must_use]
     pub fn is_permanent_validation_failure(&self) -> bool {
         match self {
@@ -332,6 +301,7 @@ impl SyncError {
     }
 
     /// Create a `SyncError::WriteVerificationFailed` error.
+    #[must_use]
     pub fn write_verification_failed(path: impl Into<std::path::PathBuf>) -> Self {
         SyncError::WriteVerificationFailed {
             path: path.into(),
@@ -342,6 +312,7 @@ impl SyncError {
     }
 
     /// Create an enriched `SyncError::WriteVerificationFailed` error with block diagnostics.
+    #[must_use]
     pub fn write_verification_failed_block(
         path: impl Into<std::path::PathBuf>,
         block_index: u64,
@@ -357,11 +328,13 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Db` without a source cause.
+    #[must_use]
     pub fn db(msg: impl Into<String>) -> Self {
         SyncError::Db(msg.into(), None)
     }
 
     /// Create a `SyncError::Db` with an underlying source error cause.
+    #[must_use]
     pub fn db_with_source<E: std::error::Error + Send + Sync + 'static>(
         msg: impl Into<String>,
         source: E,
@@ -370,11 +343,13 @@ impl SyncError {
     }
 
     /// Create a `SyncError::LockPoison` without a source cause.
+    #[must_use]
     pub fn lock_poison(msg: impl Into<String>) -> Self {
         SyncError::LockPoison(msg.into(), None)
     }
 
     /// Create a `SyncError::LockPoison` with an underlying source error cause.
+    #[must_use]
     pub fn lock_poison_with_source<E: std::error::Error + Send + Sync + 'static>(
         msg: impl Into<String>,
         source: E,
@@ -383,11 +358,13 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Watcher` without a source cause.
+    #[must_use]
     pub fn watcher(msg: impl Into<String>) -> Self {
         SyncError::Watcher(WatcherError::Other(msg.into(), None))
     }
 
     /// Create a `SyncError::Watcher` with an underlying source error cause.
+    #[must_use]
     pub fn watcher_with_source<E: std::error::Error + Send + Sync + 'static>(
         msg: impl Into<String>,
         source: E,
@@ -396,11 +373,13 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Tray` without a source cause.
+    #[must_use]
     pub fn tray(msg: impl Into<String>) -> Self {
         SyncError::Tray(msg.into(), None)
     }
 
     /// Create a `SyncError::Tray` with an underlying source error cause.
+    #[must_use]
     pub fn tray_with_source<E: std::error::Error + Send + Sync + 'static>(
         msg: impl Into<String>,
         source: E,
@@ -409,11 +388,13 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Registry` without a source cause.
+    #[must_use]
     pub fn registry(msg: impl Into<String>) -> Self {
         SyncError::Registry(msg.into(), None)
     }
 
     /// Create a `SyncError::Registry` with an underlying source error cause.
+    #[must_use]
     pub fn registry_with_source<E: std::error::Error + Send + Sync + 'static>(
         msg: impl Into<String>,
         source: E,
@@ -422,25 +403,43 @@ impl SyncError {
     }
 
     /// Create a `SyncError::Cancelled` error.
+    #[must_use]
     pub fn cancelled() -> Self {
         SyncError::Cancelled
     }
 
+    /// Create a `SyncError::Io` error.
+    #[must_use]
+    pub fn io(err: std::io::Error) -> Self {
+        SyncError::Io(err)
+    }
+
+    /// Create a generic `SyncError::Config` error message.
+    #[must_use]
+    pub fn generic(msg: impl Into<String>) -> Self {
+        SyncError::Config(msg.into(), None)
+    }
+
     /// Returns `true` if the error represents a cooperative cancellation.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         matches!(self, SyncError::Cancelled)
     }
 
     /// Returns `true` if the error represents an SMB/network connectivity loss.
-    ///
-    /// Inspects the underlying Win32 error code from `std::io::Error::raw_os_error()`
-    /// for known Windows network error codes.
-    ///
-    /// Returns `false` for non-`Io` variants or `Io` errors with unrecognized
-    /// error codes.
+    #[must_use]
     pub fn is_network_offline(&self) -> bool {
         match self {
             SyncError::Io(io_err) => is_network_offline_io(io_err),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if the error represents an I/O `NotFound` condition.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            SyncError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
             _ => false,
         }
     }
@@ -752,5 +751,17 @@ mod tests {
         let err_inv = SyncError::validation_invariant("invariant violation");
         assert!(!err_inv.is_permanent_validation_failure());
         assert_eq!(err_inv.to_string(), "Validation error: invariant violation");
+    }
+
+    #[test]
+    fn test_sync_error_must_use_and_is_not_found() {
+        let io_nf = SyncError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(io_nf.is_not_found());
+
+        let io_other = SyncError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!io_other.is_not_found());
+
+        let config_err = SyncError::config("bad config");
+        assert!(!config_err.is_not_found());
     }
 }

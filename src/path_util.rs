@@ -299,11 +299,12 @@ pub struct RelativePath(PathBuf);
 
 impl RelativePath {
     /// Construct a new `RelativePath`, validating security invariants and normalizing slashes to `/`.
+    /// Canonical constructor method.
     ///
     /// # Errors
     /// Returns `SyncError::Validation` if the path is empty, absolute, contains directory traversals,
     /// DOS device names, Alternate Data Streams, or other unsafe patterns.
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
+    pub fn try_new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
         let p = path.as_ref();
         if p.as_os_str().is_empty() || p.to_string_lossy().trim().is_empty() {
             return Err(SyncError::validation_security(
@@ -332,6 +333,13 @@ impl RelativePath {
         }
 
         Ok(Self(normalized_path))
+    }
+
+    /// Construct a new `RelativePath`, validating security invariants and normalizing slashes to `/`.
+    /// Inline wrapper around `RelativePath::try_new`.
+    #[inline]
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
+        Self::try_new(path)
     }
 
     /// Construct a `RelativePath` without running invariant checks.
@@ -476,6 +484,34 @@ impl PartialEq<RelativePath> for &str {
     #[inline]
     fn eq(&self, other: &RelativePath) -> bool {
         Path::new(*self) == other.0.as_path()
+    }
+}
+
+impl PartialEq<PathBuf> for RelativePath {
+    #[inline]
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<RelativePath> for PathBuf {
+    #[inline]
+    fn eq(&self, other: &RelativePath) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<&PathBuf> for RelativePath {
+    #[inline]
+    fn eq(&self, other: &&PathBuf) -> bool {
+        self.0 == **other
+    }
+}
+
+impl PartialEq<RelativePath> for &PathBuf {
+    #[inline]
+    fn eq(&self, other: &RelativePath) -> bool {
+        **self == other.0
     }
 }
 
@@ -790,5 +826,22 @@ mod tests {
             log_output.is_empty(),
             "Expected zero log records from normalize_path, got: {log_output}"
         );
+    }
+
+    #[test]
+    fn test_relative_path_bidirectional_partial_eq_with_pathbuf() {
+        use std::path::{Path, PathBuf};
+        let rel = RelativePath::try_new("docs/readme.md").unwrap();
+        let pb = PathBuf::from("docs/readme.md");
+        let p = Path::new("docs/readme.md");
+
+        assert_eq!(rel, pb);
+        assert_eq!(pb, rel);
+        assert_eq!(rel, p);
+        assert_eq!(p, rel);
+
+        let diff = PathBuf::from("other/file.txt");
+        assert_ne!(rel, diff);
+        assert_ne!(diff, rel);
     }
 }

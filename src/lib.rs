@@ -32,6 +32,40 @@
 //!
 //! ## Examples
 //!
+//! ### Constructing and Validating Configuration
+//!
+//! ```
+//! use syncdir::config::Config;
+//! use std::path::Path;
+//!
+//! let temp = tempfile::tempdir().unwrap();
+//! let src = temp.path().join("source");
+//! let dst = temp.path().join("dest");
+//! std::fs::create_dir_all(&src).unwrap();
+//! std::fs::create_dir_all(&dst).unwrap();
+//!
+//! let config = Config::builder(&src)
+//!     .dest_dir(&dst)
+//!     .propagate_deletions(true)
+//!     .build()
+//!     .unwrap();
+//!
+//! assert_eq!(config.dest_dirs().unwrap().len(), 1);
+//! assert!(config.propagate_deletions());
+//! ```
+//!
+//! ### Type-Safe Relative Path Validation
+//!
+//! ```
+//! use syncdir::path_util::RelativePath;
+//! use std::path::Path;
+//!
+//! let rel = RelativePath::try_new("reports/summary.docx").unwrap();
+//! assert_eq!(rel.as_path(), Path::new("reports/summary.docx"));
+//! ```
+//!
+//! ### Configuring and Running the Daemon
+//!
 //! ```no_run
 //! use std::path::Path;
 //! use syncdir::config::Config;
@@ -43,7 +77,7 @@
 //!         .build()?;
 //!
 //!     let app_dir = Path::new("C:\\ProgramData\\syncdir");
-//!     let daemon = SyncDaemon::start(config, app_dir, None)?;
+//!     let daemon = SyncDaemon::builder(config, app_dir).start()?;
 //!
 //!     // Keep running until shutdown signal
 //!     daemon.shutdown();
@@ -64,7 +98,7 @@ pub mod sync;
 pub mod test_support;
 pub mod tray;
 
-pub use daemon::{DaemonHandle, SyncDaemon};
+pub use daemon::{DaemonHandle, SyncDaemon, SyncDaemonBuilder};
 
 /// Copyright notice for syncdir.
 pub const COPYRIGHT: &str = "(c) 2026 Wendell Saligan";

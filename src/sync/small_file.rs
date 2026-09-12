@@ -242,8 +242,9 @@ mod tests {
 
         let engine = SmallFileTransferEngine::new(target_cfg);
 
+        let rel = RelativePath::try_new(file_name).unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new(file_name),
+            rel_path: &rel,
             src_path: &src_file_path,
             dest_path: &dst.join(file_name),
             dest_dir: &dst,
@@ -307,8 +308,9 @@ mod tests {
         // 2. Failure scenario: pass a stale src_mod timestamp
         let src_file = src.join("target.txt");
         fs::write(&src_file, b"NEW_CONTENT_THAT_SHOULD_FAIL").unwrap();
+        let rel_fail = RelativePath::try_new("target.txt").unwrap();
         let task_failing = FileSyncTask {
-            rel_path: Path::new("target.txt"),
+            rel_path: &rel_fail,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
@@ -330,8 +332,9 @@ mod tests {
 
         // 3. Success scenario
         let src_meta = fs::metadata(&src_file).unwrap();
+        let rel_ok = RelativePath::try_new("target.txt").unwrap();
         let task_valid = FileSyncTask {
-            rel_path: Path::new("target.txt"),
+            rel_path: &rel_ok,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
@@ -380,8 +383,9 @@ mod tests {
         fs::write(&src_file, b"Hello standalone engine!").unwrap();
 
         let meta = fs::metadata(&src_file).unwrap();
+        let rel = RelativePath::try_new("hello.txt").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("hello.txt"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dest,
@@ -418,8 +422,9 @@ mod tests {
         fs::write(&src_file, content).unwrap();
 
         let meta = fs::metadata(&src_file).unwrap();
+        let rel = RelativePath::try_new("test.txt").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("test.txt"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dest,
@@ -439,9 +444,8 @@ mod tests {
     fn test_sync_small_file_staging_nonce_and_buffer_fallback() {
         use crate::config::{TargetSyncConfig, VerificationMode};
         use crate::sync::small_file::SmallFileTransferEngine;
-        use crate::sync::types::{FileSyncTask, safe_modified_millis};
+        use crate::sync::types::{FileSyncTask, RelativePath, safe_modified_millis};
         use std::fs;
-        use std::path::Path;
         use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
@@ -465,8 +469,9 @@ mod tests {
         let engine = SmallFileTransferEngine::new(target_cfg);
 
         let dest_file = dst.join(file_name);
+        let rel = RelativePath::try_new(file_name).unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new(file_name),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dest_file,
             dest_dir: &dst,

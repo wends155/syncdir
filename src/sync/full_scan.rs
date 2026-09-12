@@ -68,42 +68,67 @@ pub(crate) struct SyncStats {
     pub skipped: usize,
 }
 
-/// Orchestrates full directory synchronization across modular, testable stages.
-pub struct FullScanCoordinator<'a, S: HashStore> {
-    engine: &'a LocalSyncEngine<S>,
-    dest_dir: &'a Path,
-    cancel: &'a AtomicBool,
+/// Abstraction driving the individual operations of a full scan cycle.
+///
+/// Decouples [`FullScanCoordinator`] from concrete engine implementations, allowing
+/// lightweight, pure in-memory testing of scanning, synchronization, and deletion lifecycles.
+pub trait FullScanDriver: Send + Sync {
+    /// Validate source existence and resolve the active destination directory.
+    fn resolve_active_destination(&self, dest_dir: &Path) -> Result<Option<PathBuf>, SyncError>;
+
+    /// Scan source directory for files, returning discovered relative paths and whether the scan completed fully.
+    fn scan_source_files(&self, cancel: &AtomicBool)
+    -> Result<(HashSet<PathBuf>, bool), SyncError>;
+
+    /// Load existing database records for comparison.
+    fn load_cached_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError>;
+
+    /// Synchronize a single file to the destination directory.
+    fn sync_file_core(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+        cached: Option<&FileRecord>,
+    ) -> Result<Option<(FileRecord, Vec<crate::db::BlockHash>)>, SyncError>;
+
+    /// Archive or remove a file on destination filesystem without updating database.
+    fn archive_dest_file_only(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError>;
+
+    /// Delete records in batch from the database.
+    fn delete_files_batch(&self, paths: &[&Path]) -> Result<(), SyncError>;
+
+    /// Flush a batch of synchronized records and block hashes to the database.
+    fn flush_record_batch(
+        &self,
+        batch: &mut Vec<(FileRecord, Vec<crate::db::BlockHash>)>,
+    ) -> Result<(), SyncError>;
+
+    /// Prune old destination archive versions.
+    fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError>;
+
+    /// Check if deletions should be propagated to destination.
+    fn propagate_deletions(&self) -> bool;
+
+    /// Get block size in bytes for buffer allocation.
+    fn block_size_bytes(&self) -> u64;
 }
 
-impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
-    /// Create a new full scan coordinator.
-    pub fn new(engine: &'a LocalSyncEngine<S>, dest_dir: &'a Path, cancel: &'a AtomicBool) -> Self {
-        Self {
-            engine,
-            dest_dir,
-            cancel,
-        }
-    }
-
-    /// Stage 1: Validate source existence and resolve the active destination directory.
-    pub(crate) fn resolve_active_destination(&self) -> Result<Option<PathBuf>, SyncError> {
-        if self.cancel.load(Ordering::Relaxed) {
-            return Err(SyncError::Cancelled);
-        }
-
-        let resolved_source = self.engine.config().source_dir();
+impl<S: HashStore> FullScanDriver for LocalSyncEngine<S> {
+    fn resolve_active_destination(&self, dest_dir: &Path) -> Result<Option<PathBuf>, SyncError> {
+        let resolved_source = self.config().source_dir();
         if !resolved_source.exists() {
             return Err(SyncError::validation("Source directory does not exist"));
         }
 
-        let active_dest = if let Some(pre_resolved) = self.engine.resolved_dest() {
+        let active_dest = if let Some(pre_resolved) = self.resolved_dest() {
             if pre_resolved.exists() && pre_resolved.is_dir() {
                 pre_resolved.to_path_buf()
             } else {
-                self.dest_dir.to_path_buf()
+                dest_dir.to_path_buf()
             }
         } else {
-            self.dest_dir.to_path_buf()
+            dest_dir.to_path_buf()
         };
 
         if !active_dest.exists() || !active_dest.is_dir() {
@@ -117,22 +142,96 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
         Ok(Some(active_dest))
     }
 
-    /// Stage 2: Scan source directory for files, supporting cancellation.
-    pub(crate) fn collect_source_files(&self) -> Result<(HashSet<PathBuf>, bool), SyncError> {
+    fn scan_source_files(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<(HashSet<PathBuf>, bool), SyncError> {
         let mut source_files = HashSet::new();
         let mut scan_complete = true;
-        self.engine.scanner().scan_dir_cancellable(
-            self.engine.config().source_dir(),
+        self.scanner().scan_dir_cancellable(
+            self.config().source_dir(),
             &mut source_files,
             &mut scan_complete,
-            self.cancel,
+            cancel,
         )?;
         Ok((source_files, scan_complete))
     }
 
+    fn load_cached_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
+        self.db().list_all_records()
+    }
+
+    fn sync_file_core(
+        &self,
+        rel_path: &Path,
+        dest_dir: &Path,
+        scratch: &mut [u8],
+        cached: Option<&FileRecord>,
+    ) -> Result<Option<(FileRecord, Vec<crate::db::BlockHash>)>, SyncError> {
+        self.sync_file_to_dest_core(rel_path, dest_dir, scratch, cached)
+    }
+
+    fn archive_dest_file_only(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
+        self.archive_dest_file_only(rel_path, dest_dir)
+    }
+
+    fn delete_files_batch(&self, paths: &[&Path]) -> Result<(), SyncError> {
+        self.db().delete_files_batch(paths)
+    }
+
+    fn flush_record_batch(
+        &self,
+        batch: &mut Vec<(FileRecord, Vec<crate::db::BlockHash>)>,
+    ) -> Result<(), SyncError> {
+        self.flush_record_batch(batch)
+    }
+
+    fn prune_destination_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
+        self.prune_destination_archive(dest_dir)
+    }
+
+    fn propagate_deletions(&self) -> bool {
+        self.config().propagate_deletions()
+    }
+
+    fn block_size_bytes(&self) -> u64 {
+        self.config().block_size_bytes()
+    }
+}
+
+/// Orchestrates full directory synchronization across modular, testable stages.
+pub struct FullScanCoordinator<'a, D: FullScanDriver + ?Sized> {
+    driver: &'a D,
+    dest_dir: &'a Path,
+    cancel: &'a AtomicBool,
+}
+
+impl<'a, D: FullScanDriver + ?Sized> FullScanCoordinator<'a, D> {
+    /// Create a new full scan coordinator.
+    pub fn new(driver: &'a D, dest_dir: &'a Path, cancel: &'a AtomicBool) -> Self {
+        Self {
+            driver,
+            dest_dir,
+            cancel,
+        }
+    }
+
+    /// Stage 1: Validate source existence and resolve the active destination directory.
+    pub(crate) fn resolve_active_destination(&self) -> Result<Option<PathBuf>, SyncError> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(SyncError::Cancelled);
+        }
+        self.driver.resolve_active_destination(self.dest_dir)
+    }
+
+    /// Stage 2: Scan source directory for files, supporting cancellation.
+    pub(crate) fn collect_source_files(&self) -> Result<(HashSet<PathBuf>, bool), SyncError> {
+        self.driver.scan_source_files(self.cancel)
+    }
+
     /// Stage 3: Load existing database records and construct normalized lookup map.
     pub(crate) fn load_cached_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
-        self.engine.db().list_all_records()
+        self.driver.load_cached_records()
     }
 
     /// Build normalized lookup mapping relative paths to database records.
@@ -154,16 +253,16 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
         cached_lookup: &HashMap<NormalizedCaseFoldedPath<'_>, &FileRecord>,
     ) -> Result<SyncStats, SyncError> {
         let mut stats = SyncStats::default();
-        let mut scratch = vec![0u8; self.engine.config().block_size_bytes() as usize];
+        let mut scratch = vec![0u8; self.driver.block_size_bytes() as usize];
         let mut batch: Vec<(FileRecord, Vec<crate::db::BlockHash>)> = Vec::with_capacity(500);
 
         for rel_path in source_files {
             if self.cancel.load(Ordering::Relaxed) {
-                self.engine.flush_record_batch(&mut batch)?;
+                self.driver.flush_record_batch(&mut batch)?;
                 return Err(SyncError::Cancelled);
             }
 
-            match self.engine.sync_file_to_dest_core(
+            match self.driver.sync_file_core(
                 rel_path,
                 active_dest,
                 &mut scratch,
@@ -175,7 +274,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
                     stats.synced += 1;
                     batch.push((record, hashes));
                     if batch.len() >= 500 {
-                        self.engine.flush_record_batch(&mut batch)?;
+                        self.driver.flush_record_batch(&mut batch)?;
                     }
                 }
                 Ok(None) => {
@@ -215,7 +314,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
             }
         }
 
-        self.engine.flush_record_batch(&mut batch)?;
+        self.driver.flush_record_batch(&mut batch)?;
 
         if stats.skipped > 0 {
             tracing::warn!(
@@ -237,7 +336,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
         cached_records: &HashMap<PathBuf, FileRecord>,
         scan_complete: bool,
     ) -> Result<usize, SyncError> {
-        if !self.engine.config().propagate_deletions() {
+        if !self.driver.propagate_deletions() {
             return Ok(0);
         }
 
@@ -278,7 +377,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
 
             if !is_present {
                 if let Err(e) = self
-                    .engine
+                    .driver
                     .archive_dest_file_only(tracked_path, active_dest)
                 {
                     let os_code = match &e {
@@ -311,7 +410,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
         }
 
         if !missing_to_delete.is_empty() {
-            self.engine.db().delete_files_batch(&missing_to_delete)?;
+            self.driver.delete_files_batch(&missing_to_delete)?;
         }
 
         if delete_skip_count > 0 {
@@ -327,7 +426,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
 
     /// Stage 6: Prune old destination archive versions.
     pub(crate) fn prune_archive(&self, active_dest: &Path) {
-        if let Err(e) = self.engine.prune_destination_archive(active_dest) {
+        if let Err(e) = self.driver.prune_destination_archive(active_dest) {
             tracing::warn!(
                 target = %active_dest.display(),
                 error = %e,
@@ -355,7 +454,7 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
 
         if source_files.is_empty()
             && !cached_records.is_empty()
-            && self.engine.config().propagate_deletions()
+            && self.driver.propagate_deletions()
         {
             tracing::warn!(
                 tracked_count = cached_records.len(),
@@ -365,8 +464,11 @@ impl<'a, S: HashStore> FullScanCoordinator<'a, S> {
             return Ok(ScanOutcome::Success { synced: 0 });
         }
 
-        let delete_skip_count =
-            self.reconcile_deletions(&active_dest, &source_files, &cached_records, scan_complete)?;
+        let delete_skip_count = if scan_complete {
+            self.reconcile_deletions(&active_dest, &source_files, &cached_records, scan_complete)?
+        } else {
+            0
+        };
 
         self.prune_archive(&active_dest);
 
@@ -548,10 +650,48 @@ mod tests {
         let hit3 = lookup.get(&NormalizedCaseFoldedPath(Path::new("DOCS/ARCHITECTURE.MD")));
         assert!(hit3.is_some());
 
-        assert!(
-            !lookup.contains_key(&NormalizedCaseFoldedPath(Path::new(
-                "docs/specification.md"
-            )))
+        assert!(!lookup.contains_key(&NormalizedCaseFoldedPath(Path::new(
+            "docs/specification.md"
+        ))));
+    }
+
+    #[test]
+    fn test_full_scan_driver_cancellation_guards_deletions() {
+        use crate::sync::mock::MockFullScanDriver;
+        let dst = Path::new("dst");
+        let cancel = AtomicBool::new(false);
+        let driver = MockFullScanDriver::new()
+            .with_source_files(vec![PathBuf::from("file1.txt")])
+            .with_scan_complete(false)
+            .with_propagate_deletions(true)
+            .with_cached_records(vec![
+                (PathBuf::from("file1.txt"), 10, 100),
+                (PathBuf::from("file2.txt"), 20, 200),
+            ]);
+        let coordinator = FullScanCoordinator::new(&driver, dst, &cancel);
+        let outcome = coordinator.run().unwrap();
+        assert_eq!(outcome, ScanOutcome::Success { synced: 1 });
+        // Since scan_complete was false, file2.txt MUST NOT have been deleted
+        assert_eq!(driver.deleted_files().len(), 0);
+        assert_eq!(driver.synced_files().len(), 1);
+
+        // Now test when scan_complete is true
+        let driver_complete = MockFullScanDriver::new()
+            .with_source_files(vec![PathBuf::from("file1.txt")])
+            .with_scan_complete(true)
+            .with_propagate_deletions(true)
+            .with_cached_records(vec![
+                (PathBuf::from("file1.txt"), 10, 100),
+                (PathBuf::from("file2.txt"), 20, 200),
+            ]);
+        let coordinator_complete = FullScanCoordinator::new(&driver_complete, dst, &cancel);
+        let outcome_complete = coordinator_complete.run().unwrap();
+        assert_eq!(outcome_complete, ScanOutcome::Success { synced: 1 });
+        // Since scan_complete was true, file2.txt MUST have been deleted
+        assert_eq!(driver_complete.deleted_files().len(), 1);
+        assert_eq!(
+            driver_complete.deleted_files()[0],
+            PathBuf::from("file2.txt")
         );
     }
 }

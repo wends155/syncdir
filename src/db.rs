@@ -176,7 +176,7 @@ pub trait HashStore: Send + Sync {
     fn delete_file(&self, path: &Path) -> Result<(), SyncError>;
 
     /// List relative paths of all currently tracked files in the database.
-    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError>;
+    fn list_files(&self) -> Result<Vec<RelativePath>, SyncError>;
 
     /// Bulk retrieve all stored file metadata records mapped by relative path.
     fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError>;
@@ -222,7 +222,7 @@ impl<S: HashStore + ?Sized> HashStore for std::sync::Arc<S> {
         (**self).delete_file(path)
     }
 
-    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+    fn list_files(&self) -> Result<Vec<RelativePath>, SyncError> {
         (**self).list_files()
     }
 
@@ -256,7 +256,7 @@ impl<S: HashStore + ?Sized> HashStore for &S {
         (**self).delete_file(path)
     }
 
-    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+    fn list_files(&self) -> Result<Vec<RelativePath>, SyncError> {
         (**self).list_files()
     }
 
@@ -595,7 +595,7 @@ impl HashStore for SqliteHashStore {
         Ok(())
     }
 
-    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+    fn list_files(&self) -> Result<Vec<RelativePath>, SyncError> {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare_cached("SELECT relative_path FROM file_metadata ORDER BY relative_path ASC")?;
@@ -603,7 +603,7 @@ impl HashStore for SqliteHashStore {
         let mut paths = Vec::new();
         while let Some(row) = rows.next()? {
             let key: String = row.get(0)?;
-            paths.push(PathBuf::from(key));
+            paths.push(RelativePath::try_new(key)?);
         }
         Ok(paths)
     }
@@ -788,7 +788,7 @@ impl HashStore for MockHashStore {
         Ok(())
     }
 
-    fn list_files(&self) -> Result<Vec<PathBuf>, SyncError> {
+    fn list_files(&self) -> Result<Vec<RelativePath>, SyncError> {
         let inner = self
             .inner
             .read()
@@ -798,7 +798,11 @@ impl HashStore for MockHashStore {
         }
         let mut keys: Vec<String> = inner.records.keys().cloned().collect();
         keys.sort();
-        Ok(keys.into_iter().map(PathBuf::from).collect())
+        let mut paths = Vec::with_capacity(keys.len());
+        for k in keys {
+            paths.push(RelativePath::try_new(k)?);
+        }
+        Ok(paths)
     }
 
     fn list_all_records(&self) -> Result<HashMap<PathBuf, FileRecord>, SyncError> {
@@ -1035,13 +1039,16 @@ mod tests {
         let files = store.list_files().unwrap();
         assert_eq!(
             files,
-            vec![PathBuf::from("a_first.txt"), PathBuf::from("b_second.txt")]
+            vec![
+                RelativePath::try_new("a_first.txt").unwrap(),
+                RelativePath::try_new("b_second.txt").unwrap(),
+            ]
         );
 
         // After delete, removed file is gone
         store.delete_file(Path::new("a_first.txt")).unwrap();
         let files = store.list_files().unwrap();
-        assert_eq!(files, vec![PathBuf::from("b_second.txt")]);
+        assert_eq!(files, vec![RelativePath::try_new("b_second.txt").unwrap()]);
     }
 
     #[test]
@@ -1067,7 +1074,7 @@ mod tests {
 
         assert_eq!(
             store.list_files().unwrap(),
-            vec![PathBuf::from("docs/readme.txt")]
+            vec![RelativePath::try_new("docs/readme.txt").unwrap()]
         );
 
         store.delete_file(Path::new("docs/readme.txt")).unwrap();
@@ -1540,5 +1547,19 @@ mod tests {
             .get_block_hashes(Path::new("nonexistent.dat"))
             .unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_hash_store_list_files_returns_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = SqliteHashStore::new(&db_path, StoreConfig::new(1024, 4096).unwrap()).unwrap();
+        let rel = RelativePath::try_new("sub/file.txt").unwrap();
+        let record = FileRecord::new(rel.clone(), 100, 1000);
+        store.save_file(&record, &[]).unwrap();
+
+        let files: Vec<RelativePath> = store.list_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], rel);
     }
 }

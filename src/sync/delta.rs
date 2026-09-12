@@ -618,8 +618,9 @@ mod tests {
         let src_mod = safe_modified_millis(&std::fs::metadata(&src_file_path).unwrap()).unwrap();
 
         let mut scratch = vec![0u8; 512];
+        let rel = RelativePath::try_new(file_name).unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new(file_name),
+            rel_path: &rel,
             src_path: &src_file_path,
             dest_path: &dst.join(file_name),
             dest_dir: &dst,
@@ -660,8 +661,9 @@ mod tests {
         let engine = LocalSyncEngine::new(store, target_cfg);
 
         let mut scratch = vec![0u8; 256];
+        let rel = RelativePath::try_new(file_name).unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new(file_name),
+            rel_path: &rel,
             src_path: &src_file_path,
             dest_path: &dst.join(file_name),
             dest_dir: &dst,
@@ -697,8 +699,9 @@ mod tests {
         std::fs::write(&src_file, vec![0xAA; 1024]).unwrap();
 
         let mut scratch = vec![0u8; 512];
+        let rel = RelativePath::try_new("large.bin").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("large.bin"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
@@ -753,8 +756,9 @@ mod tests {
         std::fs::write(&dst_file, vec![0xEE; 1024]).unwrap();
 
         let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
+        let rel = RelativePath::try_new("large.bin").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("large.bin"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
@@ -793,8 +797,9 @@ mod tests {
 
         let mut scratch = vec![0u8; 512];
         let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
+        let rel = RelativePath::try_new("large.bin").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("large.bin"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
@@ -869,8 +874,9 @@ mod tests {
         fs::write(&src_file, &payload).unwrap();
 
         let meta = fs::metadata(&src_file).unwrap();
+        let rel = RelativePath::try_new("large.bin").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("large.bin"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dest,
@@ -947,8 +953,9 @@ mod tests {
             create_test_junction(&link_target, &dst_file).unwrap();
 
             let meta = fs::metadata(&src_file).unwrap();
+            let rel = RelativePath::try_new("target.bin").unwrap();
             let task = FileSyncTask {
-                rel_path: Path::new("target.bin"),
+                rel_path: &rel,
                 src_path: &src_file,
                 dest_path: &dst_file,
                 dest_dir: &dest,

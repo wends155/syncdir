@@ -1185,3 +1185,20 @@ fn test_target_sync_config_source_dir_target_dir() {
         std::path::Path::new("C:\\Users\\Data")
     );
 }
+
+#[test]
+fn test_target_dir_serde_proxy_validation() {
+    use crate::config::target::TargetDir;
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    struct Cfg {
+        target: TargetDir,
+    }
+    let valid_toml = r#"target = "C:\\valid\\path""#;
+    let cfg: Result<Cfg, _> = toml::from_str(valid_toml);
+    assert!(cfg.is_ok());
+
+    let empty_toml = r#"target = """#;
+    let cfg_err: Result<Cfg, _> = toml::from_str(empty_toml);
+    assert!(cfg_err.is_err());
+}

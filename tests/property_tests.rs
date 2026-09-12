@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use syncdir::config::Config;
 use syncdir::db::{SqliteHashStore, StoreConfig};
-use syncdir::sync::{LocalSyncEngine, SyncEngine};
+use syncdir::sync::LocalSyncEngine;
 use tempfile::{NamedTempFile, tempdir};
 
 proptest! {

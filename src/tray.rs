@@ -294,7 +294,7 @@ impl TrayState {
 /// Display a native Windows About modal dialog box containing version, description, copyright, and URL.
 #[cfg(target_os = "windows")]
 fn show_about_dialog() {
-    let _ = std::thread::Builder::new()
+    let res = std::thread::Builder::new()
         .name("about-dialog".to_string())
         .spawn(|| {
             use std::os::windows::ffi::OsStrExt;
@@ -327,6 +327,9 @@ fn show_about_dialog() {
                 ); // MB_OK | MB_ICONINFORMATION
             }
         });
+    if let Err(e) = res {
+        tracing::error!(error = %e, "Failed to spawn thread for about dialog");
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -337,7 +340,7 @@ fn show_about_dialog() {}
 fn show_error_dialog(title_str: &str, msg_str: &str) {
     let title_owned = title_str.to_string();
     let msg_owned = msg_str.to_string();
-    let _ = std::thread::Builder::new()
+    let res = std::thread::Builder::new()
         .name("error-dialog".to_string())
         .spawn(move || {
             use std::os::windows::ffi::OsStrExt;
@@ -365,6 +368,14 @@ fn show_error_dialog(title_str: &str, msg_str: &str) {
                 ); // MB_OK | MB_ICONERROR
             }
         });
+    if let Err(e) = res {
+        tracing::error!(
+            error = %e,
+            title = %title_str,
+            msg = %msg_str,
+            "Failed to spawn thread for error dialog"
+        );
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -888,6 +899,21 @@ fn system_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
 }
 
+/// Format command line arguments for launching the system file explorer.
+///
+/// For directories, returns the path as-is to navigate into the directory.
+/// For files, formats as a single `/select,<path>` argument to highlight
+/// and select the file in Explorer rather than executing it or opening default folders.
+pub fn format_explorer_args(path: &Path, is_dir: bool) -> Vec<std::ffi::OsString> {
+    if is_dir {
+        vec![path.as_os_str().to_os_string()]
+    } else {
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path.as_os_str());
+        vec![arg]
+    }
+}
+
 /// Launches the system file explorer targeting the specified path.
 ///
 /// Returns `Err(std::io::Error)` with `ErrorKind::NotFound` if the path does not exist
@@ -908,7 +934,8 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
                 format!("Explorer executable not found at {}", explorer.display()),
             ));
         }
-        std::process::Command::new(explorer).arg(path).spawn()?;
+        let args = format_explorer_args(path, path.is_dir());
+        std::process::Command::new(explorer).args(args).spawn()?;
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1126,5 +1153,28 @@ mod tests {
         let degraded_status = EngineStatus::Degraded;
         let should_repaint_transition = last_icon_status != Some(degraded_status);
         assert!(should_repaint_transition);
+    }
+
+    #[test]
+    fn test_format_explorer_args_file_and_dir() {
+        use std::ffi::OsString;
+        let dir_path = Path::new("C:\\Users\\test\\folder");
+        let args_dir = format_explorer_args(dir_path, true);
+        assert_eq!(args_dir.len(), 1);
+        assert_eq!(args_dir[0], OsString::from("C:\\Users\\test\\folder"));
+
+        let file_path = Path::new("C:\\Users\\test\\folder\\file.txt");
+        let args_file = format_explorer_args(file_path, false);
+        assert_eq!(args_file.len(), 1);
+        assert_eq!(
+            args_file[0],
+            OsString::from("/select,C:\\Users\\test\\folder\\file.txt")
+        );
+    }
+
+    #[test]
+    fn test_show_about_dialog_does_not_panic() {
+        // Calling show_about_dialog must not panic under test environment
+        show_about_dialog();
     }
 }

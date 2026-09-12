@@ -131,27 +131,12 @@ pub trait SyncStatusObserver: Send + Sync + 'static {
 /// let engine = MockSyncEngine::new();
 /// let _ = engine.sync_file(Path::new("document.txt"));
 /// ```
-pub trait SyncEngine: Send + Sync {
+/// Role trait for synchronizing files.
+pub trait FileSynchronizer: Send + Sync {
     /// Synchronize a single file from source to the default configured destination.
-    ///
-    /// Delegates internally to destination-targeted buffered synchronization using an ephemeral scratch buffer.
-    ///
-    /// # Errors
-    ///
-    /// * `SyncError::Io` on filesystem read, write, or metadata retrieval errors.
-    /// * `SyncError::Db` on signature database cache query or persistence failures.
-    /// * `SyncError::WriteVerificationFailed` if post-write validation fails against source Blake3 block hashes.
-    /// * `SyncError::Validation` if source or destination paths fail path safety constraints (e.g., reparse points).
     fn sync_file(&self, path: &Path) -> Result<(), SyncError>;
 
     /// Synchronize a single file to a specific destination directory with a caller-provided scratch buffer.
-    ///
-    /// Allows the background worker to reuse a pre-allocated scratch buffer across thousands of sequential
-    /// file transfers to avoid memory fragmentation and allocation spikes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SyncError` if reading source, streaming delta, verifying writes, or saving metadata fails.
     fn sync_file_to_dest_buffered(
         &self,
         path: &Path,
@@ -159,10 +144,7 @@ pub trait SyncEngine: Send + Sync {
         scratch: &mut [u8],
     ) -> Result<(), SyncError>;
 
-    /// Synchronize a single file to a destination directory, staging its database metadata update
-    /// in an in-memory queue instead of committing immediately to SQLite.
-    ///
-    /// The default trait implementation falls back to `sync_file_to_dest_buffered`, committing immediately.
+    /// Synchronize a single file to a destination directory, staging its database metadata update.
     fn sync_file_to_dest_staged(
         &self,
         path: &Path,
@@ -171,76 +153,71 @@ pub trait SyncEngine: Send + Sync {
     ) -> Result<(), SyncError> {
         self.sync_file_to_dest_buffered(path, dest_dir, scratch)
     }
+}
 
-    /// Flush all staged file records and hash metadata updates to the database in a single transaction.
-    ///
-    /// The default trait implementation is a no-op returning `Ok(())`.
-    fn flush_staged_syncs(&self) -> Result<(), SyncError> {
-        Ok(())
-    }
-
+/// Role trait for file deletions and destination cleanup.
+pub trait FileDeleter: Send + Sync {
     /// Handle deletion of a file by archiving it on the default configured destination.
-    ///
-    /// Moves the deleted destination file into `.syncdir_archive` with a timestamped collision-resistant
-    /// name, then removes the file record from the database.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SyncError` if moving the deleted file to the archive or updating the database fails.
     fn delete_file(&self, path: &Path) -> Result<(), SyncError>;
 
     /// Handle deletion of a file on a specific destination directory.
-    ///
-    /// Moves the file to the destination's `.syncdir_archive` directory and updates or evicts database records
-    /// according to deletion propagation policies.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SyncError` if archiving fails or database records cannot be updated.
     fn delete_file_from_dest(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError>;
+}
 
-    /// Prune old and excess files in the destination's archive directory.
-    ///
-    /// Enforces age retention and maximum archive size quotas.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SyncError` if walking or deleting old archive files fails.
-    fn prune_archive(&self, _dest_dir: &Path) -> Result<(), SyncError> {
+/// Role trait for flushing staged file metadata and hash records.
+pub trait BatchFlusher: Send + Sync {
+    /// Flush all staged file records and hash metadata updates to the database in a single transaction.
+    fn flush_staged_syncs(&self) -> Result<(), SyncError> {
         Ok(())
     }
+}
 
-    /// Run a full scan and synchronization cycle on `dest_dir` that can be cancelled via an atomic token.
-    ///
-    /// Scans the entire source tree, compares with destination filesystem and cache state, transfers
-    /// outdated or missing files, archives orphaned destination files, and records progress.
-    ///
-    /// # Errors
-    ///
-    /// * Returns `SyncError::Cancelled` if the cancellation token is signaled during directory traversal or file sync.
-    /// * Returns `SyncError` on directory scanning or synchronization failures.
+/// Role trait for full directory scanning and synchronization.
+pub trait ScanEngine: Send + Sync {
+    /// Run a full scan on `dest_dir` that can be cancelled via an atomic token.
     fn run_cancellable_full_scan(
         &self,
         dest_dir: &Path,
-        _cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ScanOutcome, SyncError> {
-        let _ = dest_dir;
-        Ok(ScanOutcome::Success { synced: 0 })
-    }
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ScanOutcome, SyncError>;
 
-    /// Perform a full directory scan on `dest_dir` and sync all changed files without cancellation.
-    ///
-    /// Convenience wrapper around [`SyncEngine::run_cancellable_full_scan`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `SyncError` on directory traversal or synchronization failure.
+    /// Perform a full directory scan on `dest_dir` without cancellation.
     fn run_full_scan(&self, dest_dir: &Path) -> Result<ScanOutcome, SyncError> {
         static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         self.run_cancellable_full_scan(dest_dir, &NEVER_CANCELLED)
     }
+}
 
+/// Role trait for destination archive pruning and lifecycle maintenance.
+pub trait ArchiveEngine: Send + Sync {
+    /// Prune old and excess files in the destination's archive directory.
+    fn prune_archive(&self, _dest_dir: &Path) -> Result<(), SyncError> {
+        Ok(())
+    }
+}
+
+/// Core sync execution contract composing the segregated role traits.
+///
+/// `SyncEngine` serves as the composite behavioral abstraction decoupling sync workers
+/// and daemon orchestration from low-level filesystem I/O, hash database caching, and delta transfers.
+///
+/// Production implementations (like [`LocalSyncEngine`]) coordinate atomic small-file copies,
+/// block-level delta transfers, path traversal safety checks, and destination archiving. Test
+/// suites utilize [`MockSyncEngine`](crate::sync::MockSyncEngine) to verify worker state machines without live disk access.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use syncdir::sync::{MockSyncEngine, SyncEngine};
+/// use std::path::Path;
+///
+/// let engine = MockSyncEngine::new();
+/// let _ = engine.sync_file(Path::new("document.txt"));
+/// ```
+pub trait SyncEngine:
+    FileSynchronizer + FileDeleter + BatchFlusher + ScanEngine + ArchiveEngine
+{
     /// Invalidate any cached directory metadata (e.g. reparse point and ancestor junction checks).
     ///
     /// Clears internal directory verification caches to ensure subsequent operations re-inspect
@@ -386,8 +363,7 @@ pub struct LocalSyncEngine<S: HashStore> {
 
 impl<S: HashStore> LocalSyncEngine<S> {
     /// Create a new sync engine with the given database and config.
-    pub fn new(db: S, config: impl Into<TargetSyncConfig>) -> Self {
-        let config = config.into();
+    pub fn new(db: S, config: TargetSyncConfig) -> Self {
         let db = std::sync::Arc::new(db);
         let reparse_cache =
             std::sync::Arc::new(crate::sync::path_safety::ReparseCache::new(50_000, 10_000));
@@ -483,7 +459,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
     }
 
     /// Perform a full directory scan on default or pre-resolved destination.
-    pub fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+    pub fn run_configured_full_scan(&self) -> Result<ScanOutcome, SyncError> {
         static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         let dest = self
@@ -493,10 +469,43 @@ impl<S: HashStore> LocalSyncEngine<S> {
         self.run_cancellable_full_scan_impl(dest, &NEVER_CANCELLED)
     }
 
+    /// Deprecated: use [`run_configured_full_scan`] instead.
+    #[deprecated(note = "use run_configured_full_scan instead")]
+    pub fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
+        self.run_configured_full_scan()
+    }
+
     /// Synchronize a file or directory tree to a specific destination directory (primary or alternate).
     pub fn sync_file_to_dest(&self, rel_path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
         let mut scratch = vec![0u8; self.config.block_size_bytes() as usize];
         self.sync_file_to_dest_buffered(rel_path, dest_dir, &mut scratch)
+    }
+
+    /// Synchronize a single file from source to the default configured destination.
+    pub fn sync_file(&self, path: &Path) -> Result<(), SyncError> {
+        let dest = self
+            .resolved_dest
+            .as_deref()
+            .unwrap_or_else(|| self.config.dest_dir());
+        self.sync_file_to_dest(path, dest)
+    }
+
+    /// Handle deletion of a file by archiving it on the default configured destination.
+    pub fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
+        let dest = self
+            .resolved_dest
+            .as_deref()
+            .unwrap_or_else(|| self.config.dest_dir());
+        self.delete_file_from_dest(path, dest)
+    }
+
+    /// Run a full scan and synchronization cycle on `dest_dir` that can be cancelled via an atomic token.
+    pub fn run_cancellable_full_scan(
+        &self,
+        dest_dir: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ScanOutcome, SyncError> {
+        self.run_cancellable_full_scan_impl(dest_dir, cancel)
     }
 
     pub(crate) fn sync_file_core(
@@ -530,12 +539,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         scratch: &mut [u8],
         file_record: Option<&FileRecord>,
     ) -> Result<Option<(FileRecord, Vec<crate::db::BlockHash>)>, SyncError> {
-        if !is_safe_relative_path(rel_path) {
-            return Err(SyncError::validation_security(format!(
-                "Unsafe path traversal detected: {:?}",
-                rel_path
-            )));
-        }
+        let safe_rel = RelativePath::try_new(rel_path)?;
 
         let _span = tracing::info_span!(
             "sync_file",
@@ -590,12 +594,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
                     && record.file_size() == src_size as u64
                     && record.last_modified() == src_mod
                 {
-                    if let Ok(safe_rel) = crate::path_util::RelativePath::new(rel_path)
-                        && record.relative_path() != &safe_rel
-                    {
+                    if record.relative_path() != &safe_rel {
                         let hashes = self.db.get_block_hashes(rel_path)?;
-                        let updated_rec =
-                            FileRecord::from_raw(rel_path, src_size as u64, src_mod)?;
+                        let updated_rec = FileRecord::from_raw(rel_path, src_size as u64, src_mod)?;
                         self.db.save_file(&updated_rec, &hashes)?;
                     }
                     tracing::debug!(path = %rel_path.display(), "Local signature cache hit and destination matches, skipping sync");
@@ -613,7 +614,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
 
         let cached_id = file_record.and_then(|r| r.id());
         let task = FileSyncTask {
-            rel_path,
+            rel_path: &safe_rel,
             src_path: &src_path,
             dest_path: &dest_path,
             dest_dir,
@@ -870,13 +871,9 @@ pub(crate) fn calculate_remaining_files(total: usize, synced: usize, failed: usi
     total.saturating_sub(synced.saturating_add(failed))
 }
 
-impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
+impl<S: HashStore> FileSynchronizer for LocalSyncEngine<S> {
     fn sync_file(&self, path: &Path) -> Result<(), SyncError> {
-        let dest = self
-            .resolved_dest
-            .as_deref()
-            .unwrap_or_else(|| self.config.dest_dir());
-        self.sync_file_to_dest(path, dest)
+        self.sync_file(path)
     }
 
     fn sync_file_to_dest_buffered(
@@ -896,27 +893,25 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     ) -> Result<(), SyncError> {
         self.sync_file_to_dest_staged(path, dest_dir, scratch)
     }
+}
 
-    fn flush_staged_syncs(&self) -> Result<(), SyncError> {
-        self.flush_staged_syncs()
-    }
-
+impl<S: HashStore> FileDeleter for LocalSyncEngine<S> {
     fn delete_file(&self, path: &Path) -> Result<(), SyncError> {
-        let dest = self
-            .resolved_dest
-            .as_deref()
-            .unwrap_or_else(|| self.config.dest_dir());
-        self.delete_file_from_dest(path, dest)
+        self.delete_file(path)
     }
 
     fn delete_file_from_dest(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError> {
         self.delete_file_from_dest(path, dest_dir)
     }
+}
 
-    fn prune_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
-        self.prune_destination_archive(dest_dir)
+impl<S: HashStore> BatchFlusher for LocalSyncEngine<S> {
+    fn flush_staged_syncs(&self) -> Result<(), SyncError> {
+        self.flush_staged_syncs()
     }
+}
 
+impl<S: HashStore> ScanEngine for LocalSyncEngine<S> {
     fn run_cancellable_full_scan(
         &self,
         dest_dir: &Path,
@@ -925,6 +920,20 @@ impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
         self.run_cancellable_full_scan_impl(dest_dir, cancel)
     }
 
+    fn run_full_scan(&self, dest_dir: &Path) -> Result<ScanOutcome, SyncError> {
+        static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        self.run_cancellable_full_scan(dest_dir, &NEVER_CANCELLED)
+    }
+}
+
+impl<S: HashStore> ArchiveEngine for LocalSyncEngine<S> {
+    fn prune_archive(&self, dest_dir: &Path) -> Result<(), SyncError> {
+        self.prune_destination_archive(dest_dir)
+    }
+}
+
+impl<S: HashStore> SyncEngine for LocalSyncEngine<S> {
     fn invalidate_verified_dirs(&self) {
         self.invalidate_verified_dirs();
     }
@@ -1164,8 +1173,9 @@ mod tests {
         let src_file = src.join("file.bin");
         let dst_file = dst.join("file.bin");
         let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
+        let rel = RelativePath::try_new("file.bin").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("file.bin"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
@@ -1221,7 +1231,7 @@ mod tests {
             LocalSyncEngine::new(MockHashStore::new(), target_cfg).with_resolved_dest(&alt_dst);
         assert_eq!(engine.resolved_dest(), Some(alt_dst.as_path()));
 
-        let outcome = engine.run_full_scan().unwrap();
+        let outcome = engine.run_configured_full_scan().unwrap();
         assert!(matches!(outcome, ScanOutcome::Success { synced: 1 }));
         assert!(alt_dst.join("hello.txt").exists());
     }
@@ -1436,7 +1446,7 @@ mod tests {
         assert!(dst.join(".syncdir_archive").exists());
 
         // Full scan verification
-        let scan_res = engine.run_full_scan().unwrap();
+        let scan_res = engine.run_configured_full_scan().unwrap();
         assert!(matches!(scan_res, ScanOutcome::Success { .. }));
     }
 
@@ -1585,8 +1595,9 @@ mod tests {
         std::fs::write(&src_file, vec![0x42; 500]).unwrap();
 
         let src_mod = safe_modified_millis(&std::fs::metadata(&src_file).unwrap()).unwrap();
+        let rel = RelativePath::try_new("small.txt").unwrap();
         let task = FileSyncTask {
-            rel_path: Path::new("small.txt"),
+            rel_path: &rel,
             src_path: &src_file,
             dest_path: &dst_file,
             dest_dir: &dst,
@@ -1707,8 +1718,9 @@ mod tests {
         let f1 = "file1.bin";
         std::fs::write(src.join(f1), vec![0x11; 1024]).unwrap();
         let src_meta1 = std::fs::metadata(src.join(f1)).unwrap();
+        let rel1 = RelativePath::try_new(f1).unwrap();
         let task1 = FileSyncTask {
-            rel_path: Path::new(f1),
+            rel_path: &rel1,
             src_path: &src.join(f1),
             dest_path: &dst.join(f1),
             dest_dir: &dst,
@@ -1729,8 +1741,9 @@ mod tests {
         let f2 = "file2.bin";
         std::fs::write(src.join(f2), vec![0x22; 1024]).unwrap();
         let src_meta2 = std::fs::metadata(src.join(f2)).unwrap();
+        let rel2 = RelativePath::try_new(f2).unwrap();
         let task2 = FileSyncTask {
-            rel_path: Path::new(f2),
+            rel_path: &rel2,
             src_path: &src.join(f2),
             dest_path: &dst.join(f2),
             dest_dir: &dst,
@@ -1949,7 +1962,7 @@ mod tests {
         let engine = LocalSyncEngine::new(store, target_cfg);
 
         assert!(matches!(
-            engine.run_full_scan().unwrap(),
+            engine.run_configured_full_scan().unwrap(),
             ScanOutcome::PartialFailure {
                 synced: 1,
                 failed: 1,
@@ -1984,7 +1997,7 @@ mod tests {
         let engine = LocalSyncEngine::new(store, target_cfg);
 
         assert_eq!(
-            engine.run_full_scan().unwrap(),
+            engine.run_configured_full_scan().unwrap(),
             ScanOutcome::DestinationUnreachable
         );
     }
@@ -2003,7 +2016,7 @@ mod tests {
         let engine = LocalSyncEngine::new(store, target_cfg);
 
         assert_eq!(
-            engine.run_full_scan().unwrap(),
+            engine.run_configured_full_scan().unwrap(),
             ScanOutcome::DestinationUnreachable
         );
     }
@@ -2072,11 +2085,11 @@ mod tests {
         let engine = LocalSyncEngine::new(store, target_cfg);
 
         fs::write(source.join("important.txt"), b"save me").unwrap();
-        engine.run_full_scan().unwrap();
+        engine.run_configured_full_scan().unwrap();
         assert!(dest.join("important.txt").exists());
 
         fs::remove_file(source.join("important.txt")).unwrap();
-        engine.run_full_scan().unwrap();
+        engine.run_configured_full_scan().unwrap();
 
         assert!(dest.join("important.txt").exists());
     }
@@ -2098,7 +2111,7 @@ mod tests {
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(store.clone(), target_cfg);
 
-        let outcome = engine.run_full_scan().unwrap();
+        let outcome = engine.run_configured_full_scan().unwrap();
         assert!(matches!(outcome, ScanOutcome::Success { synced: 5 }));
 
         assert_eq!(
@@ -2137,7 +2150,7 @@ mod tests {
         let target_cfg = TargetSyncConfig::from_config(&config, dst.clone()).unwrap();
         let engine = LocalSyncEngine::new(db, target_cfg);
 
-        let outcome = engine.run_full_scan().unwrap();
+        let outcome = engine.run_configured_full_scan().unwrap();
         assert_eq!(outcome, ScanOutcome::Success { synced: 1 });
         assert!(!dst.join(".syncdir_archive").exists());
     }
@@ -2166,7 +2179,7 @@ mod tests {
 
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(store, target_cfg);
-        let outcome = engine.run_full_scan().unwrap();
+        let outcome = engine.run_configured_full_scan().unwrap();
         assert_eq!(outcome, ScanOutcome::Success { synced: 1 });
         assert!(dst.join("nested").join("file.txt").exists());
     }
@@ -2189,7 +2202,7 @@ mod tests {
         })));
         let target_cfg = TargetSyncConfig::try_from_config(&config).unwrap();
         let engine = LocalSyncEngine::new(store, target_cfg);
-        let result = engine.run_full_scan();
+        let result = engine.run_configured_full_scan();
         assert!(matches!(result, Err(SyncError::Db(..))));
     }
 
@@ -2467,5 +2480,35 @@ mod tests {
                 "Old lowercase 'test.txt' directory entry must not linger on destination filesystem"
             );
         }
+    }
+
+    #[test]
+    fn test_segregated_role_traits_and_reparse_cache_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let cfg = TargetSyncConfig::new(
+            crate::config::TargetDir::from_validated(src),
+            crate::config::TargetDir::from_validated(dst),
+        )
+        .unwrap();
+        let store_cfg =
+            crate::db::StoreConfig::new(cfg.block_size_bytes(), cfg.block_sync_threshold_bytes())
+                .unwrap();
+        let db = std::sync::Arc::new(
+            SqliteHashStore::new(&dir.path().join("db.sqlite"), store_cfg).unwrap(),
+        );
+        let engine = LocalSyncEngine::new(db, cfg);
+
+        let _: &dyn FileSynchronizer = &engine;
+        let _: &dyn FileDeleter = &engine;
+        let _: &dyn BatchFlusher = &engine;
+        let _: &dyn ScanEngine = &engine;
+        let _: &dyn ArchiveEngine = &engine;
+        let _: &dyn SyncEngine = &engine;
+        assert_eq!(engine.reparse_cache().len(), 0);
     }
 }

@@ -436,6 +436,7 @@ impl<F: SyncEngineFactory> SyncDaemonBuilder<F> {
     }
 
     /// Start the sync daemon with configured services.
+    #[allow(deprecated)]
     pub fn start(self) -> Result<SyncDaemon, SyncError> {
         SyncDaemon::start_with_all_services(
             self.factory,
@@ -533,6 +534,7 @@ impl SyncDaemon {
     }
 
     /// Starts all sync workers using custom engine factory, resolver, and watcher factory.
+    #[deprecated(since = "0.2.0", note = "use SyncDaemon::builder instead")]
     #[must_use = "dropping SyncDaemon immediately terminates all background sync workers"]
     pub fn start_with_all_services<F: SyncEngineFactory>(
         factory: F,
@@ -688,6 +690,20 @@ mod tests {
 
         let config = Config::builder(src).dest_dir(dst).build().unwrap();
         let daemon = SyncDaemon::start(config, dir.path(), None).unwrap();
+        assert_eq!(daemon.worker_handles.len(), 1);
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn test_sync_daemon_builder_construction() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dst = dir.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let config = Config::builder(src).dest_dir(dst).build().unwrap();
+        let daemon = SyncDaemon::builder(config, dir.path()).start().unwrap();
         assert_eq!(daemon.worker_handles.len(), 1);
         daemon.shutdown();
     }

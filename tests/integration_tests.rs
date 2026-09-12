@@ -155,7 +155,7 @@ fn test_tray_module_compiles() {
 
 #[test]
 fn test_propagate_deletions_false() {
-    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+    use syncdir::sync::LocalSyncEngine;
 
     let dir = tempdir().unwrap();
     let source = dir.path().join("source");
@@ -255,7 +255,7 @@ fn test_watcher_rename_event() {
 
 #[test]
 fn test_path_traversal_prevention() {
-    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+    use syncdir::sync::LocalSyncEngine;
     let dir = tempdir().unwrap();
     let source = dir.path().join("source");
     let dest = dir.path().join("dest");
@@ -293,7 +293,7 @@ fn test_path_traversal_prevention() {
 
 #[test]
 fn test_subsecond_sync_precision() {
-    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+    use syncdir::sync::LocalSyncEngine;
     let dir = tempdir().unwrap();
     let source = dir.path().join("source");
     let dest = dir.path().join("dest");
@@ -333,7 +333,7 @@ fn test_subsecond_sync_precision() {
 
 #[test]
 fn test_directory_rename_syncs_child_files() {
-    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+    use syncdir::sync::LocalSyncEngine;
 
     let dir = tempdir().unwrap();
     let source = dir.path().join("source");
@@ -507,7 +507,7 @@ fn test_delta_sync_interrupted_write_invalidates_cache() {
     use std::path::Path;
     use syncdir::config::{Config, TargetSyncConfig};
     use syncdir::db::{HashStore, SqliteHashStore, StoreConfig};
-    use syncdir::sync::{LocalSyncEngine, SyncEngine};
+    use syncdir::sync::LocalSyncEngine;
 
     #[cfg(windows)]
     {
@@ -623,4 +623,20 @@ fn test_delta_sync_interrupted_write_invalidates_cache() {
             "SQLite cache record must be invalidated (deleted) after interrupted delta sync"
         );
     }
+}
+
+#[test]
+fn test_consumer_accepts_segregated_traits() {
+    use std::path::Path;
+    use syncdir::sync::{FileDeleter, FileSynchronizer, MockSyncEngine};
+
+    fn sync_and_delete(syncer: &dyn FileSynchronizer, deleter: &dyn FileDeleter, file: &Path) {
+        syncer.sync_file(file).unwrap();
+        deleter.delete_file(file).unwrap();
+    }
+
+    let engine = MockSyncEngine::new();
+    sync_and_delete(&engine, &engine, Path::new("test.txt"));
+    assert_eq!(engine.synced_calls().len(), 1);
+    assert_eq!(engine.deleted_calls().len(), 1);
 }

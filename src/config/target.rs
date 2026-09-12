@@ -57,8 +57,21 @@ impl std::fmt::Display for TargetRole {
 
 /// Strongly-typed, normalized synchronization root directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(from = "PathBuf", into = "PathBuf")]
+#[serde(try_from = "RawTargetDir", into = "PathBuf")]
 pub struct TargetDir(PathBuf);
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct RawTargetDir(PathBuf);
+
+impl TryFrom<RawTargetDir> for TargetDir {
+    type Error = SyncError;
+    fn try_from(raw: RawTargetDir) -> Result<Self, Self::Error> {
+        let normalized = normalize_path(raw.0);
+        TargetDir::validate_internal(&normalized, None)?;
+        Ok(TargetDir(normalized))
+    }
+}
 
 impl TargetDir {
     /// Construct a validated TargetDir by normalizing path via normalize_path() and validating syntax for role.
@@ -78,9 +91,17 @@ impl TargetDir {
         Self(normalize_path(path.into()))
     }
 
-    /// Validates path syntax for a given role (`TargetRole::Source` or `TargetRole::Destination`).
-    /// Accepts Windows drive letters (C:\), UNC prefixes (\\), and Unix absolute paths (/).
-    pub(crate) fn validate(&self, role: TargetRole) -> Result<(), SyncError> {
+    /// Construct TargetDir from an already validated path without deprecation warning.
+    #[must_use]
+    pub fn from_validated(path: impl Into<PathBuf>) -> Self {
+        Self(normalize_path(path.into()))
+    }
+
+    /// Validates path syntax internally for an optional role.
+    pub(crate) fn validate_internal(
+        path: &Path,
+        role: Option<TargetRole>,
+    ) -> Result<(), SyncError> {
         let is_valid_drive_path = |path_str: &str| -> bool {
             if path_str.len() < 3 {
                 return false;
@@ -91,23 +112,34 @@ impl TargetDir {
                 && (bytes[2] == b'\\' || bytes[2] == b'/')
         };
 
-        let s = self.0.to_string_lossy();
-        let is_unc = crate::path_util::parse_unc_host_and_share(&self.0).is_some()
+        let s = path.to_string_lossy();
+        let is_unc = crate::path_util::parse_unc_host_and_share(path).is_some()
             && !s.starts_with(r"\\.\")
             && !s.starts_with(r"\\?\");
         let is_drive = is_valid_drive_path(&s);
-        let is_unix_abs = s.starts_with('/');
 
-        if !is_unc && !is_drive && !is_unix_abs {
+        if !is_unc && !is_drive {
+            let role_name = match role {
+                Some(TargetRole::Source) => "source ",
+                Some(TargetRole::Destination) => "destination ",
+                None => "",
+            };
             let example_drive = match role {
-                TargetRole::Source => "C:\\, R:\\",
-                TargetRole::Destination => "C:\\, X:\\",
+                Some(TargetRole::Source) => "C:\\, R:\\",
+                Some(TargetRole::Destination) => "C:\\, X:\\",
+                None => "C:\\, D:\\",
             };
             return Err(SyncError::validation_security(format!(
-                "Invalid {role} path '{s}': must start with a drive letter (e.g. {example_drive}) or UNC network prefix (e.g. \\\\server\\share)"
+                "Invalid {role_name}path '{s}': must start with a drive letter (e.g. {example_drive}) or UNC network prefix (e.g. \\\\server\\share)"
             )));
         }
         Ok(())
+    }
+
+    /// Validates path syntax for a given role (`TargetRole::Source` or `TargetRole::Destination`).
+    /// Accepts Windows drive letters (C:\) and UNC prefixes (\\).
+    pub(crate) fn validate(&self, role: TargetRole) -> Result<(), SyncError> {
+        Self::validate_internal(&self.0, Some(role))
     }
 
     #[must_use]
