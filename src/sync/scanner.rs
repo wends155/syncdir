@@ -47,6 +47,18 @@ pub(crate) fn scan_dir_cancellable(
             }
             Err(e) => return Err(SyncError::Io(e)),
         };
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(dir = %dir.display(), error = %e, "Permission denied querying file type; skipping");
+                *scan_complete = false;
+                continue;
+            }
+            Err(e) => return Err(SyncError::Io(e)),
+        };
+        if !file_type.is_dir() && !file_type.is_file() {
+            continue;
+        }
         let path = entry.path();
         match is_reparse_or_symlink(&entry, &path) {
             Ok(true) => {
@@ -60,15 +72,6 @@ pub(crate) fn scan_dir_cancellable(
                 continue;
             }
         }
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::warn!(path = %path.display(), error = %e, "Permission denied querying file type; skipping");
-                *scan_complete = false;
-                continue;
-            }
-            Err(e) => return Err(SyncError::Io(e)),
-        };
         if file_type.is_dir() {
             scan_dir_cancellable(&path, source_root, files, scan_complete, depth + 1, cancel)?;
         } else if file_type.is_file()

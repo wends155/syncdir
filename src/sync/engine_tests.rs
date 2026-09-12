@@ -1573,3 +1573,54 @@ fn test_segregated_role_traits_and_reparse_cache_export() {
     let _: &dyn SyncEngine = &engine;
     assert_eq!(engine.reparse_cache().len(), 0);
 }
+
+#[test]
+fn test_dest_casing_alignment_bypassed_on_cache_hit() {
+    use crate::sync::engine::CASING_ALIGN_READ_DIR_COUNT;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+
+    let file_rel = RelativePath::try_new("sample.txt").unwrap();
+    let src_file = src.join("sample.txt");
+    let dst_file = dst.join("sample.txt");
+    std::fs::write(&src_file, b"content").unwrap();
+    std::fs::write(&dst_file, b"content").unwrap();
+
+    let meta = std::fs::metadata(&src_file).unwrap();
+    let mtime = safe_modified_millis(&meta).unwrap();
+    let _ = std::fs::File::open(&dst_file).unwrap().set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + safe_epoch_duration_millis(mtime)),
+    );
+
+    let db = MockHashStore::new();
+    let rec = FileRecord::new(file_rel.clone(), meta.len(), mtime).with_id(1);
+    db.save_file(&rec, &[]).unwrap();
+
+    let target_cfg = TargetSyncConfig::builder(
+        TargetDir::from_validated(src.clone()),
+        TargetDir::from_validated(dst.clone()),
+    )
+    .build()
+    .unwrap();
+
+    let engine = LocalSyncEngine::new(db, target_cfg);
+    let mut scratch = vec![0u8; 64 * 1024];
+
+    let before = CASING_ALIGN_READ_DIR_COUNT.load(Relaxed);
+    let outcome = engine
+        .sync_file_to_dest_core(file_rel.as_path(), &dst, &mut scratch, Some(&rec))
+        .unwrap();
+    let after = CASING_ALIGN_READ_DIR_COUNT.load(Relaxed);
+
+    assert!(outcome.is_none(), "Must skip sync on verified cache hit");
+    assert_eq!(
+        after, before,
+        "Fast path MUST bypass directory casing alignment read_dir"
+    );
+}

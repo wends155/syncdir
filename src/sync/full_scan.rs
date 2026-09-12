@@ -66,6 +66,7 @@ pub(crate) struct SyncStats {
     pub synced: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub network_offline: bool,
 }
 
 /// Abstraction driving the individual operations of a full scan cycle.
@@ -287,6 +288,7 @@ impl<'a, D: FullScanDriver + ?Sized> FullScanCoordinator<'a, D> {
                         _ => None,
                     };
                     if e.is_network_offline() {
+                        stats.network_offline = true;
                         tracing::warn!(
                             path = %rel_path.display(),
                             target = %active_dest.display(),
@@ -909,6 +911,21 @@ mod tests {
         assert_eq!(
             driver_complete.deleted_files()[0],
             PathBuf::from("file2.txt")
+        );
+    }
+
+    #[test]
+    fn test_full_scan_local_io_error_not_destination_unreachable() {
+        let mut stats = SyncStats::default();
+        let io_err = SyncError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+
+        if io_err.is_network_offline() {
+            stats.network_offline = true;
+        }
+
+        assert!(
+            !stats.network_offline,
+            "Local permission denied must NOT mark network offline"
         );
     }
 }

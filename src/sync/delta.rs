@@ -204,6 +204,7 @@ pub(crate) struct DeltaTransferEngine<S: HashStore> {
     db: S,
     config: TargetSyncConfig,
     dirty_range_pool: std::sync::Mutex<Option<DirtyBlockRange>>,
+    pub(crate) last_modified_block_count: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: HashStore> DeltaTransferEngine<S> {
@@ -212,6 +213,7 @@ impl<S: HashStore> DeltaTransferEngine<S> {
             db,
             config,
             dirty_range_pool: std::sync::Mutex::new(None),
+            last_modified_block_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -290,7 +292,9 @@ impl<S: HashStore> DeltaTransferEngine<S> {
             let cached_hashes = self.db.get_block_hashes(task.rel_path)?;
 
             let buffer = scratch;
-            let mut new_hashes = Vec::new();
+            let expected_blocks =
+                (task.src_size + block_size.saturating_sub(1)) / block_size.max(1);
+            let mut new_hashes = Vec::with_capacity(expected_blocks as usize);
             let mut block_idx: u64 = 0;
             let mut lease = self.acquire_dirty_range_lease();
             let range = &mut *lease;
@@ -317,12 +321,19 @@ impl<S: HashStore> DeltaTransferEngine<S> {
                 if block_changed || is_truncated_on_dest {
                     range.add_block(block_idx, &buffer[..bytes_read], &mut dest_file)?;
                     dirty_blocks_written += 1;
-                    if self.config.verification_mode() != VerificationMode::Disabled {
+                    if matches!(
+                        self.config.verification_mode(),
+                        VerificationMode::Full | VerificationMode::Sampled
+                    ) {
                         modified_block_indices.push((block_idx, bytes_read, hash));
                     }
                 }
                 block_idx += 1;
             }
+            self.last_modified_block_count.store(
+                modified_block_indices.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             range.flush(&mut dest_file)?;
             drop(lease);
 
@@ -986,5 +997,32 @@ mod tests {
             let err = res.err().unwrap();
             assert!(matches!(err, SyncError::Validation { .. }));
         }
+    }
+
+    #[test]
+    fn test_delta_metadata_and_flush_skips_block_collection() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src.bin");
+        let dst = temp.path().join("dst.bin");
+        std::fs::write(&src, vec![1u8; 128 * 1024]).unwrap();
+        std::fs::write(&dst, vec![1u8; 128 * 1024]).unwrap();
+
+        let db = MockHashStore::new();
+        let target_cfg = TargetSyncConfig::builder(
+            TargetDir::from_validated(src.clone()),
+            TargetDir::from_validated(dst.clone()),
+        )
+        .verification_mode(crate::config::VerificationMode::MetadataAndFlush)
+        .build()
+        .unwrap();
+
+        let delta_engine = DeltaTransferEngine::new(db, target_cfg);
+        assert_eq!(
+            delta_engine
+                .last_modified_block_count
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

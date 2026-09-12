@@ -31,6 +31,10 @@ pub enum SyncCommand {
 }
 pub use super::traits::*;
 
+#[cfg(test)]
+pub(crate) static CASING_ALIGN_READ_DIR_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// RAII lease for a `DirtyBlockRange` buffer checked out from `LocalSyncEngine`.
 ///
 /// On drop, resets the buffer and returns it to the pool, retaining whichever has
@@ -324,6 +328,20 @@ impl<S: HashStore> LocalSyncEngine<S> {
             let dest_size = dest_meta_ref.len() as i64;
             let dest_mod = safe_modified_millis(dest_meta_ref).unwrap_or(0);
             if dest_size == src_size && dest_mod.abs_diff(src_mod) <= 2000 {
+                let is_verified_cache_hit = if let Some(record) = file_record {
+                    record.is_tracked()
+                        && record.file_size() == src_size as u64
+                        && record.last_modified() == src_mod
+                        && record.relative_path() == &safe_rel
+                } else {
+                    false
+                };
+
+                if is_verified_cache_hit {
+                    tracing::debug!(path = %rel_path.display(), "Local signature cache hit and destination matches, skipping sync");
+                    return Ok(None);
+                }
+
                 self.align_dest_file_casing_if_needed(dest_dir, rel_path)?;
                 if let Some(record) = file_record
                     && record.is_tracked()
@@ -513,6 +531,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
         dest_dir: &Path,
         rel_path: &Path,
     ) -> Result<(), SyncError> {
+        #[cfg(test)]
+        CASING_ALIGN_READ_DIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let dest_path = dest_dir.join(rel_path);
         let Some(expected_name) = rel_path.file_name() else {
             return Ok(());
@@ -561,6 +582,9 @@ impl<S: HashStore> LocalSyncEngine<S> {
         _dest_dir: &Path,
         _rel_path: &Path,
     ) -> Result<(), SyncError> {
+        #[cfg(test)]
+        CASING_ALIGN_READ_DIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Ok(())
     }
 
