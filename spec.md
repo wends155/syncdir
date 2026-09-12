@@ -660,16 +660,19 @@ Encapsulates destination path, current reachability, and optional resolved UNC p
 Encapsulates thread-safe source presence state wrapping an `Arc<AtomicBool>`.
 
 ### DebounceQueue
-In-memory queue managing pending sync and delete paths with per-path debounce deadlines and capacity enforcement.
+In-memory dual min-heap queue managing pending sync and delete paths with per-path debounce deadlines and capacity enforcement.
 
 ### ReachabilityMonitor
 Worker sub-component managing target destination health probes, alternate UNC resolution, and observer notifications.
 
+### FailureTracker
+Bounded failure tracking structure capping memory consumption at 5,000 entries with FIFO oldest eviction and periodic queue compaction when `order.len() > capacity * 2`. Reset on successful file synchronization and completely emptied on successful full scans.
+
 ### SyncWorkerState
-Worker execution state container tracking scratch buffer, failure counts, and archive pruning intervals.
+Worker execution state container tracking scratch buffer, bounded `FailureTracker`, exponential backoff calculation, and catch-up scan state invariants (cleared to false, with failure counters zeroed and attempt deadline reset to `None` upon successful `TriggerFullScan` and destination reconnect scans).
 
 ### SyncWorkerRunner
-Testable sync worker state machine orchestrating reachability, debouncing, and execution.
+Testable sync worker state machine orchestrating reachability, debouncing, and execution via deterministic `tick(now)` stepping and sleep-free event dispatching.
 - `context`: SyncWorkerContext<E>
 - `queue`: DebounceQueue
 - `reachability`: ReachabilityMonitor
