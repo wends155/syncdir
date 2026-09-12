@@ -95,11 +95,12 @@ pub fn validate_icon_asset(path: &std::path::Path) -> Result<(), BuildResourceEr
     }
 
     let mut header = [0u8; 6];
-    file.read_exact(&mut header).map_err(|e| BuildResourceError::Io {
-        path: path.to_path_buf(),
-        kind: e.kind(),
-        message: e.to_string(),
-    })?;
+    file.read_exact(&mut header)
+        .map_err(|e| BuildResourceError::Io {
+            path: path.to_path_buf(),
+            kind: e.kind(),
+            message: e.to_string(),
+        })?;
 
     validate_icon_bytes(&header)
 }
@@ -278,25 +279,80 @@ impl ResourceBuildConfig {
     }
 }
 
+pub fn emit_rebuild_directives() {
+    println!("cargo:rerun-if-changed=syncdir.ico");
+    println!("cargo:rerun-if-env-changed=WINRES_TOOLKIT_PATH");
+    println!("cargo:rerun-if-env-changed=RC_PATH");
+    println!("cargo:rerun-if-env-changed=WINDOWS_SDK_PATH");
+    println!("cargo:rerun-if-env-changed=SYNCDIR_ALLOW_MISSING_ICON");
+}
+
+pub fn handle_resource_error(err: &BuildResourceError, config: &ResourceBuildConfig) {
+    if config.is_release() && !config.allow_missing_icon() {
+        eprintln!(
+            "================================================================================"
+        );
+        eprintln!("ERROR: Failed to compile Windows resource icon for release build: {err}");
+        eprintln!(
+            "================================================================================"
+        );
+        eprintln!("Release builds must embed the application icon and manifest to ensure identity");
+        eprintln!("and prevent legacy Windows UAC virtualization (CWE-390 / CWE-250).");
+        eprintln!();
+        eprintln!("Remediation options:");
+        eprintln!("  1. Set WINRES_TOOLKIT_PATH to directory containing rc.exe or windres.exe:");
+        eprintln!("     $env:WINRES_TOOLKIT_PATH = 'C:\\path\\to\\bin\\x64'");
+        eprintln!("  2. Set RC_PATH directly to the resource compiler binary:");
+        eprintln!("     $env:RC_PATH = 'C:\\path\\to\\bin\\x64\\rc.exe'");
+        eprintln!("  3. Set WINDOWS_SDK_PATH to the Windows SDK root folder:");
+        eprintln!("     $env:WINDOWS_SDK_PATH = 'C:\\Program Files (x86)\\Windows Kits\\10'");
+        eprintln!("  4. Ensure Windows 10/11 SDK or Build Tools with rc.exe is installed.");
+        eprintln!("  5. Headless / CI escape hatch (suppresses error and continues without icon):");
+        eprintln!("     $env:SYNCDIR_ALLOW_MISSING_ICON = '1'");
+        eprintln!(
+            "================================================================================"
+        );
+        std::process::exit(1);
+    } else {
+        println!("cargo:warning=Failed to compile Windows resource icon: {err}");
+        println!(
+            "cargo:warning=Remediation: Set WINRES_TOOLKIT_PATH, RC_PATH, or WINDOWS_SDK_PATH, or set SYNCDIR_ALLOW_MISSING_ICON=1"
+        );
+    }
+}
+
 #[cfg(all(windows, not(test)))]
-fn compile_windows_resources() -> Result<(), BuildResourceError> {
+pub fn compile_windows_resources(config: &ResourceBuildConfig) -> Result<(), BuildResourceError> {
+    let icon_path = std::path::Path::new("syncdir.ico");
+    validate_icon_asset(icon_path)?;
+
     let mut res = winres::WindowsResource::new();
     res.set_icon("syncdir.ico");
+
+    if let Some(toolkit) = config.resolve_toolkit_dir()? {
+        res.set_toolkit_path(&toolkit.to_string_lossy());
+    }
+
     res.compile()
         .map_err(|e| BuildResourceError::CompilationFailed(e.to_string()))
 }
 
 #[cfg(any(not(windows), test))]
-fn compile_windows_resources() -> Result<(), BuildResourceError> {
+pub fn compile_windows_resources(_config: &ResourceBuildConfig) -> Result<(), BuildResourceError> {
     Ok(())
 }
 
 #[cfg(not(test))]
 fn main() {
-    println!("cargo:rerun-if-changed=syncdir.ico");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        if let Err(e) = compile_windows_resources() {
-            println!("cargo:warning=Failed to compile Windows resource icon: {e}");
+    emit_rebuild_directives();
+
+    let config = ResourceBuildConfig::from_env();
+    let is_windows =
+        config.target_os == "windows" || (config.target_os.is_empty() && cfg!(windows));
+    if is_windows {
+        match compile_windows_resources(&config) {
+            Ok(()) => {}
+            Err(e) => handle_resource_error(&e, &config),
         }
     }
 }

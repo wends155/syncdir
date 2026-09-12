@@ -2,7 +2,7 @@
 #[path = "../build.rs"]
 mod build_script;
 
-use build_script::{validate_icon_bytes, BuildResourceError};
+use build_script::{BuildResourceError, validate_icon_bytes};
 
 #[test]
 fn test_validate_icon_bytes_valid() {
@@ -63,7 +63,8 @@ fn test_validate_icon_asset_valid_file() {
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("test_icon.ico");
     let mut file = std::fs::File::create(&file_path).unwrap();
-    file.write_all(&[0x00, 0x00, 0x01, 0x00, 0x01, 0x00]).unwrap();
+    file.write_all(&[0x00, 0x00, 0x01, 0x00, 0x01, 0x00])
+        .unwrap();
     assert_eq!(validate_icon_asset(&file_path), Ok(()));
 }
 
@@ -80,7 +81,7 @@ fn test_validate_icon_asset_too_large() {
     ));
 }
 
-use build_script::{validate_path_safety, ResourceBuildConfig};
+use build_script::{ResourceBuildConfig, validate_path_safety};
 
 #[test]
 fn test_validate_path_safety_valid() {
@@ -163,14 +164,13 @@ fn test_resolve_toolkit_tier2_rc_path_dir() {
 #[test]
 fn test_resolve_toolkit_tier3_sdk_root() {
     let mut config = ResourceBuildConfig::from_env_with(|_| None);
-    config.windows_sdk_path =
-        Some(std::path::PathBuf::from("C:\\Program Files (x86)\\Windows Kits\\10"));
+    config.windows_sdk_path = Some(std::path::PathBuf::from(
+        "C:\\Program Files (x86)\\Windows Kits\\10",
+    ));
     let expected_bin =
         std::path::PathBuf::from("C:\\Program Files (x86)\\Windows Kits\\10\\bin\\x64");
     let checker = move |p: &std::path::Path| {
-        p == std::path::Path::new(
-            "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\x64\\rc.exe",
-        )
+        p == std::path::Path::new("C:\\Program Files (x86)\\Windows Kits\\10\\bin\\x64\\rc.exe")
     };
     assert_eq!(
         config.resolve_toolkit_dir_with(checker),
@@ -183,4 +183,40 @@ fn test_resolve_toolkit_tier4_fallback() {
     let config = ResourceBuildConfig::from_env_with(|_| None);
     let checker = |_p: &std::path::Path| false;
     assert_eq!(config.resolve_toolkit_dir_with(checker), Ok(None));
+}
+
+use build_script::{compile_windows_resources, emit_rebuild_directives, handle_resource_error};
+
+#[test]
+fn test_emit_rebuild_directives_executes() {
+    emit_rebuild_directives();
+}
+
+#[test]
+fn test_handle_resource_error_debug_does_not_exit() {
+    let err = BuildResourceError::IconInvalid("bad header".to_string());
+    let lookup = |var: &str| match var {
+        "PROFILE" => Some("debug".to_string()),
+        _ => None,
+    };
+    let config = ResourceBuildConfig::from_env_with(lookup);
+    handle_resource_error(&err, &config);
+}
+
+#[test]
+fn test_handle_resource_error_release_with_allow_missing_does_not_exit() {
+    let err = BuildResourceError::CompilationFailed("os error 3".to_string());
+    let lookup = |var: &str| match var {
+        "PROFILE" => Some("release".to_string()),
+        "SYNCDIR_ALLOW_MISSING_ICON" => Some("1".to_string()),
+        _ => None,
+    };
+    let config = ResourceBuildConfig::from_env_with(lookup);
+    handle_resource_error(&err, &config);
+}
+
+#[test]
+fn test_compile_windows_resources_under_test_cfg() {
+    let config = ResourceBuildConfig::from_env_with(|_| None);
+    assert_eq!(compile_windows_resources(&config), Ok(()));
 }
