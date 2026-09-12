@@ -46,7 +46,7 @@ syncdir/
 ├── context.md            # Decisions and history
 ├── .agents/              # TARS rules, workflows, and scripts
 ├── tests/
-│   ├── integration_tests.rs # Integration testing suite (12 scenarios)
+│   ├── integration_tests.rs # Integration testing suite (13 scenarios)
 │   ├── property_tests.rs    # Proptest generative invariant suites (8 properties)
 │   ├── snapshot_tests.rs    # Insta golden snapshot tests (20 snapshots)
 │   └── snapshots/           # Insta snapshot golden files
@@ -63,10 +63,15 @@ syncdir/
     │   └── validation.rs # TOML preprocessing and numeric bound constants
     ├── path_util.rs      # Path canonicalization and normalization leaf
     ├── net.rs            # Win32 network UNC and mapped drive FFI
-    ├── db.rs             # SQLite local database cache layer
+    ├── db/               # Decoupled SQLite storage subsystem
+    │   ├── mod.rs        # Subsystem facade and public re-exports
+    │   ├── traits.rs     # Pure HashStore, FileRecord, StoreConfig, BlockHash traits & types
+    │   ├── sqlite.rs     # Concrete SqliteHashStore persistence implementation
+    │   └── mock.rs       # In-memory MockHashStore test double
     ├── error.rs          # Project-wide error definitions
     ├── monitor.rs        # ReadDirectoryChangesW event monitor
     ├── startup.rs        # Platform-specific registry auto-start hook
+    ├── test_support.rs   # Canonical doc(hidden) test double re-exports and tracing capture
     ├── sync/             # Block delta sync engine and background workers
     │   ├── mod.rs        # Module facade and public exports
     │   ├── archive.rs    # Deletion archiving and archive retention pruning (ArchiveManager)
@@ -259,23 +264,23 @@ syncdir/
 * **Log Injection Sanitization (CWE-117 Defense)**: Structured log events use `Debug` formatting (`?rel_path`) or validated domain newtypes to escape carriage returns and line feeds, preventing CRLF log injection in user-controlled filesystem paths.
 
 ## 10. Testing Strategy
-* **Test Suite Metrics**: 381 total automated tests passing with zero regressions and zero warnings across all targets (321 unit tests in `src/lib.rs`, 7 in `src/main.rs`, 13 integration tests, 8 property tests, 20 snapshot tests, 12 doc-tests, and 1 ignored).
-* **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config.rs` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db.rs` (CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing, hierarchy comparison, system root detection), `src/startup.rs`, `src/tray.rs` (testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), `src/monitor.rs` (watcher buffer overflow recovery and event dispatching), and the decomposed `src/sync/` submodules:
-  * `src/sync/engine.rs`: Composed `LocalSyncEngine` end-to-end regression, metadata timestamp tolerances, TOCTOU size protection, directory creation, destination file truncation repair, two-phase lock release, and reparse cache invalidation.
+* **Test Suite Metrics**: 422 total automated tests passing with zero regressions and zero warnings across all targets (365 unit tests in `src/lib.rs`, 7 in `src/main.rs`, 13 integration tests, 8 property tests, 20 snapshot tests, 9 doc-tests, and 2 ignored interactive GUI modal dialog tests).
+* **Unit Tests**: Co-located `#[cfg(test)]` modules across `src/config/` (path normalization, mapped drive resolution, block size/threshold validation, builder invariants), `src/net.rs` (Win32 FFI buffer safety and mapped drive lookups), `src/db/` (`traits.rs`, `sqlite.rs`, CRUD, exact prefix cascade deletion, BlockHash signatures), `src/path_util.rs` (lexical parent component collapsing, UNC parsing, hierarchy comparison, system root detection), `src/startup.rs`, `src/tray/` (`state_tests.rs`, `event_loop_tests.rs`, `dialog.rs`, `menu.rs`, testing `TrayState` status transitions, open_path qualification, and tooltip text formatting), `src/monitor.rs` (watcher buffer overflow recovery and event dispatching), `src/test_support.rs` (canonical test double re-exports and tracing capture buffer tests), and the decomposed `src/sync/` submodules:
+  * `src/sync/engine.rs` & `src/sync/engine_tests.rs`: Composed `LocalSyncEngine` end-to-end regression, metadata timestamp tolerances, TOCTOU size protection, directory creation, destination file truncation repair, two-phase lock release, fast-path casing alignment bypass on matching relative path, and reparse cache invalidation.
   * `src/sync/delta.rs`: Standalone `DeltaTransferEngine` Blake3 chunk hashing, delta sync dirty block updates, and read-back verification.
   * `src/sync/small_file.rs`: Standalone `SmallFileTransferEngine` fast-path atomic staging, sampled verification, and zero-byte files.
-  * `src/sync/scanner.rs`: Standalone `DirectoryScanner` directory traversal recursion limits, permission bypass, and case-insensitive deletion detection.
-  * `src/sync/archive.rs`: Standalone `ArchiveManager` retention-based archive subfolder management, timestamped backups, root junction verification, and safe directory pruning.
-  * `src/sync/path_safety.rs`: Traversal defense, reserved DOS devices, ADS rejection, ancestor junction caching, and two-phase non-blocking checks.
+  * `src/sync/scanner.rs`: Standalone `DirectoryScanner` directory traversal recursion limits, permission bypass, Windows cached `file_type()?` entry filtering without path allocations, and case-insensitive deletion detection.
+  * `src/sync/archive.rs`: Standalone `ArchiveManager` retention-based archive subfolder management, timestamped backups, ancestor junction checks before directory creation, TOCTOU symlink checks before pruning, and safe directory pruning.
+  * `src/sync/path_safety.rs`: Traversal defense, reserved DOS devices, ADS rejection, ancestor junction caching (with non-existent directory exclusion), and read-lock probe in `ReparseCache::evict_dir`.
   * `src/sync/worker/tests.rs`: Discrete `SyncWorkerRunner` stepping, debounce min-heap queue stress testing, exponential backoff, reachability tracking, catch-up scan clearing invariants, bounded failure tracking (5k cap FIFO eviction), and permanent validation error eviction.
   * `src/sync/mock.rs`: Recording mock engine verification.
-* **Integration Tests**: `tests/integration_tests.rs` (13 tests) simulating standard files, deletions, directory updates, configuration reload validation, rename event pairing, worker reachability offline drain guards, subsecond precision, and `run_tray` interface compilation.
+* **Integration Tests**: `tests/integration_tests.rs` (13 tests) simulating standard files, deletions, directory updates, configuration reload validation, rename event pairing, worker reachability offline drain guards, subsecond precision, segregated trait consumer verification, and `run_tray` interface compilation.
 * **Snapshot Tests**: `tests/snapshot_tests.rs` (20 tests) using `insta` (v1) for regression-guarding snapshot assertions on `Config` debug formatting, validation errors (including zero block size/threshold and zero debounce), `SyncError` display output (including `SyncError::WriteVerificationFailed` and `SyncError::Registry`), `TargetSyncConfig`, and `FileRecord` structures.
 * **Property-Based Tests**: `tests/property_tests.rs` (8 tests) using `proptest` (v1) for invariant validation (block boundary division, TOML round-tripping, `is_metadata_up_to_date_raw` timestamp delta evaluation across ±10000ms, `DirtyBlockRange` chunk coalescing, path traversal safety wired directly to `is_safe_relative_path`, sync idempotency, and delta sync single-block isolation).
 * **Assertions & Structural Diffing**: `pretty_assertions` (v1) for colorized diff output on test failure assertions across all test modules.
 * **Shared Test Fixtures**: `Config::test_default()` helper for consistent test configuration across unit and integration tests.
-* **Comprehensive In-Memory Mocks**: Six isolated mock implementations providing 100% test isolation:
-  * `MockHashStore` (`src/db.rs`): In-memory signature store without SQLite I/O.
+* **Comprehensive In-Memory Mocks**: Six isolated mock implementations providing 100% test isolation, re-exported under `syncdir::test_support`:
+  * `MockHashStore` (`src/db/mock.rs`): In-memory signature store without SQLite I/O.
   * `MockStartupRegistry` (`src/startup.rs`): In-memory registry backend without HKCU mutation.
   * `MockNetworkResolver` (`src/net.rs`): In-memory drive/UNC translator and SMB failure simulator.
   * `MockWatcherFactory` & `MockFileWatcher` (`src/monitor.rs`): In-memory directory watcher and factory without Win32 OS threads.

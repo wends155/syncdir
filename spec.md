@@ -1,6 +1,6 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 94283f7
+> Last verified against: 2f489f6
  
 | Field | Value |
 |-------|-------|
@@ -276,6 +276,8 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 | `DirectoryScanner::new` | `(config: TargetSyncConfig) -> Self` | `DirectoryScanner` | — (pub(crate) directory recursion, batch record saves, and single path allocations) |
 | `DirtyBlockRange::new` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (infallible zero-panic constructor) |
 | `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` (if `block_size == 0`) |
+| `FileMetadataSnapshot::new` | `(size: u64, modified_epoch_millis: i64) -> Self` | `FileMetadataSnapshot` | `size` standardized to unsigned `u64` |
+| `FileMetadataSnapshot::from_metadata` | `(meta: &fs::Metadata) -> Result<Self, SyncError>` | `FileMetadataSnapshot` | `SyncError::Io` (safely parses metadata) |
 | `FileMetadataSnapshot::is_up_to_date` | `(&self, dest: &FileMetadataSnapshot, record: Option<&FileRecord>) -> bool` | `bool` | Evaluates SMB ±2000ms timestamp tolerance |
 | `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | Zero-allocation `.peekable()` ancestor component traversal |
 | `verify_source_not_reparse_cached` | `(source_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<(), SyncError>` | `()` | Zero-allocation `.peekable()` ancestor component traversal |
@@ -447,6 +449,52 @@ AND does not issue a false-positive file deletion command
 GIVEN a destination path whose mapped drive letter is disconnected
 WHEN the worker processes sync and delete commands
 THEN operations are executed against the active resolved UNC share path
+
+[PERFORMANCE] Fast-path casing alignment bypass on matching relative path
+GIVEN a file synchronization task where the local SQLite record matches source file size and modification time
+AND the recorded relative path casing exactly matches the source relative path (`file_record.relative_path() == &safe_rel`)
+WHEN `LocalSyncEngine::sync_file_to_dest_core` executes
+THEN `align_dest_file_casing_if_needed` is bypassed completely without issuing remote SMB directory listings (`read_dir`)
+
+[SECURITY] ReparseCache non-existent directory exclusion
+GIVEN a destination directory path that does not yet exist on disk
+WHEN `verify_destination_not_reparse_cached` evaluates ancestor safety
+THEN `symlink_metadata` returns `NotFound` and the non-existent path is NOT inserted into `ReparseCache`
+
+[SECURITY] Archive directory ancestor reparse point validation prior to creation
+GIVEN an archive backup operation for a destination file
+WHEN `ArchiveManager::archive_dest_file_only` executes
+THEN ancestor path safety is verified via `verify_destination_not_reparse_cached` before invoking `fs::create_dir_all`
+
+[SECURITY] Archive pruning TOCTOU symlink verification prior to deletion
+GIVEN an archive retention pruning pass collecting candidate expired files
+WHEN `prune_archive` prepares to delete a candidate file via `fs::remove_file`
+THEN `symlink_metadata` is checked immediately before removal, rejecting any candidate substituted with a junction or symlink
+
+[LOGIC] FullScanCoordinator local error classification as PartialFailure
+GIVEN a full scan operation where all source file transfers fail due to local file locks or permission errors
+WHEN `FullScanCoordinator::run` calculates the scan outcome
+THEN `ScanOutcome::PartialFailure` is returned rather than false `DestinationUnreachable`
+
+[PERFORMANCE] Scanner Windows cached file_type query without path allocation
+GIVEN a recursive directory scan via `DirectoryScanner`
+WHEN directory entries are enumerated
+THEN `entry.file_type()?` is inspected directly from Windows directory enumerator records before allocating `entry.path()`
+
+[PERFORMANCE] ReparseCache evict_dir read-lock early return probe
+GIVEN a file deletion operation invalidating cached directory ancestors
+WHEN `ReparseCache::evict_dir` is called
+THEN cache contents are probed under a read lock first, returning immediately without write lock acquisition when no prefix matches
+
+[LOGIC] SyncWorker catch-up scan flag reset upon full scan completion
+GIVEN a sync worker whose `needs_catchup_scan` flag was set by offline changes
+WHEN a full scan is triggered and successfully completes
+THEN `needs_catchup_scan` is reset to `false`, preventing infinite full-scan recurrence
+
+[SECURITY] CWE-117 log injection prevention via Debug path formatting
+GIVEN filesystem entries containing carriage return or line feed characters
+WHEN scanner and archive operations log warnings or instrument tracing spans
+THEN paths are formatted using Debug representation (`?path`, `?dir`), escaping raw CRLF injection tokens
 
 ---
 
