@@ -1,12 +1,12 @@
 # Behavioral Specification: syncdir
  
-> Last verified against: 9fa32e6
+> Last verified against: 94283f7
  
 | Field | Value |
 |-------|-------|
 | **Project** | syncdir |
 | **Version** | 0.1.13 |
-| **Last Updated** | 2026-09-11 |
+| **Last Updated** | 2026-09-12 |
 
 ---
 
@@ -126,10 +126,12 @@ AND construction fails immediately
  
 | Function / Struct | Signature | Returns | Notes |
 |-------------------|-----------|---------|-------|
-| `RelativePath::new` | `(path: impl Into<PathBuf>) -> Result<Self, SyncError>` | `RelativePath` | Enforces path safety, `/` normalization, rejects traversal/devices/ADS/whitespace |
+| `RelativePath::try_new` | `(path: impl Into<PathBuf>) -> Result<Self, SyncError>` | `RelativePath` | Canonical constructor enforcing path safety, forward-slash normalization, rejecting traversal, devices, ADS, and whitespace |
+| `RelativePath::new` | `(path: impl Into<PathBuf>) -> Result<Self, SyncError>` | `RelativePath` | Inline non-deprecated convenience wrapper delegating to `try_new` |
 | `RelativePath::as_path` | `(&self) -> &Path` | `&Path` | Returns borrowed `&Path` slice |
 | `RelativePath::as_str` | `(&self) -> &str` | `&str` | Returns canonical forward-slash string slice |
 | `RelativePath::to_path_buf` | `(&self) -> PathBuf` | `PathBuf` | Converts to owned PathBuf |
+| `RelativePath::eq (PartialEq)` | `(&self, other: &PathBuf / &Path) -> bool` | `bool` | Bidirectional equality comparison with `PathBuf` and `Path` |
 | `normalize_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | Replaces `/` with `\`, normalizes root backslashes, collapses `.` |
 | `parse_unc_host_and_share` | `(path: impl AsRef<Path>) -> Option<(&str, &str)>` | `Option<(&str, &str)>` | Extracts host and share from UNC paths |
 | `collapse_components` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | Lexically resolves `..` parent segments without disk I/O |
@@ -184,7 +186,7 @@ AND unrelated paths return `false`
 | `HashStore::save_files_batch` | `(&self, records: &[(&FileRecord, &[BlockHash])]) -> Result<(), SyncError>` | `()` | `SyncError::Db` (batch atomic UPSERT) |
 | `HashStore::get_block_hashes` | `(&self, file_id: i64) -> Result<Vec<BlockHash>, SyncError>` | `Vec<BlockHash>` | `SyncError::Db` |
 | `HashStore::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
-| `HashStore::list_files` | `(&self) -> Result<Vec<PathBuf>, SyncError>` | `Vec<PathBuf>` | `SyncError::Db` |
+| `HashStore::list_files` | `(&self) -> Result<Vec<RelativePath>, SyncError>` | `Vec<RelativePath>` | `SyncError::Db` |
 | `SqliteHashStore::new` | `(db_path: &Path, config: impl Into<StoreConfig>) -> Result<Self, SyncError>` | `SqliteHashStore` | `SyncError::Db` |
 | `SqliteHashStore::cache_db_path` | `(app_dir: &Path, target_dest: &Path) -> PathBuf` | `PathBuf` | — (deterministic `sigcache_<blake3>.db` path generation) |
 | `MockHashStore::new` | `() -> Self` | `MockHashStore` | — |
@@ -211,56 +213,103 @@ THEN `RETURNING id` provides the row ID directly without an extra `SELECT id` qu
 
 ---
 
-### 4. Sync Module (SyncEngine)
+### 4. Sync Module (SyncEngine & Role Traits)
  
-> Performs streaming delta sync, single-pass I/O, contiguous block coalescing, reparse checks, and worker queue processing.
+> Performs streaming delta sync, single-pass I/O, contiguous block coalescing, reparse checks, role-segregated synchronization, and worker queue processing.
  
 #### Public API
  
 | Function / Component | Signature | Returns | Errors |
 |----------------------|-----------|---------|--------|
-| `SyncEngine::sync_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db`, `SyncError::WriteVerificationFailed` |
-| `SyncEngine::sync_file_buffered` | `(&self, path: &Path, scratch: &mut [u8]) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db`, `SyncError::WriteVerificationFailed` |
-| `SyncEngine::sync_file_to_dest_buffered` | `(&self, path: &Path, dest_dir: &Path, scratch: &mut [u8]) -> Result<(), SyncError>` | `()` | `SyncError::Io`, `SyncError::Db`, `SyncError::WriteVerificationFailed` |
-| `SyncEngine::sync_file_to_dest_staged` | `(&self, path: &RelativePath, dest_dir: &Path, scratch: &mut [u8]) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `SyncError::Io`, `SyncError::WriteVerificationFailed` (stages transfer for batch SQLite commit) |
-| `SyncEngine::flush_staged_syncs` | `(&self, staged: &[FileRecord]) -> Result<(), SyncError>` | `()` | `SyncError::Db` (commits batch with single-record fallback) |
-| `SyncEngine::delete_file` | `(&self, path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
-| `SyncEngine::delete_file_from_dest` | `(&self, path: &Path, dest_dir: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
-| `SyncEngine::prune_archive` | `(&self, dest_dir: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
-| `SyncEngine::run_full_scan` | `(&self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
+| `FileSynchronizer::sync_file` | `(&self, rel_path: &Path) -> Result<Option<FileRecord>, SyncError>` | `Option<FileRecord>` | `SyncError::Io`, `SyncError::Db`, `SyncError::WriteVerificationFailed` |
+| `FileDeleter::delete_file` | `(&self, rel_path: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
+| `BatchFlusher::flush_batch` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Db` |
+| `ScanEngine::run_cancellable_full_scan` | `(&self, cancel_flag: &AtomicBool) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
+| `ArchiveEngine::prune_archives` | `(&self) -> Result<(), SyncError>` | `()` | `SyncError::Io` |
+| `SyncEngine` | `trait: FileSynchronizer + FileDeleter + BatchFlusher + ScanEngine + ArchiveEngine` | — | Composite synchronization supertrait with blanket implementations |
 | `SyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (default no-op clearing directory safety cache) |
-| `start_sync_worker` | `<E: SyncEngine + 'static>(context: SyncWorkerContext<E>) -> Result<JoinHandle<()>, SyncError>` | `Result<JoinHandle<()>, SyncError>` | `SyncError::Io` (thread spawn failure) |
-| `SyncWorkerRunner::new` | `(context: SyncWorkerContext<E>) -> Self` | `SyncWorkerRunner<E>` | — (discrete, testable worker state machine with `pub(crate)` fields) |
-| `SyncWorkerRunner::handle_command` | `(&mut self, cmd: SyncCommand) -> bool` | `bool` | — (false indicates shutdown requested) |
-| `SyncWorkerRunner::tick` | `(&mut self, now: Instant) -> Result<WorkerTickOutcome, SyncError>` | `WorkerTickOutcome` | `SyncError` |
-| `SyncWorkerContext::builder` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, source_conn: impl Into<SourceConnectivityTracker>) -> SyncWorkerContextBuilder<E>` | `SyncWorkerContextBuilder<E>` | — (entrypoint for builder construction) |
-| `SyncWorkerContextBuilder::build` | `(self) -> Result<SyncWorkerContext<E>, SyncError>` | `SyncWorkerContext<E>` | `SyncError::Validation` (requires `max_pending_queue > 0`) |
-| `LocalSyncEngine::new` | `(db: S, config: impl Into<TargetSyncConfig>) -> Self` | `LocalSyncEngine<S>` | — (composes collaborating transfer/scan engines; fields private) |
+| `LocalSyncEngine::new` | `(db: S, config: TargetSyncConfig) -> Self` | `LocalSyncEngine<S>` | — (composes collaborating transfer/scan engines; fields private) |
+| `LocalSyncEngine::run_configured_full_scan` | `(&self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` (runs scan against configured destination) |
+| `LocalSyncEngine::run_full_scan` | `(&self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | Deprecated: use `run_configured_full_scan` instead |
 | `LocalSyncEngine::acquire_dirty_range_lease` | `(&self) -> DirtyRangeLease<'_>` | `DirtyRangeLease<'_>` | — (pub(crate) reusable scratch buffer lease for zero-lock streaming) |
 | `LocalSyncEngine::invalidate_verified_dirs` | `(&self)` | `()` | — (clears reparse cache) |
 | `LocalSyncEngine::evict_verified_dir` | `(&self, dir: &Path)` | `()` | — (evicts dir and descendants from cache) |
-| `FullScanCoordinator::new` | `(engine: &'a LocalSyncEngine<S>, dest_dir: &'a Path, cancel: &'a AtomicBool) -> Self` | `FullScanCoordinator<'a, S>` | — (decomposed pipeline coordinator for full directory scans) |
-| `FullScanCoordinator::run` | `(self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` |
-| `ReparseCache::new` | `(shallow_capacity: usize, deep_capacity: usize) -> Self` | `ReparseCache` | — (two-tier relative-depth ancestor cache under RwLock) |
+| `LocalSyncEngine::reparse_cache` | `(&self) -> &Arc<ReparseCache>` | `&Arc<ReparseCache>` | — (public accessor returning re-exported ReparseCache) |
+| `FullScanDriver` | `trait: Send + Sync` | — | Decoupled driver abstraction required by `FullScanCoordinator` |
+| `MockFullScanDriver::new` | `() -> Self` | `MockFullScanDriver` | Pure in-memory mock implementation of `FullScanDriver` |
+| `FullScanCoordinator::new` | `(driver: &'a D, dest_dir: &'a Path, cancel: &'a AtomicBool) -> Self` | `FullScanCoordinator<'a, D>` | — (decomposed pipeline coordinator for full directory scans) |
+| `FullScanCoordinator::run` | `(self) -> Result<ScanOutcome, SyncError>` | `ScanOutcome` | `SyncError::Io`, `SyncError::Db` (deletion reconciliation guarded by `scan_complete`) |
+| `start_sync_worker` | `<E: SyncEngine + 'static>(context: SyncWorkerContext<E>) -> Result<JoinHandle<()>, SyncError>` | `Result<JoinHandle<()>, SyncError>` | `SyncError::Io` (thread spawn failure) |
+| `SyncWorkerRunner::new` | `(context: SyncWorkerContext<E>) -> Self` | `SyncWorkerRunner<E>` | — (discrete, testable worker state machine with `pub(crate)` fields) |
+| `SyncWorkerRunner::handle_command` | `(&mut self, cmd: SyncCommand) -> bool` | `bool` | — (false indicates shutdown requested) |
+| `SyncWorkerRunner::tick` | `(&mut self, now: Instant) -> Result<WorkerTickOutcome, SyncError>` | `WorkerTickOutcome` | `SyncError` (immediate NotFound eviction, 10-retry IO ceiling) |
+| `SyncWorkerContext::builder` | `(target_index: usize, config: impl Into<TargetSyncConfig>, engine: E, rx: Receiver<SyncCommand>, source_conn: impl Into<SourceConnectivityTracker>) -> SyncWorkerContextBuilder<E>` | `SyncWorkerContextBuilder<E>` | — (entrypoint for builder construction) |
+| `SyncWorkerContextBuilder::build` | `(self) -> Result<SyncWorkerContext<E>, SyncError>` | `SyncWorkerContext<E>` | `SyncError::Validation` (requires `max_pending_queue > 0`) |
+| `ReparseCache::new` | `(shallow_capacity: usize, deep_capacity: usize) -> Self` | `ReparseCache` | — (two-tier relative-depth ancestor cache under RwLock; re-exported in `syncdir::sync`) |
 | `ReparseCache::contains` | `(&self, path: &Path) -> bool` | `bool` | — |
 | `ReparseCache::insert_ancestor` | `(&self, path: PathBuf, depth: usize)` | `()` | — |
 | `ReparseCache::evict_dir` | `(&self, dir: &Path)` | `()` | — |
 | `ReparseCache::clear` | `(&self)` | `()` | — |
-| `SmallFileTransferEngine::new` | `(config: TargetSyncConfig) -> Self` | `SmallFileTransferEngine` | — (pub(crate) atomic small-file streaming) |
+| `SmallFileTransferEngine::new` | `(config: TargetSyncConfig) -> Self` | `SmallFileTransferEngine` | — (pub(crate) atomic small-file streaming with splitmix64 nonces) |
 | `DeltaTransferEngine::new` | `(db: S, config: TargetSyncConfig) -> Self` | `DeltaTransferEngine<S>` | — (pub(crate) in-place delta sync with chunk hashing) |
 | `ArchiveManager::new` | `(config: TargetSyncConfig, reparse_cache: Arc<ReparseCache>) -> Self` | `ArchiveManager` | — (pub(crate) timestamped backup management and safe pruning with ReparseCache) |
-| `DirectoryScanner::new` | `(config: TargetSyncConfig) -> Self` | `DirectoryScanner` | — (pub(crate) directory recursion and batch record saves) |
+| `DirectoryScanner::new` | `(config: TargetSyncConfig) -> Self` | `DirectoryScanner` | — (pub(crate) directory recursion, batch record saves, and single path allocations) |
 | `DirtyBlockRange::new` | `(block_size: NonZeroU64) -> Self` | `DirtyBlockRange` | — (infallible zero-panic constructor) |
 | `DirtyBlockRange::try_new` | `(block_size: u64) -> Result<Self, SyncError>` | `DirtyBlockRange` | `SyncError::Validation` (if `block_size == 0`) |
 | `FileMetadataSnapshot::is_up_to_date` | `(&self, dest: &FileMetadataSnapshot, record: Option<&FileRecord>) -> bool` | `bool` | Evaluates SMB ±2000ms timestamp tolerance |
-| `is_metadata_up_to_date_raw` | `(dest: &FileMetadataSnapshot, src: &FileMetadataSnapshot, record: Option<&FileRecord>) -> bool` | `bool` | Deprecated in favor of `FileMetadataSnapshot::is_up_to_date` |
-| `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | `SyncError::Validation` (cached ancestor junction verification) |
-| `verify_source_not_reparse_cached` | `(source_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (cached source ancestor validation) |
-| `FileSyncTask<'a>` | `struct` | — | Borrowed task bundle defined in leaf `src/sync/types.rs` |
+| `verify_destination_not_reparse_cached` | `(dest_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<Option<Metadata>, SyncError>` | `Option<Metadata>` | Zero-allocation `.peekable()` ancestor component traversal |
+| `verify_source_not_reparse_cached` | `(source_dir: &Path, rel_path: &Path, cache: &ReparseCache) -> Result<(), SyncError>` | `()` | Zero-allocation `.peekable()` ancestor component traversal |
+| `FileSyncTask<'a>` | `struct` | — | Borrowed task bundle with typed `rel_path: &'a RelativePath` |
+| `FileSyncTaskBuilder<'a>` | `struct` | — | Fluent builder requiring source, dest, and staging paths |
 | `safe_modified_millis` | `(metadata: &std::fs::Metadata) -> Result<i64, SyncError>` | `i64` | `SyncError::Io` (safely extracts epoch millis) |
 | `safe_epoch_duration_millis` | `(millis: i64) -> std::time::Duration` | `Duration` | Clamps negative millis to zero Duration |
  
 #### Behavioral Scenarios
+
+[RECOVERY] Immediate eviction of transient deleted source files
+GIVEN a source file deleted during the write debounce period
+WHEN `SyncWorkerRunner::tick` processes the sync task and receives `io::ErrorKind::NotFound` with `!source.exists()`
+THEN the path is immediately evicted from retry queues without scheduling retries
+AND its failure tracking state is cleared
+
+[RECOVERY] Generic I/O retry ceiling and observer notification
+GIVEN a persistent generic I/O failure (`SyncError::Io`) during file synchronization or deletion
+WHEN the operation fails repeatedly
+THEN it is retried with exponential backoff up to 10 attempts
+AND upon the 11th attempt, the path is permanently evicted from retry queues
+AND `SyncStatusObserver::on_write_verification_failed` is invoked to notify observers
+
+[RECOVERY] PartialFailure reachability synchronization
+GIVEN a full scan triggered via `SyncCommand::TriggerFullScan`
+WHEN `run_cancellable_full_scan` returns `ScanOutcome::PartialFailure` (individual file access failures on an active target)
+THEN `ReachabilityMonitor::mark_online` is explicitly invoked
+AND destination reachability transitions to Online, unblocking subsequent queue draining
+
+[PERFORMANCE] Catch-up full scan failure exponential backoff throttling
+GIVEN a directory watcher buffer overflow requiring a catch-up scan
+WHEN `run_cancellable_full_scan` fails with `ScanOutcome::DestinationUnreachable` or an error
+THEN `SyncWorkerState.record_catchup_scan_failure` schedules an exponential backoff timestamp starting at `retry_interval_seconds`
+AND tight 50ms CPU spin-loops are prevented
+
+[HAPPY] Case-only file renaming destination alignment
+GIVEN a file renamed on source with casing changes only (e.g. `report.docx` -> `Report.docx`) on Windows
+WHEN `sync_file_to_dest_core` verifies metadata equality
+THEN `align_dest_file_casing_if_needed` detects the directory entry casing discrepancy
+AND performs an atomic two-step rename (`*.syncdir_casetmp_*`) on the destination share
+AND updates the SQLite database record with `relative_path = excluded.relative_path` preserving existing block signatures
+
+[SECURITY] Symmetrical ReparseCache eviction on deletion (CWE-59)
+GIVEN a file deletion operation via `delete_file_from_dest`
+WHEN the target file is removed and archived
+THEN `dest_path.parent()` is evicted from `ReparseCache`
+AND `source_path.parent()` is symmetrically evicted from `ReparseCache`
+AND any subsequent replacement with an NTFS junction forces full re-validation
+
+[SECURITY] Full scan deletion reconciliation guard
+GIVEN a full directory scan executed via `FullScanCoordinator`
+WHEN `scan_source_files` encounters an I/O error or cancellation signal (`scan_complete == false`)
+THEN `reconcile_deletions` is aborted without deleting any destination files
+AND destination files are protected from accidental pruning
 
 [SECURITY] Archive prune root junction protection
 GIVEN an archive directory that is an NTFS junction or symlink
@@ -440,6 +489,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `TrayState::set_scan_notice` | `(&mut self, notice: Option<String>) -> bool` | `bool` | — |
 | `TrayState::overall_status` | `(&self) -> EngineStatus` | `EngineStatus` | — |
 | `TrayState::tooltip_text` | `(&self) -> String` | `String` | — |
+| `format_explorer_args` | `(path: &Path, is_dir: bool) -> Vec<OsString>` | `Vec<OsString>` | Formats single `/select,<path>` token for files, preventing default directory launch |
 | `open_path` | `(path: &Path) -> std::io::Result<()>` | `()` | Launches default Windows shell application via `%SystemRoot%\explorer.exe` |
 
 ---
@@ -454,7 +504,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 |-------------------|-----------|---------|--------|
 | `SyncDaemon::builder` | `(config: Config, app_dir: impl Into<PathBuf>) -> SyncDaemonBuilder` | `SyncDaemonBuilder` | — (fluent constructor entrypoint) |
 | `SyncDaemon::start` | `(config: Config, app_dir: &Path, observer: Option<Arc<dyn SyncStatusObserver>>) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError::Db`, `SyncError::Validation` (delegates to builder) |
-| `SyncDaemon::start_with_services` | `(...) -> Result<Self, SyncError>` | `SyncDaemon` | `SyncError` (deprecated in favor of `SyncDaemon::builder`) |
+| `SyncDaemon::start_with_all_services` | `(...) -> Result<Self, SyncError>` | `SyncDaemon` | `#[deprecated]` in favor of `SyncDaemonBuilder` |
 | `SyncDaemon::validate_target_loops` | `(config: &Config, resolver: &dyn NetworkResolver) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (non-blocking loop detection using `try_resolve_unc_path`) |
 | `SyncDaemon::config` | `(&self) -> &Config` | `&Config` | — |
 | `SyncDaemon::handle` | `(&self) -> DaemonHandle` | `DaemonHandle` | — |
@@ -486,7 +536,7 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 
 ### 10. Error Module
 
-> Defines application-wide typed error structures and causal source wrapping.
+> Defines application-wide typed error structures and causal source wrapping. All classifiers and constructors are marked `#[must_use]`.
 
 #### Public API
 
@@ -503,13 +553,16 @@ AND `SyncCommand::TriggerFullScan` is dispatched to the sync worker channel to g
 | `SyncError::Watcher` | `(#[from] WatcherError)` | Directory watcher errors wrapping strongly typed `WatcherError` |
 | `SyncError::Tray` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | GUI / Tray notification errors |
 | `SyncError::Registry` | `(String, #[source] Option<Box<dyn Error + Send + Sync>>)` | Windows registry errors |
-| `SyncError::validation` | `(msg: impl Into<String>) -> Self` | Semantic validation error constructor (default Invariant) |
-| `SyncError::validation_kind` | `(kind: ValidationKind, msg: impl Into<String>) -> Self` | Explicit typed validation constructor |
-| `SyncError::validation_security` | `(msg: impl Into<String>) -> Self` | Security validation constructor (Security) |
-| `SyncError::validation_reparse` | `(msg: impl Into<String>) -> Self` | Reparse validation constructor (ReparsePoint) |
-| `SyncError::validation_loop` | `(msg: impl Into<String>) -> Self` | Recursive loop validation constructor (RecursiveLoop) |
-| `SyncError::validation_invariant` | `(msg: impl Into<String>) -> Self` | Domain invariant constructor (Invariant) |
-| `SyncError::is_permanent_validation_failure` | `(&self) -> bool` | Detects non-retryable fatal violations via `kind.is_permanent()` |
+| `SyncError::validation` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Semantic validation error constructor (default Invariant) |
+| `SyncError::validation_kind` | `(kind: ValidationKind, msg: impl Into<String>) -> Self` | `#[must_use]` Explicit typed validation constructor |
+| `SyncError::validation_security` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Security validation constructor (Security) |
+| `SyncError::validation_reparse` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Reparse validation constructor (ReparsePoint) |
+| `SyncError::validation_loop` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Recursive loop validation constructor (RecursiveLoop) |
+| `SyncError::validation_invariant` | `(msg: impl Into<String>) -> Self` | `#[must_use]` Domain invariant constructor (Invariant) |
+| `SyncError::is_permanent_validation_failure` | `(&self) -> bool` | `#[must_use]` Detects non-retryable fatal violations via `kind.is_permanent()` |
+| `SyncError::is_not_found` | `(&self) -> bool` | `#[must_use]` Detects `std::io::ErrorKind::NotFound` across IO variants |
+| `SyncError::is_network_offline` | `(&self) -> bool` | `#[must_use]` Matches Win32 SMB disconnect error codes |
+| `SyncError::is_cancelled` | `(&self) -> bool` | `#[must_use]` Checks cancellation state |
 | `is_network_offline_io` | `(io_err: &std::io::Error) -> bool` | Maps 9 standard `ErrorKind` variants and 11 Win32 error codes |
 
 #### Behavioral Scenarios
@@ -744,12 +797,12 @@ User interface tray-icon utilizing `tray-icon` and `winit` with `TrayController`
 Integrates `StartupRegistry` under HKCU for automatic daemon launch on user login.
 
 ### 6. Automated Testing Frameworks
-289 automated test cases verifying engine behavior:
-- Unit test suite across all modules (235 unit tests in `src/lib.rs`, 3 tests in `src/main.rs`).
-- Integration test suite (`tests/integration_tests.rs`: 12 tests).
-- Generative property test suite (`tests/property_tests.rs`: 8 proptest suites verifying `is_metadata_up_to_date_raw` and `DirtyBlockRange` chunk coalescing).
+381 automated test cases verifying engine behavior:
+- Unit test suite across all modules (321 unit tests in `src/lib.rs`, 7 tests in `src/main.rs`).
+- Integration test suite (`tests/integration_tests.rs`: 13 tests).
+- Generative property test suite (`tests/property_tests.rs`: 8 proptest suites).
 - Snapshot regression test suite (`tests/snapshot_tests.rs`: 20 insta golden snapshots).
-- Documentation tests (`cargo test --doc`: 11 doctests).
+- Documentation tests (`cargo test --doc`: 12 doctests).
 
 ### 7. Development & Release Automation Scripts (`scripts/`)
 - `scripts/check-quality.ps1`: Code quality pipeline executing formatting, linter, tests, and static analysis.

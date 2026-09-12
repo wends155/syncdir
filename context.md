@@ -819,6 +819,23 @@ This file documents the chronological history, design decisions, and rules conte
 >   - 6-arg `SyncDaemon::start_with_all_services` deprecated.
 >   - Raw path strings in `HashStore::list_files` replaced with strongly-typed `RelativePath`.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Architecture & Specification Synchronization (Post-Review Hardening)
+> * **Changes:**
+>   - **`architecture.md § 5` Module Boundaries Synchronized**: Documented 5 segregated role traits (`FileSynchronizer`, `FileDeleter`, `BatchFlusher`, `ScanEngine`, `ArchiveEngine`), composite `SyncEngine` supertrait, `FullScanDriver` decoupling interface, `MockFullScanDriver`, `RawTargetDir` Serde proxy for invariant validation during deserialization, `RelativePath` bidirectional equality (`PartialEq<PathBuf>`, `PartialEq<Path>`), strongly-typed `HashStore::list_files(&self) -> Result<Vec<RelativePath>, SyncError>`, and `SyncDaemonBuilder` primary constructor with event-driven watcher coordinator shutdown synchronization (`signal_rx.recv_timeout`).
+>   - **`architecture.md § 8` & `§ 9` Error Handling & Observability Synchronized**: Documented `#[must_use]` annotation on all error classifier predicates and constructors, `SyncError::is_not_found()` transparent I/O error classifier, `tracing = { version = "0.1", features = ["attributes"] }`, `#[tracing::instrument]` attribute instrumentation across subsystem boundaries, thread-scoped execution spans (`sync_worker`, `watcher_coordinator`, `tray_event_loop`), and CWE-117 CRLF log injection defense.
+>   - **`architecture.md § 10` Testing Strategy Synchronized**: Updated test suite metrics to 381 passing automated tests (321 lib + 7 bin + 13 integration + 8 property + 20 snapshot + 12 doc-tests, and 1 ignored). Expanded Comprehensive In-Memory Mocks list to 6 test doubles with `MockFullScanDriver`.
+>   - **`architecture.md § 14` Technical Debt Synchronized**: Recorded complete resolution of all 36 findings across Blocks 1–4 from the multi-lens code review (`review_report.md`).
+>   - **`spec.md` Behavioral Contracts Synchronized**: Recorded verification hash `94283f7`, updated API tables, added 7 behavioral scenarios covering immediate eviction of transient NotFound deletions, 10-retry generic I/O bounds, reachability synchronization on PartialFailure, catch-up scan failure backoff, case-only rename alignment, symmetrical ReparseCache eviction (CWE-59), and full scan deletion reconciliation abort guard.
+>   - **Intra-Doc Link Resolution**: Fixed broken rustdoc link in `src/sync/engine.rs:472` (`[run_configured_full_scan]` -> `[Self::run_configured_full_scan]`).
+>   - **Quality Verification Gate**: All 381 automated tests, 12 doc-tests, `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo doc --no-deps` passing with exit 0.
+> * **New Constraints:**
+>   - Architectural specification is strictly 1:1 aligned with production implementation and behavioral contracts in `spec.md`.
+> * **Pruned:**
+>   - All 7 architectural drift areas from `architecture_recommendations_report.md` resolved.
+
 
 
 

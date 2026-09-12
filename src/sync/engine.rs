@@ -469,7 +469,7 @@ impl<S: HashStore> LocalSyncEngine<S> {
         self.run_cancellable_full_scan_impl(dest, &NEVER_CANCELLED)
     }
 
-    /// Deprecated: use [`run_configured_full_scan`] instead.
+    /// Deprecated: use [`Self::run_configured_full_scan`] instead.
     #[deprecated(note = "use run_configured_full_scan instead")]
     pub fn run_full_scan(&self) -> Result<ScanOutcome, SyncError> {
         self.run_configured_full_scan()
