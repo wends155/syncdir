@@ -1059,10 +1059,8 @@ fn test_config_builder_build_validates_invariants() {
 fn test_target_sync_config_from_config_rejects_nested_and_ancestor_paths() {
     let config = Config::test_default(r"C:\source", r"D:\dest");
     // Nested path (dest inside source)
-    let res_nested = TargetSyncConfig::from_config(
-        &config,
-        TargetDir::from_validated(r"C:\source\nested"),
-    );
+    let res_nested =
+        TargetSyncConfig::from_config(&config, TargetDir::from_validated(r"C:\source\nested"));
     assert!(res_nested.is_err());
     match res_nested.unwrap_err() {
         SyncError::Validation { kind, .. } => {
@@ -1072,8 +1070,7 @@ fn test_target_sync_config_from_config_rejects_nested_and_ancestor_paths() {
     }
 
     // Ancestor path (source inside dest)
-    let res_ancestor =
-        TargetSyncConfig::from_config(&config, TargetDir::from_validated(r"C:\"));
+    let res_ancestor = TargetSyncConfig::from_config(&config, TargetDir::from_validated(r"C:\"));
     assert!(res_ancestor.is_err());
     match res_ancestor.unwrap_err() {
         SyncError::Validation { kind, .. } => {
@@ -1089,10 +1086,7 @@ fn test_target_sync_config_from_config_rejects_invalid_block_size_and_ordering()
         .dest_dir(r"D:\dest")
         .block_size_bytes(0)
         .build_unvalidated();
-    let res = TargetSyncConfig::from_config(
-        &invalid_config,
-        TargetDir::from_validated(r"D:\dest"),
-    );
+    let res = TargetSyncConfig::from_config(&invalid_config, TargetDir::from_validated(r"D:\dest"));
     assert!(res.is_err());
 
     let invalid_order = Config::builder(r"C:\source")
@@ -1100,10 +1094,8 @@ fn test_target_sync_config_from_config_rejects_invalid_block_size_and_ordering()
         .block_size_bytes(1024)
         .block_sync_threshold_bytes(512)
         .build_unvalidated();
-    let res_order = TargetSyncConfig::from_config(
-        &invalid_order,
-        TargetDir::from_validated(r"D:\dest"),
-    );
+    let res_order =
+        TargetSyncConfig::from_config(&invalid_order, TargetDir::from_validated(r"D:\dest"));
     assert!(res_order.is_err());
 }
 
@@ -1187,8 +1179,8 @@ fn test_target_sync_config_block_size_nonzero_panic_free_fallback() {
 #[test]
 #[allow(deprecated)]
 fn test_target_sync_config_source_dir_target_dir() {
-    use crate::config::TargetSyncConfig;
     use crate::config::TargetDir;
+    use crate::config::TargetSyncConfig;
     let td = TargetDir::new("C:\\Users\\Data");
     let config = TargetSyncConfig::builder(td.clone(), TargetDir::from_validated("D:\\Backup"))
         .build()

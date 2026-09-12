@@ -239,9 +239,9 @@ mod tests {
             TargetDir::from_validated(src.clone()),
             TargetDir::from_validated(dst.clone()),
         )
-            .verification_mode(VerificationMode::Disabled)
-            .build()
-            .unwrap();
+        .verification_mode(VerificationMode::Disabled)
+        .build()
+        .unwrap();
 
         let engine = SmallFileTransferEngine::new(target_cfg);
 
@@ -419,9 +419,9 @@ mod tests {
             TargetDir::from_validated(source.clone()),
             TargetDir::from_validated(dest.clone()),
         )
-            .verification_mode(crate::config::VerificationMode::Sampled)
-            .build()
-            .unwrap();
+        .verification_mode(crate::config::VerificationMode::Sampled)
+        .build()
+        .unwrap();
         let engine = SmallFileTransferEngine::new(target_cfg);
 
         let src_file = source.join("test.txt");
@@ -473,9 +473,9 @@ mod tests {
             TargetDir::from_validated(src.clone()),
             TargetDir::from_validated(dst.clone()),
         )
-            .verification_mode(VerificationMode::Full)
-            .build()
-            .unwrap();
+        .verification_mode(VerificationMode::Full)
+        .build()
+        .unwrap();
         let engine = SmallFileTransferEngine::new(target_cfg);
 
         let dest_file = dst.join(file_name);

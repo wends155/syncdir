@@ -36,26 +36,26 @@
 | `ConfigBuilder::build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` (validates all configuration invariants) |
 | `ConfigBuilder::build_unvalidated` | `(self) -> Config` | `Config` | — (bypasses invariant validation; test fixtures only) |
 | `ConfigBuilder::try_build` | `(self) -> Result<Config, SyncError>` | `Config` | `SyncError::Validation` (alias for `build`) |
-| `TargetDir::try_new` | `(path: impl Into<PathBuf>, role: TargetRole) -> Result<Self, SyncError>` | `TargetDir` | `SyncError::Validation` (validates syntax, drive root, or UNC format) |
+| `TargetDir::try_new` | `(path: impl Into<PathBuf>, role: TargetRole) -> Result<Self, SyncError>` | `TargetDir` | `SyncError::Validation` (validates syntax, drive root, or UNC format; annotated with `#[must_use]`) |
+| `TargetDir::try_from` | `(PathBuf / &Path / &str) -> Result<Self, SyncError>` | `TargetDir` | `SyncError::Validation` (fallible conversion enforcing syntax validation; unvalidated `From` removed) |
 | `TargetDir::new` | `(path: impl Into<PathBuf>) -> Self` | `TargetDir` | — (deprecated in favor of `TargetDir::try_new`) |
 | `TargetDir::validate` | `(&self, role: &str) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (invalid drive or UNC syntax) |
 | `TargetDir::as_path` | `(&self) -> &Path` | `&Path` | — |
 | `TargetDir::to_path_buf` | `(&self) -> PathBuf` | `PathBuf` | — |
 | `DestinationCollection::new` | `(destinations: impl IntoIterator<Item = TargetDir>) -> Self` | `DestinationCollection` | — (case-insensitive dedup preserving order) |
-| `DestinationCollection::iter` | `(&self) -> impl Iterator<Item = &TargetDir>` | `Iterator` | — |
-| `DestinationCollection::len` | `(&self) -> usize` | `usize` | — |
-| `DestinationCollection::is_empty` | `(&self) -> bool` | `bool` | — |
-| `DestinationCollection::as_slice` | `(&self) -> &[TargetDir]` | `&[TargetDir]` | — |
+| `DestinationCollection::iter` | `(&self) -> impl Iterator<Item = &TargetDir>` | `Iterator` | — (annotated with `#[must_use]`) |
+| `DestinationCollection::len` | `(&self) -> usize` | `usize` | — (annotated with `#[must_use]`) |
+| `DestinationCollection::is_empty` | `(&self) -> bool` | `bool` | — (annotated with `#[must_use]`) |
+| `DestinationCollection::as_slice` | `(&self) -> &[TargetDir]` | `&[TargetDir]` | — (annotated with `#[must_use]`) |
 | `DestinationCollection::to_path_bufs` | `(&self) -> Vec<PathBuf>` | `Vec<PathBuf>` | — |
 | `TargetSyncConfig::from_config` | `(config: &Config, dest_dir: impl Into<TargetDir>) -> Result<Self, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` (validates invariants via builder) |
-| `TargetSyncConfig::builder` | `(source_dir: impl Into<PathBuf>, dest_dir: impl Into<PathBuf>) -> TargetSyncConfigBuilder` | `TargetSyncConfigBuilder` | — |
-| `TargetSyncConfig::source_dir` | `(&self) -> &Path` | `&Path` | — (returns path reference to validated source TargetDir) |
-| `TargetSyncConfig::source_target_dir` | `(&self) -> &TargetDir` | `&TargetDir` | — (returns borrowed reference to underlying TargetDir) |
-| `TargetSyncConfig::block_size_nonzero` | `(&self) -> std::num::NonZeroU64` | `NonZeroU64` | — (safely defaults to 64KB on zero) |
-| `TargetSyncConfig::with_verify_writes` | `(mut self, verify_writes: bool) -> Self` | `Self` | — (mutation helper for test fixtures) |
-| `TargetSyncConfigBuilder::build` | `(self) -> Result<TargetSyncConfig, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` |
-| `StoreConfig::try_from` | `(config: &Config) -> Result<StoreConfig, SyncError>` | `StoreConfig` | `SyncError::Validation` |
-| `StoreConfig::try_from` | `(target_config: &TargetSyncConfig) -> Result<StoreConfig, SyncError>` | `StoreConfig` | `SyncError::Validation` |
+| `TargetSyncConfig::builder` | `(source_dir: impl Into<TargetDir>, dest_dir: impl Into<TargetDir>) -> TargetSyncConfigBuilder` | `TargetSyncConfigBuilder` | — (annotated with `#[must_use]`) |
+| `TargetSyncConfig::source_dir` | `(&self) -> &Path` | `&Path` | — (returns path reference to validated source TargetDir; `#[must_use]`) |
+| `TargetSyncConfig::source_target_dir` | `(&self) -> &TargetDir` | `&TargetDir` | — (returns borrowed reference to underlying TargetDir; `#[must_use]`) |
+| `TargetSyncConfig::block_size_nonzero` | `(&self) -> std::num::NonZeroU64` | `NonZeroU64` | — (safely defaults to 64KB on zero; `#[must_use]`) |
+| `TargetSyncConfig::with_verify_writes` | `(mut self, verify_writes: bool) -> Self` | `Self` | — (mutation helper for test fixtures; `#[must_use]`) |
+| `TargetSyncConfigBuilder::build` | `(self) -> Result<TargetSyncConfig, SyncError>` | `TargetSyncConfig` | `SyncError::Validation` (annotated with `#[must_use]`) |
+| `StoreConfig::new` | `(block_size_bytes: u64, block_sync_threshold_bytes: u64) -> Self` | `StoreConfig` | Storage-decoupled value object constructed directly without `config` dependency |
 | `validate_sync_boundaries` | `(source: &Path, dest: &Path) -> Result<(), SyncError>` | `()` | `SyncError::Validation` (rejects identical or nested source/dest) |
 | `preprocess_config_toml` | `(raw_toml: &str) -> String` | `String` | — (preserves multi-line arrays and quotes) |
 
@@ -130,6 +130,9 @@ AND construction fails immediately
 | `RelativePath::new` | `(path: impl Into<PathBuf>) -> Result<Self, SyncError>` | `RelativePath` | Inline non-deprecated convenience wrapper delegating to `try_new` |
 | `RelativePath::as_path` | `(&self) -> &Path` | `&Path` | Returns borrowed `&Path` slice |
 | `RelativePath::as_str` | `(&self) -> &str` | `&str` | Returns canonical forward-slash string slice |
+| `RelativePath::as_forward_slash_str` | `(&self) -> &str` | `&str` | Returns zero-allocation canonical forward-slash string slice (annotated with `#[must_use]`) |
+| `RelativePath::to_storage_key` | `(&self) -> String` | `String` | Returns storage-agnostic owned string key (annotated with `#[must_use]`) |
+| `RelativePath::to_sqlite_key` | `(&self) -> String` | `String` | Deprecated backward-compatible shim delegating to `to_storage_key()` |
 | `RelativePath::to_path_buf` | `(&self) -> PathBuf` | `PathBuf` | Converts to owned PathBuf |
 | `RelativePath::eq (PartialEq)` | `(&self, other: &PathBuf / &Path) -> bool` | `bool` | Bidirectional equality comparison with `PathBuf` and `Path` |
 | `normalize_path` | `(path: impl AsRef<Path>) -> PathBuf` | `PathBuf` | Replaces `/` with `\`, normalizes root backslashes, collapses `.` |

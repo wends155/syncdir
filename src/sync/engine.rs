@@ -1927,7 +1927,8 @@ mod tests {
             .build()
             .unwrap();
         let target_cfg_no_prop =
-            TargetSyncConfig::from_config(&config_no_prop, TargetDir::from_validated(dst.clone())).unwrap();
+            TargetSyncConfig::from_config(&config_no_prop, TargetDir::from_validated(dst.clone()))
+                .unwrap();
         let engine_no_prop = LocalSyncEngine::new(store.clone(), target_cfg_no_prop);
         let rec3 = FileRecord::from_raw("unprop.txt", 4, 300).unwrap();
         store.save_file(&rec3, &[]).unwrap();

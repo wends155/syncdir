@@ -75,7 +75,6 @@ impl TryFrom<RawTargetDir> for TargetDir {
 
 impl TargetDir {
     /// Construct a validated TargetDir by normalizing path via normalize_path() and validating syntax for role.
-    #[must_use]
     pub fn try_new(path: impl Into<PathBuf>, role: TargetRole) -> Result<Self, SyncError> {
         let dir = Self(normalize_path(path.into()));
         dir.validate(role)?;
@@ -187,7 +186,7 @@ impl TryFrom<&Path> for TargetDir {
     type Error = SyncError;
 
     fn try_from(path: &Path) -> Result<Self, Self::Error> {
-        let normalized = normalize_path(path.to_path_buf());
+        let normalized = normalize_path(path);
         Self::validate_internal(&normalized, None)?;
         Ok(Self(normalized))
     }
@@ -283,7 +282,6 @@ impl DestinationCollection {
         Self::new(items)
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = &TargetDir> {
         self.destinations.iter()
     }

@@ -603,11 +603,11 @@ mod tests {
             TargetDir::from_validated(src.clone()),
             TargetDir::from_validated(dst.clone()),
         )
-            .block_size_bytes(512)
-            .block_sync_threshold_bytes(512)
-            .verification_mode(VerificationMode::MetadataAndFlush)
-            .build()
-            .unwrap();
+        .block_size_bytes(512)
+        .block_sync_threshold_bytes(512)
+        .verification_mode(VerificationMode::MetadataAndFlush)
+        .build()
+        .unwrap();
 
         assert_eq!(
             target_cfg.verification_mode(),
@@ -657,11 +657,11 @@ mod tests {
             TargetDir::from_validated(src.clone()),
             TargetDir::from_validated(dst.clone()),
         )
-            .block_size_bytes(256)
-            .block_sync_threshold_bytes(256)
-            .verification_mode(VerificationMode::Sampled)
-            .build()
-            .unwrap();
+        .block_size_bytes(256)
+        .block_sync_threshold_bytes(256)
+        .verification_mode(VerificationMode::Sampled)
+        .build()
+        .unwrap();
 
         let store = MockHashStore::new();
         let engine = LocalSyncEngine::new(store, target_cfg);
@@ -944,10 +944,10 @@ mod tests {
                 TargetDir::from_validated(source.clone()),
                 TargetDir::from_validated(dest.clone()),
             )
-                .block_size_bytes(512)
-                .block_sync_threshold_bytes(512)
-                .build()
-                .unwrap();
+            .block_size_bytes(512)
+            .block_sync_threshold_bytes(512)
+            .build()
+            .unwrap();
             let store_cfg = crate::db::StoreConfig::new(
                 target_cfg.block_size_bytes(),
                 target_cfg.block_sync_threshold_bytes(),

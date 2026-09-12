@@ -269,7 +269,6 @@ impl RelativePath {
     /// # Errors
     /// Returns `SyncError::Validation` if the path is empty, absolute, contains directory traversals,
     /// DOS device names, Alternate Data Streams, or other unsafe patterns.
-    #[must_use]
     pub fn try_new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
         let p = path.as_ref();
         if p.as_os_str().is_empty() || p.to_string_lossy().trim().is_empty() {
@@ -304,7 +303,6 @@ impl RelativePath {
     /// Construct a new `RelativePath`, validating security invariants and normalizing slashes to `/`.
     /// Inline wrapper around `RelativePath::try_new`.
     #[inline]
-    #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Result<Self, SyncError> {
         Self::try_new(path)
     }
@@ -343,7 +341,10 @@ impl RelativePath {
     /// Converts to SQLite storage key format.
     #[inline]
     #[must_use]
-    #[deprecated(since = "0.2.0", note = "use to_storage_key or as_forward_slash_str instead")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "use to_storage_key or as_forward_slash_str instead"
+    )]
     pub fn to_sqlite_key(&self) -> String {
         self.to_storage_key()
     }
@@ -844,7 +845,10 @@ mod tests {
 
         // Unicode character preservation
         let rp_unicode = RelativePath::try_new("docs/rapport_été_2026.pdf").unwrap();
-        assert_eq!(rp_unicode.as_forward_slash_str(), "docs/rapport_été_2026.pdf");
+        assert_eq!(
+            rp_unicode.as_forward_slash_str(),
+            "docs/rapport_été_2026.pdf"
+        );
         assert_eq!(rp_unicode.to_storage_key(), "docs/rapport_été_2026.pdf");
     }
 
