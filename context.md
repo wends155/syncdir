@@ -789,6 +789,37 @@ This file documents the chronological history, design decisions, and rules conte
 >   - Redundant pre-creation reparse check in `archive_dest_file_only` eliminated.
 >   - 64KB stack zeroing per small file sync when scratch buffer is available eliminated.
 
+---
+
+> 📝 **Context Update (2026-09-12):**
+> * **Feature:** Block 4: API Safety, Trait Segregation & Hardening (`/build`, `/audit`)
+> * **Changes:**
+>   - **Trait Segregation & Interface Segregation Principle (Finding 15, O1)**: Segregated monolithic `SyncEngine` into 5 discrete role traits in `src/sync/engine.rs`: `FileSynchronizer`, `FileDeleter`, `BatchFlusher`, `ScanEngine`, and `ArchiveEngine`. Defined composite `SyncEngine: FileSynchronizer + FileDeleter + BatchFlusher + ScanEngine + ArchiveEngine { fn invalidate_verified_dirs(&self) {} }`. Implemented traits on `LocalSyncEngine<S>` and `MockSyncEngine` with inherent delegation methods, resolving `E0034` trait resolution ambiguity.
+>   - **Public API Re-Exports & Type Leakage Elimination (Finding 12, O1)**: Re-exported `ReparseCache`, `FileSyncTaskBuilder`, and all 5 role traits from `syncdir::sync`, eliminating private type leakage in `LocalSyncEngine::reparse_cache`.
+>   - **Type-Safe `RelativePath` & `HashStore::list_files` (Findings 21 & 22, O2)**: Upgraded `HashStore::list_files(&self) -> Result<Vec<RelativePath>, SyncError>` across `SqliteHashStore`, `MockHashStore`, `Arc<S>`, and `&S`. Implemented bidirectional `PartialEq<PathBuf>` and `PartialEq<Path>` on `RelativePath`. Preserved `RelativePath::new` as an undeprecated inline wrapper around `try_new`.
+>   - **`FileSyncTaskBuilder` & Parameter Transposition Defense (Finding 13, O3)**: Strongly typed `FileSyncTask.rel_path` as `&'a RelativePath` and introduced fluent `FileSyncTaskBuilder` enforcing mandatory source, destination, and staging paths. Migrated all 19 call sites across `types.rs`, `engine.rs`, `delta.rs`, and `small_file.rs`.
+>   - **`TargetDir` Deserialization Proxy & Dead Code Elimination (Findings 14 & 28, O4)**: Implemented transparent `RawTargetDir` Serde proxy with `#[serde(try_from = "RawTargetDir", into = "PathBuf")]` in `src/config/target.rs` to validate paths during TOML/JSON deserialization without breaking `From<PathBuf>` or causing `E0119` coherence collisions. Pruned dead Unix validation branch.
+>   - **Decoupled `FullScanCoordinator` & Deletion Abort Guard (Findings 8 & 26, O5)**: Abstracted full scan filesystem/database dependencies behind the `FullScanDriver` trait. Implemented pure in-memory `MockFullScanDriver` for testing. Guarded deletion reconciliation with `if scan_complete` to prevent accidental deletion of unscanned destination files upon error or cancellation.
+>   - **Hardened Error Attributes & Method Shadowing Resolution (Findings 23, 25 & 34, O6)**: Annotated all error constructors and classifiers in `src/error.rs` with `#[must_use]` and added `is_not_found()` predicate. Renamed shadowed 0-arg `LocalSyncEngine::run_full_scan` to `run_configured_full_scan` with `#[deprecated]` attribute. Simplified `LocalSyncEngine::new(db: S, config: TargetSyncConfig)`.
+>   - **Windows Explorer Argument Tokenization & Dialog Error Handling (Findings 31 & 32, O7)**: Implemented `format_explorer_args` returning a single `/select,<path>` `OsString` token for files, avoiding default folder fallback and executable launching. Added structured `tracing::error!` logging on background thread spawn errors in `show_about_dialog` and `show_error_dialog`.
+>   - **Fluent `SyncDaemonBuilder` & Executable Doc-Tests (Findings 24 & 36, O8)**: Implemented `SyncDaemonBuilder`, deprecated 6-arg `SyncDaemon::start_with_all_services`, and added runnable `# Examples` doc-tests in `src/lib.rs`.
+>   - **Quality Verification Gate**: 381 passing tests across workspace (369 all-targets + 12 doc-tests), zero clippy warnings under `-D warnings`, and 100% clean formatting.
+> * **New Constraints:**
+>   - Consumers requiring a subset of sync functionality should depend on segregated role traits (`FileSynchronizer`, `FileDeleter`, etc.) rather than the full `SyncEngine`.
+>   - `FileSyncTask` must be constructed using `FileSyncTaskBuilder` with typed `&RelativePath`.
+>   - `FullScanCoordinator` deletion reconciliation must be guarded by `scan_complete`.
+>   - Error classifiers and constructor functions must retain `#[must_use]`.
+>   - Windows Explorer file selections must be formatted as single `/select,<path>` tokens.
+>   - Daemon construction should use `SyncDaemonBuilder`.
+> * **Pruned:**
+>   - Monolithic `SyncEngine` coupling eliminated via trait segregation.
+>   - 4-`&Path` argument ordering hazard on `FileSyncTask` eliminated.
+>   - Dead Unix path validation branch in `TargetDir::validate` eliminated.
+>   - Shadowed 0-arg `LocalSyncEngine::run_full_scan` replaced.
+>   - 6-arg `SyncDaemon::start_with_all_services` deprecated.
+>   - Raw path strings in `HashStore::list_files` replaced with strongly-typed `RelativePath`.
+
+
 
 
 
