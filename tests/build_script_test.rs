@@ -79,3 +79,46 @@ fn test_validate_icon_asset_too_large() {
         Err(BuildResourceError::IconInvalid(_))
     ));
 }
+
+use build_script::{validate_path_safety, ResourceBuildConfig};
+
+#[test]
+fn test_validate_path_safety_valid() {
+    assert_eq!(
+        validate_path_safety(std::path::Path::new("C:\\Valid\\Path")),
+        Ok(())
+    );
+}
+
+#[test]
+fn test_validate_path_safety_null_bytes() {
+    assert!(matches!(
+        validate_path_safety(std::path::Path::new("C:\\Invalid\0Path")),
+        Err(BuildResourceError::UnsafePath(_))
+    ));
+}
+
+#[test]
+fn test_config_from_env_defaults() {
+    let empty_lookup = |_var: &str| None;
+    let config = ResourceBuildConfig::from_env_with(empty_lookup);
+    assert_eq!(config.winres_toolkit_path, None);
+    assert_eq!(config.rc_path, None);
+    assert_eq!(config.windows_sdk_path, None);
+    assert!(!config.allow_missing_icon());
+}
+
+#[test]
+fn test_config_from_env_truthy_flags() {
+    for flag in &["1", "true", "TRUE", "yes", "YES"] {
+        let lookup = |var: &str| {
+            if var == "SYNCDIR_ALLOW_MISSING_ICON" {
+                Some((*flag).to_string())
+            } else {
+                None
+            }
+        };
+        let config = ResourceBuildConfig::from_env_with(lookup);
+        assert!(config.allow_missing_icon());
+    }
+}

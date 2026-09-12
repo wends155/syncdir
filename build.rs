@@ -59,8 +59,93 @@ pub fn validate_icon_bytes(bytes: &[u8]) -> Result<(), BuildResourceError> {
     Ok(())
 }
 
-pub fn validate_icon_asset(_path: &std::path::Path) -> Result<(), BuildResourceError> {
-    Err(BuildResourceError::IconInvalid("Stub".into()))
+pub fn validate_icon_asset(path: &std::path::Path) -> Result<(), BuildResourceError> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => BuildResourceError::IconNotFound(path.to_path_buf()),
+        kind => BuildResourceError::Io {
+            path: path.to_path_buf(),
+            kind,
+            message: e.to_string(),
+        },
+    })?;
+
+    let meta = file.metadata().map_err(|e| BuildResourceError::Io {
+        path: path.to_path_buf(),
+        kind: e.kind(),
+        message: e.to_string(),
+    })?;
+
+    if !meta.is_file() {
+        return Err(BuildResourceError::IconInvalid(format!(
+            "Path '{}' is not a regular file",
+            path.display()
+        )));
+    }
+
+    let len = meta.len();
+    if len == 0 {
+        return Err(BuildResourceError::IconInvalid("Icon file is empty".into()));
+    }
+    if len > 524_288 {
+        return Err(BuildResourceError::IconInvalid(format!(
+            "Icon file size ({len} bytes) exceeds maximum limit of 512 KB"
+        )));
+    }
+
+    let mut header = [0u8; 6];
+    file.read_exact(&mut header).map_err(|e| BuildResourceError::Io {
+        path: path.to_path_buf(),
+        kind: e.kind(),
+        message: e.to_string(),
+    })?;
+
+    validate_icon_bytes(&header)
+}
+
+pub fn validate_path_safety(_path: &std::path::Path) -> Result<(), BuildResourceError> {
+    Err(BuildResourceError::UnsafePath("Stub".into()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceBuildConfig {
+    pub winres_toolkit_path: Option<std::path::PathBuf>,
+    pub rc_path: Option<std::path::PathBuf>,
+    pub windows_sdk_path: Option<std::path::PathBuf>,
+    pub allow_missing_icon: bool,
+    pub profile: String,
+    pub target_os: String,
+}
+
+impl ResourceBuildConfig {
+    pub fn from_env() -> Self {
+        Self::from_env_with(|var| std::env::var(var).ok())
+    }
+
+    pub fn from_env_with<E>(_lookup: E) -> Self
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        Self {
+            winres_toolkit_path: None,
+            rc_path: None,
+            windows_sdk_path: None,
+            allow_missing_icon: false,
+            profile: String::new(),
+            target_os: String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_release(&self) -> bool {
+        self.profile == "release"
+    }
+
+    #[must_use]
+    pub fn allow_missing_icon(&self) -> bool {
+        self.allow_missing_icon
+    }
 }
 
 #[cfg(all(windows, not(test)))]
