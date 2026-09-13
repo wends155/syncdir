@@ -214,6 +214,12 @@ syncdir/
   * `RegistryBackend`: Interface for Windows startup registry operations.
 * **Mock Availability**: `MockStartupRegistry` (implemented in `src/startup.rs` and re-exported under `test_support`) for cross-platform unit testing.
 
+### `error`
+* **Owns**: Project-wide typed error taxonomy (`SyncError`), causal error source preservation via `Box<dyn std::error::Error + Send + Sync>` on IO, DB, Watcher, and Registry variants, semantic constructor helpers (`*_with_source`), Win32 and SMB network offline error classification (`is_network_offline`, `is_network_offline_io`), and validation error categorization (`ValidationKind`). Implements `std::error::Error` and `Display`.
+* **Does NOT own**: Domain logic, error recovery side-effects, UI dialog rendering.
+* **Trait Interfaces**: Implements `std::error::Error`, `std::fmt::Display`.
+* **Mock Availability**: N/A (pure error value domain).
+
 ### `test_support`
 * **Owns**: Canonical re-exports of test doubles (`MockHashStore`, `MockSyncEngine`, `MockSyncStatusObserver`, `MockNetworkResolver`, `MockStartupRegistry`) decorated with `#[doc(hidden)]` to isolate test scaffolding from public documentation while supporting integration test suites.
 

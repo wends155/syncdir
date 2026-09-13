@@ -1046,6 +1046,21 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - The entire 15-finding remediation workstream is fully closed, audited, and verified across all project standards.
 
+---
+
+> 📝 **Context Update (2026-09-13):**
+> * **Feature:** Documentation & Architectural Synchronization (`/update-doc` & `/architecture`)
+> * **Changes:**
+>   - **`spec.md` Verification Hash Advanced**: Advanced baseline verification commit hash from `59c2d25` to `0bb1603` and updated date to `2026-09-13`. Confirmed all 5 required sections per `doc-rules.md §4` are present and test metrics (444 Rust tests + 19 PS tests) are accurate.
+>   - **`architecture.md § 5` Boundary Symmetry**: Added `### error` subsection to Section 5 (Module Boundaries) documenting typed error taxonomy (`SyncError`), causal source preservation, Win32/SMB network error classification, and `ValidationKind`, achieving 100% formal boundary symmetry across all 13 modules.
+>   - **Package Metadata Triad Confirmed**: Re-verified exact alignment across `Cargo.toml [package.description]`, `src/lib.rs //!`, and `README.md` overview.
+>   - **Zero Rustdoc Warnings**: `cargo doc --no-deps` verified with 0 warnings.
+> * **New Constraints:**
+>   - All 13 modules in `syncdir` maintain explicit Owns / Does NOT own declarations in `architecture.md § 5`.
+> * **Pruned:**
+>   - Stale verification commit hash in `spec.md` and documentation boundary omissions resolved.
+
+
 
 
 
