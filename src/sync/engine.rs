@@ -31,10 +31,6 @@ pub enum SyncCommand {
 }
 pub use super::traits::*;
 
-#[cfg(test)]
-pub(crate) static CASING_ALIGN_READ_DIR_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// RAII lease for a `DirtyBlockRange` buffer checked out from `LocalSyncEngine`.
 ///
 /// On drop, resets the buffer and returns it to the pool, retaining whichever has
@@ -99,6 +95,8 @@ pub struct LocalSyncEngine<S: HashStore> {
     archive_manager: crate::sync::archive::ArchiveManager,
     scanner: crate::sync::scanner::DirectoryScanner,
     staged_records: std::sync::Mutex<Vec<(FileRecord, Vec<crate::db::BlockHash>)>>,
+    #[cfg(test)]
+    casing_align_count: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: HashStore> LocalSyncEngine<S> {
@@ -128,6 +126,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
             archive_manager,
             scanner,
             staged_records: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            casing_align_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -532,7 +532,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
         rel_path: &Path,
     ) -> Result<(), SyncError> {
         #[cfg(test)]
-        CASING_ALIGN_READ_DIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.casing_align_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let dest_path = dest_dir.join(rel_path);
         let Some(expected_name) = rel_path.file_name() else {
@@ -583,7 +584,8 @@ impl<S: HashStore> LocalSyncEngine<S> {
         _rel_path: &Path,
     ) -> Result<(), SyncError> {
         #[cfg(test)]
-        CASING_ALIGN_READ_DIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.casing_align_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
@@ -623,6 +625,12 @@ impl<S: HashStore> LocalSyncEngine<S> {
         let (record, _) = self.sync_small_file_core(task, &mut stack_scratch)?;
         self.db.save_file(&record, &[])?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn casing_align_count(&self) -> usize {
+        self.casing_align_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

@@ -1060,6 +1060,19 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - Stale verification commit hash in `spec.md` and documentation boundary omissions resolved.
 
+---
+
+> 📝 **Context Update (2026-09-13):**
+> * **Feature:** Casing Alignment Parallel Test Isolation (`/audit`)
+> * **Changes:**
+>   - **`src/sync/engine.rs`**: Removed global static `CASING_ALIGN_READ_DIR_COUNT: AtomicUsize`. Added instance-level `casing_align_count: AtomicUsize` field to `LocalSyncEngine<S>` initialized to `0` in `LocalSyncEngine::new` under `#[cfg(test)]`. Updated `align_dest_file_casing_if_needed` (Windows and non-Windows) to increment `self.casing_align_count`. Added `casing_align_count(&self) -> usize` accessor. Release builds compile out all test instrumentation with zero production overhead.
+>   - **`src/sync/engine_tests.rs`**: Updated `test_dest_casing_alignment_bypassed_on_cache_hit` to assert against `engine.casing_align_count()`. Added `test_dest_casing_alignment_invoked_on_cache_miss` to verify casing alignment invocation on cache miss.
+>   - **Verification**: 447 Rust tests passing (increased from 446 baseline, zero regressions), 19 PowerShell tests passing, 0 clippy warnings, clean formatting, zero ast-grep violations.
+> * **New Constraints:**
+>   - Do not use global static mutable state or global static atomics for test verification; encapsulate test spies on engine or struct instances under `#[cfg(test)]` to guarantee deterministic parallel test isolation.
+> * **Pruned:**
+>   - Global static `CASING_ALIGN_READ_DIR_COUNT` removed, eliminating intermittent race conditions during parallel test runs (`cargo test`).
+
 
 
 
