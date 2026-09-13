@@ -1032,6 +1032,21 @@ This file documents the chronological history, design decisions, and rules conte
 > * **Pruned:**
 >   - All 15 findings from `review_report.md` regarding build script failure (`os error 3`), UAC virtualization risk, single-resolution icon, and fragile release scripting are 100% remediated and closed across Blocks 1–3.
 
+---
+
+> 📝 **Context Update (2026-09-13):**
+> * **Feature:** Full Series Compliance Audit — Windows Resource Icon & Release Hardening (Blocks 1–3)
+> * **Changes:**
+>   - **Unified Scope Audit**: Audited all 9 modified files across the 3-block series (`build.rs`, `scripts/build-release.ps1`, `syncdir.ico`, `architecture.md`, `spec.md`, `README.md`, `tests/build_script_test.rs`, `tests/test_build_release.ps1`, `context.md`).
+>   - **Verification Pipeline Results**: 444 Rust tests passing, 19 PowerShell tests passing, 100% `cargo fmt` compliance, 0 warnings under `cargo clippy --all-targets --all-features -- -D warnings`, 0 AST security violations under `sg scan`, 0 Narsil security/CWE findings, and successful live PE resource verification.
+>   - **Observation Noted**: Recorded a low-severity observation regarding pre-existing parallel test race on static `CASING_ALIGN_READ_DIR_COUNT` atomic in `src/sync/engine_tests.rs`.
+>   - **Audit Verdict**: ✅ Pass. 100% plan fidelity, 0 omissions, 0 deviations, 0 test regressions across all 15 review findings.
+> * **New Constraints:**
+>   - Future test suites testing atomic counters must use localized thread-safe structures or serialize test execution to avoid parallel test races.
+> * **Pruned:**
+>   - The entire 15-finding remediation workstream is fully closed, audited, and verified across all project standards.
+
+
 
 
 
